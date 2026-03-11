@@ -34,6 +34,7 @@ use super::Collector;
 ///  26  - FileDeleteDetected
 pub struct SysmonCollector {
     config: SysmonConfig,
+    #[allow(dead_code)] // used on Windows only
     hostname: String,
     dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]

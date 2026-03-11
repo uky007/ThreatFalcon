@@ -21,6 +21,7 @@ use super::Collector;
 ///   from its own module instead of calling ntdll, bypassing user-mode hooks.
 pub struct EvasionCollector {
     config: EvasionConfig,
+    #[allow(dead_code)] // used on Windows only
     hostname: String,
     dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]

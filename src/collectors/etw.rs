@@ -12,6 +12,7 @@ use super::Collector;
 
 pub struct EtwCollector {
     config: EtwConfig,
+    #[allow(dead_code)] // used on Windows only
     hostname: String,
     dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
@@ -216,6 +217,7 @@ mod platform {
             String::from_utf16_lossy(&wide)
         }
 
+        #[allow(dead_code)] // available for future ETW event parsing
         fn skip(&mut self, n: usize) {
             self.pos = (self.pos + n).min(self.data.len());
         }
@@ -446,7 +448,7 @@ mod platform {
             }
 
             unsafe {
-                CloseTrace(trace);
+                let _ = CloseTrace(trace);
                 drop(Box::from_raw(ctx_ptr));
             }
         });
@@ -469,7 +471,7 @@ mod platform {
         props.Wnode.BufferSize = total as u32;
 
         unsafe {
-            ControlTraceW(
+            let _ = ControlTraceW(
                 CONTROLTRACE_HANDLE::default(),
                 windows::core::PCWSTR(session_name_wide.as_ptr()),
                 props,
