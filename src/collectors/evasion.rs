@@ -1,5 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -20,6 +22,7 @@ use super::Collector;
 pub struct EvasionCollector {
     config: EvasionConfig,
     hostname: String,
+    dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -29,6 +32,7 @@ impl EvasionCollector {
         Self {
             config,
             hostname,
+            dropped: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
         }
@@ -51,12 +55,13 @@ mod platform {
         config: EvasionConfig,
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
+        dropped: Arc<AtomicU64>,
     ) -> Result<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
 
         tokio::task::spawn_blocking(move || {
-            scan_loop(&config, &hostname, &tx, &stop_clone);
+            scan_loop(&config, &hostname, &tx, &stop_clone, &dropped);
         });
 
         Ok(stop)
@@ -67,6 +72,7 @@ mod platform {
         hostname: &str,
         tx: &mpsc::Sender<ThreatEvent>,
         stop: &Arc<AtomicBool>,
+        dropped: &Arc<AtomicU64>,
     ) {
         let interval =
             std::time::Duration::from_millis(config.scan_interval_ms);
@@ -96,6 +102,7 @@ mod platform {
                         check_etw_patching(handle, *pid, hostname)
                     {
                         if let Err(e) = tx.try_send(evt) {
+                            dropped.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(error = %e, "Evasion event dropped");
                         }
                     }
@@ -106,6 +113,7 @@ mod platform {
                         check_amsi_bypass(handle, *pid, hostname)
                     {
                         if let Err(e) = tx.try_send(evt) {
+                            dropped.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(error = %e, "Evasion event dropped");
                         }
                     }
@@ -119,6 +127,7 @@ mod platform {
                         &ntdll_reference,
                     ) {
                         if let Err(e) = tx.try_send(evt) {
+                            dropped.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(error = %e, "Evasion event dropped");
                         }
                     }
@@ -638,6 +647,7 @@ impl Collector for EvasionCollector {
                 self.config.clone(),
                 self.hostname.clone(),
                 _tx,
+                self.dropped.clone(),
             )?;
             self.stop_flag = Some(flag);
             info!("Evasion detector started");
@@ -657,5 +667,9 @@ impl Collector for EvasionCollector {
 
         info!("Evasion detector stopped");
         Ok(())
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }

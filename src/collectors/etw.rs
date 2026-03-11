@@ -1,5 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -11,6 +13,7 @@ use super::Collector;
 pub struct EtwCollector {
     config: EtwConfig,
     hostname: String,
+    dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(target_os = "windows")]
@@ -22,6 +25,7 @@ impl EtwCollector {
         Self {
             config,
             hostname,
+            dropped: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
             #[cfg(target_os = "windows")]
@@ -294,7 +298,7 @@ mod platform {
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
         stop: Arc<AtomicBool>,
-        dropped: AtomicU64,
+        dropped: Arc<AtomicU64>,
     }
 
     /// Start an ETW real-time trace session, enable the configured providers,
@@ -307,6 +311,7 @@ mod platform {
         providers: &[crate::config::EtwProviderConfig],
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
+        dropped: Arc<AtomicU64>,
     ) -> Result<(Arc<AtomicBool>, isize)> {
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -412,7 +417,7 @@ mod platform {
                 hostname,
                 tx,
                 stop: stop_clone,
-                dropped: AtomicU64::new(0),
+                dropped,
             });
             let ctx_ptr = Box::into_raw(ctx);
 
@@ -1040,6 +1045,7 @@ impl Collector for EtwCollector {
                 &self.config.providers,
                 self.hostname.clone(),
                 _tx,
+                self.dropped.clone(),
             )?;
             self.stop_flag = Some(flag);
             self.instance_lock = Some(lock);
@@ -1069,5 +1075,9 @@ impl Collector for EtwCollector {
 
         info!("ETW collector stopped");
         Ok(())
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }

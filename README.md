@@ -11,8 +11,10 @@ ThreatFalcon is early-stage software.
 - Windows is the primary target platform
 - ETW collection is implemented
 - Sysmon subscription and parsing are implemented, but disabled by default
-- Evasion-detection checks are implemented for selected techniques
+- Evasion-oriented signal collection is implemented for selected techniques
+- Sensor health events are available for local runtime visibility
 - Configuration is loaded from `threatfalcon.toml` (TOML format)
+- Events are written locally; no remote transport is built in
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -20,11 +22,12 @@ ThreatFalcon is early-stage software.
 - Keep the sensor small and auditable
 - Use straightforward event models instead of opaque binaries
 - Emit machine-readable events that are easy to inspect and test
-- Prefer explicit detection logic over black-box behavior
+- Prefer explicit collection and signal logic over black-box behavior
+- Maintain a single normalized event model across collection sources
 
 ## Current Capabilities
 
-ThreatFalcon currently normalizes telemetry into a unified `ThreatEvent` model with:
+ThreatFalcon currently emits normalized telemetry for:
 
 - process events
 - file events
@@ -33,13 +36,16 @@ ThreatFalcon currently normalizes telemetry into a unified `ThreatEvent` model w
 - image load events
 - DNS events
 - script-related events
-- evasion-detection events
+- evasion-oriented signal events for selected techniques
+- sensor health events (periodic heartbeat with uptime, throughput, and collector status)
 
-Collection sources:
+It currently collects from:
 
 - ETW
 - Sysmon
-- in-process evasion scanner
+- an in-process evasion-oriented signal collector
+
+ThreatFalcon normalizes these inputs into a unified `ThreatEvent` model for downstream inspection and comparison.
 
 ## Default Behavior
 
@@ -49,7 +55,10 @@ The built-in default configuration currently does the following:
 - rotates output at `100 MB`
 - enables ETW collection
 - disables Sysmon collection by default
-- enables evasion checks
+- enables evasion-oriented checks
+- emits periodic health events every 60 seconds by default
+
+By default, ThreatFalcon writes events locally only and does not transmit telemetry to a remote service.
 
 The default ETW provider set includes:
 
@@ -125,6 +134,10 @@ All sections are optional. Only the fields you want to override need to be speci
 # Override hostname (default: auto-detected from environment)
 hostname = "WORKSTATION-01"
 
+# Periodic health event interval in seconds (default: 60, 0 = periodic disabled)
+# A final shutdown health event is always emitted regardless of this setting.
+health_interval_secs = 60
+
 [output]
 path = "threatfalcon_events.jsonl"
 rotation_size_mb = 100
@@ -196,7 +209,7 @@ Example event shape:
 - No installer, service wrapper, or packaging yet
 - Some ETW payload parsing is best-effort and should be validated on real Windows hosts
 - Sysmon support depends on Sysmon being installed and configured
-- Evasion detection is heuristic and should be treated as signal, not ground truth
+- Evasion-oriented checks are heuristic and should be treated as signal, not ground truth
 
 ## Roadmap
 
