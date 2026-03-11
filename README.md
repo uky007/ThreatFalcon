@@ -211,19 +211,6 @@ Example event shape:
 - Sysmon support depends on Sysmon being installed and configured
 - Evasion-oriented checks are heuristic and should be treated as signal, not ground truth
 
-## Roadmap
-
-- `v1`: single-host Windows telemetry sensor
-- ~~config file loading~~ (done)
-- clearer rule and evidence metadata for detections
-- better Windows operational packaging
-- more test coverage for collectors and event mapping
-- documentation for privacy boundaries and collection scope
-- post-`v1`: multi-agent coordination and fleet visibility
-- post-`v1`: Active Directory and intranet endpoint visualization
-
-See [ROADMAP.md](/Users/uky/src/threatscope/ROADMAP.md) for the longer roadmap.
-
 ## License
 
 MIT
