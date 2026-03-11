@@ -36,11 +36,150 @@ impl EtwCollector {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-platform ETW data parsing utilities
+// ---------------------------------------------------------------------------
+pub(crate) mod parser {
+    /// Cursor-based binary reader for ETW EVENT_RECORD.UserData payloads.
+    pub struct UserDataReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        pointer_size: usize,
+    }
+
+    impl<'a> UserDataReader<'a> {
+        pub fn new(data: &'a [u8], pointer_size: usize) -> Self {
+            Self {
+                data,
+                pos: 0,
+                pointer_size,
+            }
+        }
+
+        pub fn read_u16(&mut self) -> Option<u16> {
+            if self.pos + 2 > self.data.len() {
+                return None;
+            }
+            let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+            self.pos += 2;
+            Some(v)
+        }
+
+        pub fn read_u16_be(&mut self) -> Option<u16> {
+            if self.pos + 2 > self.data.len() {
+                return None;
+            }
+            let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+            self.pos += 2;
+            Some(v)
+        }
+
+        pub fn read_u32(&mut self) -> Option<u32> {
+            if self.pos + 4 > self.data.len() {
+                return None;
+            }
+            let v = u32::from_le_bytes(
+                self.data[self.pos..self.pos + 4].try_into().ok()?,
+            );
+            self.pos += 4;
+            Some(v)
+        }
+
+        pub fn read_u64(&mut self) -> Option<u64> {
+            if self.pos + 8 > self.data.len() {
+                return None;
+            }
+            let v = u64::from_le_bytes(
+                self.data[self.pos..self.pos + 8].try_into().ok()?,
+            );
+            self.pos += 8;
+            Some(v)
+        }
+
+        pub fn read_pointer(&mut self) -> Option<u64> {
+            match self.pointer_size {
+                4 => self.read_u32().map(|v| v as u64),
+                _ => self.read_u64(),
+            }
+        }
+
+        pub fn read_ipv4(&mut self) -> Option<String> {
+            if self.pos + 4 > self.data.len() {
+                return None;
+            }
+            let b = &self.data[self.pos..self.pos + 4];
+            self.pos += 4;
+            Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+        }
+
+        pub fn read_ipv6(&mut self) -> Option<String> {
+            if self.pos + 16 > self.data.len() {
+                return None;
+            }
+            let b = &self.data[self.pos..self.pos + 16];
+            self.pos += 16;
+            let addr = std::net::Ipv6Addr::from([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
+                b[10], b[11], b[12], b[13], b[14], b[15],
+            ]);
+            Some(addr.to_string())
+        }
+
+        /// Read a null-terminated UTF-16LE string (win:UnicodeString in ETW).
+        pub fn read_utf16_nul(&mut self) -> String {
+            let start = self.pos;
+            while self.pos + 2 <= self.data.len() {
+                let c = u16::from_le_bytes([
+                    self.data[self.pos],
+                    self.data[self.pos + 1],
+                ]);
+                self.pos += 2;
+                if c == 0 {
+                    return self.decode_utf16(start, self.pos - 2);
+                }
+            }
+            // No terminator — consume remaining bytes
+            let end = self.pos;
+            self.decode_utf16(start, end)
+        }
+
+        fn decode_utf16(&self, start: usize, end: usize) -> String {
+            let wide: Vec<u16> = self.data[start..end]
+                .chunks_exact(2)
+                .map(|ch| u16::from_le_bytes([ch[0], ch[1]]))
+                .collect();
+            String::from_utf16_lossy(&wide)
+        }
+
+        #[allow(dead_code)]
+        pub fn skip(&mut self, n: usize) {
+            self.pos = (self.pos + n).min(self.data.len());
+        }
+    }
+
+    pub fn dns_query_type_name(qtype: u16) -> String {
+        match qtype {
+            1 => "A".into(),
+            2 => "NS".into(),
+            5 => "CNAME".into(),
+            6 => "SOA".into(),
+            12 => "PTR".into(),
+            15 => "MX".into(),
+            16 => "TXT".into(),
+            28 => "AAAA".into(),
+            33 => "SRV".into(),
+            255 => "ANY".into(),
+            _ => format!("TYPE{qtype}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Windows implementation: real-time ETW trace session
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
+    use super::parser::{UserDataReader, dns_query_type_name};
     use crate::events::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -104,126 +243,6 @@ mod platform {
     }
 
     // -----------------------------------------------------------------------
-    // UserDataReader: cursor-based binary reader for EVENT_RECORD.UserData
-    // -----------------------------------------------------------------------
-
-    struct UserDataReader<'a> {
-        data: &'a [u8],
-        pos: usize,
-        pointer_size: usize,
-    }
-
-    impl<'a> UserDataReader<'a> {
-        fn new(data: &'a [u8], pointer_size: usize) -> Self {
-            Self {
-                data,
-                pos: 0,
-                pointer_size,
-            }
-        }
-
-        fn read_u16(&mut self) -> Option<u16> {
-            if self.pos + 2 > self.data.len() {
-                return None;
-            }
-            let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-            self.pos += 2;
-            Some(v)
-        }
-
-        fn read_u16_be(&mut self) -> Option<u16> {
-            if self.pos + 2 > self.data.len() {
-                return None;
-            }
-            let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-            self.pos += 2;
-            Some(v)
-        }
-
-        fn read_u32(&mut self) -> Option<u32> {
-            if self.pos + 4 > self.data.len() {
-                return None;
-            }
-            let v = u32::from_le_bytes(
-                self.data[self.pos..self.pos + 4].try_into().ok()?,
-            );
-            self.pos += 4;
-            Some(v)
-        }
-
-        fn read_u64(&mut self) -> Option<u64> {
-            if self.pos + 8 > self.data.len() {
-                return None;
-            }
-            let v = u64::from_le_bytes(
-                self.data[self.pos..self.pos + 8].try_into().ok()?,
-            );
-            self.pos += 8;
-            Some(v)
-        }
-
-        fn read_pointer(&mut self) -> Option<u64> {
-            match self.pointer_size {
-                4 => self.read_u32().map(|v| v as u64),
-                _ => self.read_u64(),
-            }
-        }
-
-        fn read_ipv4(&mut self) -> Option<String> {
-            if self.pos + 4 > self.data.len() {
-                return None;
-            }
-            let b = &self.data[self.pos..self.pos + 4];
-            self.pos += 4;
-            Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
-        }
-
-        fn read_ipv6(&mut self) -> Option<String> {
-            if self.pos + 16 > self.data.len() {
-                return None;
-            }
-            let b = &self.data[self.pos..self.pos + 16];
-            self.pos += 16;
-            let addr = std::net::Ipv6Addr::from([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
-                b[10], b[11], b[12], b[13], b[14], b[15],
-            ]);
-            Some(addr.to_string())
-        }
-
-        /// Read a null-terminated UTF-16LE string (win:UnicodeString in ETW).
-        fn read_utf16_nul(&mut self) -> String {
-            let start = self.pos;
-            while self.pos + 2 <= self.data.len() {
-                let c = u16::from_le_bytes([
-                    self.data[self.pos],
-                    self.data[self.pos + 1],
-                ]);
-                self.pos += 2;
-                if c == 0 {
-                    return self.decode_utf16(start, self.pos - 2);
-                }
-            }
-            // No terminator — consume remaining bytes
-            let end = self.pos;
-            self.decode_utf16(start, end)
-        }
-
-        fn decode_utf16(&self, start: usize, end: usize) -> String {
-            let wide: Vec<u16> = self.data[start..end]
-                .chunks_exact(2)
-                .map(|ch| u16::from_le_bytes([ch[0], ch[1]]))
-                .collect();
-            String::from_utf16_lossy(&wide)
-        }
-
-        #[allow(dead_code)] // available for future ETW event parsing
-        fn skip(&mut self, n: usize) {
-            self.pos = (self.pos + n).min(self.data.len());
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -251,22 +270,6 @@ mod platform {
             4
         } else {
             8 // default to 64-bit on modern Windows
-        }
-    }
-
-    fn dns_query_type_name(qtype: u16) -> String {
-        match qtype {
-            1 => "A".into(),
-            2 => "NS".into(),
-            5 => "CNAME".into(),
-            6 => "SOA".into(),
-            12 => "PTR".into(),
-            15 => "MX".into(),
-            16 => "TXT".into(),
-            28 => "AAAA".into(),
-            33 => "SRV".into(),
-            255 => "ANY".into(),
-            _ => format!("TYPE{qtype}"),
         }
     }
 
@@ -1081,5 +1084,245 @@ impl Collector for EtwCollector {
 
     fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parser::*;
+
+    // --- Helper: encode a UTF-16LE null-terminated string into bytes ----------
+    fn utf16_nul(s: &str) -> Vec<u8> {
+        let mut buf: Vec<u8> = s
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        buf.extend_from_slice(&[0, 0]); // null terminator
+        buf
+    }
+
+    // --- UserDataReader integer tests ----------------------------------------
+
+    #[test]
+    fn read_u16_le() {
+        let data = [0x34, 0x12];
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_u16(), Some(0x1234));
+    }
+
+    #[test]
+    fn read_u16_be() {
+        let data = [0x00, 0x50]; // port 80
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_u16_be(), Some(80));
+    }
+
+    #[test]
+    fn read_u32_le() {
+        let data = 1234u32.to_le_bytes();
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_u32(), Some(1234));
+    }
+
+    #[test]
+    fn read_u64_le() {
+        let data = 0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes();
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_u64(), Some(0xDEAD_BEEF_CAFE_BABE));
+    }
+
+    #[test]
+    fn read_pointer_64bit() {
+        let data = 0x7FFE_0000_0000u64.to_le_bytes();
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_pointer(), Some(0x7FFE_0000_0000));
+    }
+
+    #[test]
+    fn read_pointer_32bit() {
+        let data = 0x7FFE_0000u32.to_le_bytes();
+        let mut r = UserDataReader::new(&data, 4);
+        assert_eq!(r.read_pointer(), Some(0x7FFE_0000));
+    }
+
+    #[test]
+    fn read_past_end_returns_none() {
+        let data = [0x01]; // only 1 byte, not enough for u16
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_u16(), None);
+        assert_eq!(r.read_u32(), None);
+        assert_eq!(r.read_u64(), None);
+    }
+
+    // --- UserDataReader IP address tests -------------------------------------
+
+    #[test]
+    fn read_ipv4() {
+        let data = [192, 168, 1, 100];
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_ipv4(), Some("192.168.1.100".into()));
+    }
+
+    #[test]
+    fn read_ipv6_loopback() {
+        let mut data = [0u8; 16];
+        data[15] = 1; // ::1
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_ipv6(), Some("::1".into()));
+    }
+
+    // --- UserDataReader UTF-16 string tests ----------------------------------
+
+    #[test]
+    fn read_utf16_nul_simple() {
+        let data = utf16_nul("cmd.exe");
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_utf16_nul(), "cmd.exe");
+    }
+
+    #[test]
+    fn read_utf16_nul_empty_string() {
+        let data = [0, 0]; // just null terminator
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_utf16_nul(), "");
+    }
+
+    #[test]
+    fn read_utf16_nul_no_terminator() {
+        // "AB" without null terminator — reader should consume all bytes
+        let data = [0x41, 0x00, 0x42, 0x00];
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_utf16_nul(), "AB");
+    }
+
+    #[test]
+    fn read_multiple_strings() {
+        let mut data = utf16_nul("hello");
+        data.extend_from_slice(&utf16_nul("world"));
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_utf16_nul(), "hello");
+        assert_eq!(r.read_utf16_nul(), "world");
+    }
+
+    // --- Composite fixture: ProcessCreate-like payload -----------------------
+
+    #[test]
+    fn fixture_process_create_payload() {
+        // Simulate Kernel-Process event ID 1 (ProcessCreate) UserData:
+        //   PID(u32), CreateTime(u64), PPID(u32), SessionID(u32),
+        //   Flags(u32), ImageName(wstr), CommandLine(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&1234u32.to_le_bytes()); // PID
+        data.extend_from_slice(&0u64.to_le_bytes());    // CreateTime
+        data.extend_from_slice(&4321u32.to_le_bytes()); // PPID
+        data.extend_from_slice(&1u32.to_le_bytes());    // SessionID
+        data.extend_from_slice(&0u32.to_le_bytes());    // Flags
+        data.extend_from_slice(&utf16_nul(r"C:\Windows\System32\cmd.exe"));
+        data.extend_from_slice(&utf16_nul("cmd.exe /c whoami"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let pid = r.read_u32().unwrap();
+        let _create_time = r.read_u64().unwrap();
+        let ppid = r.read_u32().unwrap();
+        let _session_id = r.read_u32().unwrap();
+        let _flags = r.read_u32().unwrap();
+        let image = r.read_utf16_nul();
+        let cmdline = r.read_utf16_nul();
+
+        assert_eq!(pid, 1234);
+        assert_eq!(ppid, 4321);
+        assert_eq!(image, r"C:\Windows\System32\cmd.exe");
+        assert_eq!(cmdline, "cmd.exe /c whoami");
+    }
+
+    // --- Composite fixture: TCP IPv4 network payload -------------------------
+
+    #[test]
+    fn fixture_tcp_ipv4_payload() {
+        // Simulate Kernel-Network event ID 10 (TcpSendIPv4) UserData:
+        //   PID(u32), Size(u32), DstAddr(4), SrcAddr(4),
+        //   DstPort(u16 BE), SrcPort(u16 BE)
+        let mut data = Vec::new();
+        data.extend_from_slice(&100u32.to_le_bytes());  // PID
+        data.extend_from_slice(&512u32.to_le_bytes());  // Size
+        data.extend_from_slice(&[93, 184, 216, 34]);    // DstAddr: 93.184.216.34
+        data.extend_from_slice(&[192, 168, 1, 10]);     // SrcAddr: 192.168.1.10
+        data.extend_from_slice(&443u16.to_be_bytes());  // DstPort (BE)
+        data.extend_from_slice(&50000u16.to_be_bytes()); // SrcPort (BE)
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _size = r.read_u32().unwrap();
+        let dst_addr = r.read_ipv4().unwrap();
+        let src_addr = r.read_ipv4().unwrap();
+        let dst_port = r.read_u16_be().unwrap();
+        let src_port = r.read_u16_be().unwrap();
+
+        assert_eq!(dst_addr, "93.184.216.34");
+        assert_eq!(src_addr, "192.168.1.10");
+        assert_eq!(dst_port, 443);
+        assert_eq!(src_port, 50000);
+    }
+
+    // --- Composite fixture: DNS query payload --------------------------------
+
+    #[test]
+    fn fixture_dns_query_payload() {
+        // Simulate DNS-Client event 3006 UserData:
+        //   QueryName(wstr), QueryType(u16 LE)
+        let mut data = utf16_nul("example.com");
+        data.extend_from_slice(&1u16.to_le_bytes()); // A record
+
+        let mut r = UserDataReader::new(&data, 8);
+        let query_name = r.read_utf16_nul();
+        let query_type = r.read_u16().unwrap();
+
+        assert_eq!(query_name, "example.com");
+        assert_eq!(dns_query_type_name(query_type), "A");
+    }
+
+    // --- Composite fixture: Registry SetValue payload ------------------------
+
+    #[test]
+    fn fixture_registry_set_value_payload() {
+        // Simulate Kernel-Registry event ID 5 (SetValueKey) UserData:
+        //   KeyObject(ptr), Status(u32), Type(u32), DataSize(u32),
+        //   KeyName(wstr), ValueName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234_5678_9ABCu64.to_le_bytes()); // KeyObject (64-bit ptr)
+        data.extend_from_slice(&0u32.to_le_bytes());                // Status
+        data.extend_from_slice(&1u32.to_le_bytes());                // Type (REG_SZ)
+        data.extend_from_slice(&64u32.to_le_bytes());               // DataSize
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\Test"));
+        data.extend_from_slice(&utf16_nul("MyValue"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_object = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let _value_type = r.read_u32().unwrap();
+        let _data_size = r.read_u32().unwrap();
+        let key = r.read_utf16_nul();
+        let value_name = r.read_utf16_nul();
+
+        assert_eq!(key, r"HKLM\SOFTWARE\Test");
+        assert_eq!(value_name, "MyValue");
+    }
+
+    // --- dns_query_type_name tests -------------------------------------------
+
+    #[test]
+    fn dns_type_known() {
+        assert_eq!(dns_query_type_name(1), "A");
+        assert_eq!(dns_query_type_name(28), "AAAA");
+        assert_eq!(dns_query_type_name(5), "CNAME");
+        assert_eq!(dns_query_type_name(15), "MX");
+        assert_eq!(dns_query_type_name(33), "SRV");
+        assert_eq!(dns_query_type_name(255), "ANY");
+    }
+
+    #[test]
+    fn dns_type_unknown() {
+        assert_eq!(dns_query_type_name(99), "TYPE99");
+        assert_eq!(dns_query_type_name(0), "TYPE0");
     }
 }
