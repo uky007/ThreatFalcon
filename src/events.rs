@@ -12,9 +12,40 @@ pub struct ThreatEvent {
     pub category: EventCategory,
     pub severity: Severity,
     pub data: EventData,
+    /// Present only on detection events — provides structured context
+    /// for why this event was flagged as suspicious.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<RuleMetadata>,
+}
+
+/// Structured metadata attached to detection events for explainability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleMetadata {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub mitre: MitreRef,
+    pub confidence: Confidence,
+    pub evidence: Vec<String>,
+}
+
+/// MITRE ATT&CK reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MitreRef {
+    pub tactic: String,
+    pub technique_id: String,
+    pub technique_name: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
 }
 
 impl ThreatEvent {
+    /// Create a telemetry event (no rule metadata).
     pub fn new(
         hostname: &str,
         source: EventSource,
@@ -30,6 +61,28 @@ impl ThreatEvent {
             category,
             severity,
             data,
+            rule: None,
+        }
+    }
+
+    /// Create a detection event with rule metadata.
+    pub fn with_rule(
+        hostname: &str,
+        source: EventSource,
+        category: EventCategory,
+        severity: Severity,
+        data: EventData,
+        rule: RuleMetadata,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            hostname: hostname.to_string(),
+            source,
+            category,
+            severity,
+            data,
+            rule: Some(rule),
         }
     }
 }

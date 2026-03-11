@@ -367,20 +367,44 @@ pub fn map_to_threat_event(
             },
         ),
 
-        // Event 25: Process Tampering
-        25 => (
-            EventCategory::Evasion,
-            Severity::Critical,
-            EventData::EvasionDetected {
-                technique: EvasionTechnique::ProcessHollowing,
-                pid: Some(parsed.get_u32("ProcessId")),
-                process_name: parsed.get("Image").map(String::from),
-                details: format!(
-                    "Sysmon ProcessTampering: {}",
-                    parsed.get_string("Type"),
-                ),
-            },
-        ),
+        // Event 25: Process Tampering — detection event with rule metadata
+        25 => {
+            let tampering_type = parsed.get_string("Type");
+            let target_pid = parsed.get_u32("ProcessId");
+            let image = parsed.get("Image").map(String::from);
+            let rule = RuleMetadata {
+                id: "TF-SYS-001".into(),
+                name: "Sysmon Process Tampering".into(),
+                description: "Sysmon detected process tampering such as \
+                    process hollowing or process herpaderping."
+                    .into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: "T1055.012".into(),
+                    technique_name: "Process Injection: Process Hollowing".into(),
+                },
+                confidence: Confidence::High,
+                evidence: vec![
+                    "Sysmon Event ID 25 (ProcessTampering)".into(),
+                    format!("Tampering type: {tampering_type}"),
+                    format!("Target PID: {target_pid}"),
+                    format!("Image: {}", image.as_deref().unwrap_or("unknown")),
+                ],
+            };
+            return Some(ThreatEvent::with_rule(
+                hostname,
+                source,
+                EventCategory::Evasion,
+                Severity::Critical,
+                EventData::EvasionDetected {
+                    technique: EvasionTechnique::ProcessHollowing,
+                    pid: Some(target_pid),
+                    process_name: image,
+                    details: format!("Sysmon ProcessTampering: {tampering_type}"),
+                },
+                rule,
+            ));
+        }
 
         _ => return None,
     };
@@ -646,6 +670,51 @@ mod tests {
             }
             _ => panic!("expected ImageLoad"),
         }
+    }
+
+    #[test]
+    fn process_tampering_has_rule_metadata() {
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">9999</Data>
+    <Data Name="Image">C:\malware\hollowed.exe</Data>
+    <Data Name="Type">Image is replaced</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        assert!(matches!(event.severity, Severity::Critical));
+        match &event.data {
+            EventData::EvasionDetected { technique, pid, .. } => {
+                assert!(matches!(technique, EvasionTechnique::ProcessHollowing));
+                assert_eq!(*pid, Some(9999));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
+        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        assert_eq!(rule.id, "TF-SYS-001");
+        assert_eq!(rule.mitre.technique_id, "T1055.012");
+        assert_eq!(rule.confidence, Confidence::High);
+        assert!(rule.evidence.len() >= 3);
+    }
+
+    #[test]
+    fn telemetry_events_have_no_rule() {
+        let xml = r#"<Event>
+  <System><EventID>1</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">1234</Data>
+    <Data Name="ParentProcessId">5678</Data>
+    <Data Name="Image">C:\test.exe</Data>
+    <Data Name="CommandLine">test.exe</Data>
+    <Data Name="User">SYSTEM</Data>
+    <Data Name="IntegrityLevel">High</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        assert!(event.rule.is_none(), "telemetry events should not have rule metadata");
     }
 
     #[test]

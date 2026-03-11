@@ -966,16 +966,42 @@ mod platform {
             // -----------------------------------------------------------
             // Threat Intelligence
             // -----------------------------------------------------------
-            "Microsoft-Windows-Threat-Intelligence" => (
-                EventCategory::Evasion,
-                Severity::High,
-                EventData::EvasionDetected {
-                    technique: EvasionTechnique::ProcessHollowing,
-                    pid: Some(pid),
-                    process_name: None,
-                    details: format!("TI ETW event {event_id}"),
-                },
-            ),
+            "Microsoft-Windows-Threat-Intelligence" => {
+                let rule = RuleMetadata {
+                    id: "TF-TI-001".into(),
+                    name: "Threat Intelligence ETW Alert".into(),
+                    description: "Windows Threat Intelligence ETW provider \
+                        reported suspicious activity such as process \
+                        hollowing or code injection."
+                        .into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: "T1055".into(),
+                        technique_name: "Process Injection".into(),
+                    },
+                    confidence: Confidence::High,
+                    evidence: vec![
+                        format!("TI ETW event ID: {event_id}"),
+                        format!("Source PID: {pid}"),
+                    ],
+                };
+                let event = ThreatEvent::with_rule(
+                    hostname,
+                    EventSource::Etw {
+                        provider: provider.to_string(),
+                    },
+                    EventCategory::Evasion,
+                    Severity::High,
+                    EventData::EvasionDetected {
+                        technique: EvasionTechnique::ProcessHollowing,
+                        pid: Some(pid),
+                        process_name: None,
+                        details: format!("TI ETW event {event_id}"),
+                    },
+                    rule,
+                );
+                return Some(event);
+            }
 
             _ => return None,
         };
