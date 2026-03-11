@@ -2,7 +2,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const CONFIG_FILE: &str = "threatfalcon.toml";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SensorConfig {
     pub hostname: String,
     pub output: OutputConfig,
@@ -10,6 +13,7 @@ pub struct SensorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OutputConfig {
     pub path: PathBuf,
     pub format: OutputFormat,
@@ -22,6 +26,7 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CollectorConfig {
     pub etw: EtwConfig,
     pub sysmon: SysmonConfig,
@@ -29,6 +34,7 @@ pub struct CollectorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EtwConfig {
     pub enabled: bool,
     pub providers: Vec<EtwProviderConfig>,
@@ -38,16 +44,71 @@ pub struct EtwConfig {
 pub struct EtwProviderConfig {
     pub name: String,
     pub guid: String,
+    #[serde(default = "default_level")]
     pub level: u8,
+    #[serde(
+        default = "default_keywords",
+        deserialize_with = "deserialize_keywords",
+        serialize_with = "serialize_keywords"
+    )]
     pub keywords: u64,
 }
 
+fn default_level() -> u8 {
+    5
+}
+fn default_keywords() -> u64 {
+    0xFFFFFFFFFFFFFFFF
+}
+
+/// Deserialize keywords from either a hex string ("0xFF..") or an integer.
+fn deserialize_keywords<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct KeywordsVisitor;
+
+    impl<'de> de::Visitor<'de> for KeywordsVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a hex string (\"0xFF..\") or an integer")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<u64, E> {
+            Ok(v as u64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<u64, E> {
+            let s = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+            u64::from_str_radix(s, 16).map_err(de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(KeywordsVisitor)
+}
+
+fn serialize_keywords<S>(value: &u64, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("0x{value:016X}"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SysmonConfig {
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EvasionConfig {
     pub enabled: bool,
     pub scan_interval_ms: u64,
@@ -59,8 +120,20 @@ pub struct EvasionConfig {
 
 impl SensorConfig {
     pub fn load() -> Result<Self> {
-        // TODO: Load from TOML/YAML config file
-        Ok(Self::default())
+        let path = PathBuf::from(CONFIG_FILE);
+
+        if !path.exists() {
+            tracing::info!(
+                "No config file found at {CONFIG_FILE} — using defaults"
+            );
+            return Ok(Self::default());
+        }
+
+        let content = std::fs::read_to_string(&path)?;
+        let config: SensorConfig = toml::from_str(&content)?;
+
+        tracing::info!("Loaded config from {CONFIG_FILE}");
+        Ok(config)
     }
 }
 
@@ -68,28 +141,56 @@ impl Default for SensorConfig {
     fn default() -> Self {
         Self {
             hostname: hostname(),
-            output: OutputConfig {
-                path: PathBuf::from("threatfalcon_events.jsonl"),
-                format: OutputFormat::JsonLines,
-                rotation_size_mb: 100,
-            },
-            collectors: CollectorConfig {
-                etw: EtwConfig {
-                    enabled: true,
-                    providers: default_etw_providers(),
-                },
-                sysmon: SysmonConfig {
-                    enabled: false,
-                },
-                evasion: EvasionConfig {
-                    enabled: true,
-                    scan_interval_ms: 5000,
-                    detect_etw_patching: true,
-                    detect_amsi_bypass: true,
-                    detect_unhooking: true,
-                    detect_direct_syscall: true,
-                },
-            },
+            output: OutputConfig::default(),
+            collectors: CollectorConfig::default(),
+        }
+    }
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("threatfalcon_events.jsonl"),
+            format: OutputFormat::JsonLines,
+            rotation_size_mb: 100,
+        }
+    }
+}
+
+impl Default for CollectorConfig {
+    fn default() -> Self {
+        Self {
+            etw: EtwConfig::default(),
+            sysmon: SysmonConfig::default(),
+            evasion: EvasionConfig::default(),
+        }
+    }
+}
+
+impl Default for EtwConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            providers: default_etw_providers(),
+        }
+    }
+}
+
+impl Default for SysmonConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+impl Default for EvasionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_interval_ms: 5000,
+            detect_etw_patching: true,
+            detect_amsi_bypass: true,
+            detect_unhooking: true,
+            detect_direct_syscall: true,
         }
     }
 }
@@ -151,4 +252,110 @@ fn default_etw_providers() -> Vec<EtwProviderConfig> {
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        let cfg = SensorConfig::default();
+        assert!(cfg.collectors.etw.enabled);
+        assert!(!cfg.collectors.sysmon.enabled);
+        assert!(cfg.collectors.evasion.enabled);
+        assert_eq!(cfg.output.rotation_size_mb, 100);
+        assert_eq!(cfg.collectors.etw.providers.len(), 8);
+    }
+
+    #[test]
+    fn empty_toml_uses_defaults() {
+        let cfg: SensorConfig = toml::from_str("").unwrap();
+        assert!(cfg.collectors.etw.enabled);
+        assert_eq!(cfg.collectors.etw.providers.len(), 8);
+        assert_eq!(cfg.output.rotation_size_mb, 100);
+    }
+
+    #[test]
+    fn partial_toml_merges_with_defaults() {
+        let toml = r#"
+            hostname = "WORKSTATION-01"
+
+            [output]
+            path = "custom.jsonl"
+            rotation_size_mb = 50
+
+            [collectors.sysmon]
+            enabled = true
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.hostname, "WORKSTATION-01");
+        assert_eq!(cfg.output.path, PathBuf::from("custom.jsonl"));
+        assert_eq!(cfg.output.rotation_size_mb, 50);
+        assert!(cfg.collectors.sysmon.enabled);
+        // Untouched fields keep defaults
+        assert!(cfg.collectors.etw.enabled);
+        assert!(cfg.collectors.evasion.enabled);
+    }
+
+    #[test]
+    fn keywords_hex_string() {
+        let toml = r#"
+            [[collectors.etw.providers]]
+            name = "Test"
+            guid = "00000000-0000-0000-0000-000000000000"
+            keywords = "0x0000000000000010"
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.collectors.etw.providers[0].keywords, 0x10);
+    }
+
+    #[test]
+    fn keywords_integer() {
+        let toml = r#"
+            [[collectors.etw.providers]]
+            name = "Test"
+            guid = "00000000-0000-0000-0000-000000000000"
+            keywords = 255
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.collectors.etw.providers[0].keywords, 255);
+    }
+
+    #[test]
+    fn evasion_partial_overrides() {
+        let toml = r#"
+            [collectors.evasion]
+            detect_unhooking = false
+            scan_interval_ms = 10000
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.collectors.evasion.detect_unhooking);
+        assert_eq!(cfg.collectors.evasion.scan_interval_ms, 10000);
+        // Other evasion defaults preserved
+        assert!(cfg.collectors.evasion.detect_etw_patching);
+        assert!(cfg.collectors.evasion.detect_amsi_bypass);
+    }
+
+    #[test]
+    fn custom_providers_replace_defaults() {
+        let toml = r#"
+            [collectors.etw]
+            providers = [
+                { name = "Only-This", guid = "11111111-1111-1111-1111-111111111111" },
+            ]
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.collectors.etw.providers.len(), 1);
+        assert_eq!(cfg.collectors.etw.providers[0].name, "Only-This");
+    }
+
+    #[test]
+    fn roundtrip_serialization() {
+        let cfg = SensorConfig::default();
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let cfg2: SensorConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.collectors.etw.providers.len(), cfg2.collectors.etw.providers.len());
+        assert_eq!(cfg.output.rotation_size_mb, cfg2.output.rotation_size_mb);
+    }
 }
