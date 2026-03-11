@@ -161,6 +161,10 @@ pub(crate) mod parser {
             String::from_utf16_lossy(&wide)
         }
 
+        pub fn position(&self) -> usize {
+            self.pos
+        }
+
         #[allow(dead_code)]
         pub fn skip(&mut self, n: usize) {
             self.pos = (self.pos + n).min(self.data.len());
@@ -627,7 +631,7 @@ mod platform {
                     //   TimeDateStamp(u32), DefaultBase(ptr),
                     //   SignatureLevel(u8), SignatureType(u8),
                     //   ...padding/flags..., FileName(wstr)
-                    let (process_id, image_base, file_name) = data
+                    let (process_id, _image_base, file_name) = data
                         .and_then(|d| {
                             let mut r = UserDataReader::new(d, ps);
                             let process_id = r.read_u32()?;
@@ -1121,7 +1125,7 @@ mod platform {
             let _calling_protection = r.read_u8()?;
             let calling_tid = r.read_u32()?;
             let _calling_thread_create_time = r.read_u64()?;
-            Some((calling_pid, calling_tid, r.pos))
+            Some((calling_pid, calling_tid, r.position()))
         });
         let (calling_pid, _calling_tid, header_end) =
             header.unwrap_or((pid, 0, 0));
@@ -1140,7 +1144,7 @@ mod platform {
                 let _target_sig_level = r.read_u8()?;
                 let _target_sec_sig_level = r.read_u8()?;
                 let _target_protection = r.read_u8()?;
-                Some((target_pid, header_end + r.pos))
+                Some((target_pid, header_end + r.position()))
             })
         } else {
             None
