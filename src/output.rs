@@ -21,13 +21,14 @@ impl EventWriter {
         let path = config.path.to_string_lossy().to_string();
         let existing_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let file = open_append(&path)?;
+        let generation = find_max_generation(&path);
 
         Ok(Self {
             writer: BufWriter::new(file),
             bytes_written: existing_size,
             rotation_bytes: config.rotation_size_mb * 1024 * 1024,
             base_path: path,
-            generation: 0,
+            generation,
         })
     }
 
@@ -72,6 +73,35 @@ impl EventWriter {
         self.bytes_written = 0;
         Ok(())
     }
+}
+
+/// Scan for existing rotated files (`base_path.1`, `.2`, ...) and return the
+/// highest generation number found, so the next rotation won't overwrite them.
+fn find_max_generation(base_path: &str) -> u32 {
+    let parent = Path::new(base_path)
+        .parent()
+        .unwrap_or(Path::new("."));
+    let filename = match Path::new(base_path).file_name().and_then(|n| n.to_str()) {
+        Some(f) => f,
+        None => return 0,
+    };
+
+    let prefix = format!("{filename}.");
+    let mut max_gen = 0u32;
+
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(suffix) = name.strip_prefix(&prefix) {
+                if let Ok(gen) = suffix.parse::<u32>() {
+                    max_gen = max_gen.max(gen);
+                }
+            }
+        }
+    }
+
+    max_gen
 }
 
 fn open_append(path: &str) -> Result<File> {

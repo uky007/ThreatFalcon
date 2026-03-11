@@ -71,9 +71,9 @@ mod platform {
         let interval =
             std::time::Duration::from_millis(config.scan_interval_ms);
 
-        // Load the on-disk ntdll .text section as baseline for unhooking
-        // detection — NOT our own in-memory copy, which may already be hooked.
-        let ntdll_reference = load_ondisk_ntdll_text();
+        // Build a reference for ntdll unhooking detection: on-disk clean
+        // copy + whether our own in-memory ntdll has EDR hooks installed.
+        let ntdll_reference = build_ntdll_reference();
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -95,7 +95,9 @@ mod platform {
                     if let Some(evt) =
                         check_etw_patching(handle, *pid, hostname)
                     {
-                        let _ = tx.try_send(evt);
+                        if let Err(e) = tx.try_send(evt) {
+                            tracing::warn!(error = %e, "Evasion event dropped");
+                        }
                     }
                 }
 
@@ -103,7 +105,9 @@ mod platform {
                     if let Some(evt) =
                         check_amsi_bypass(handle, *pid, hostname)
                     {
-                        let _ = tx.try_send(evt);
+                        if let Err(e) = tx.try_send(evt) {
+                            tracing::warn!(error = %e, "Evasion event dropped");
+                        }
                     }
                 }
 
@@ -114,7 +118,9 @@ mod platform {
                         hostname,
                         &ntdll_reference,
                     ) {
-                        let _ = tx.try_send(evt);
+                        if let Err(e) = tx.try_send(evt) {
+                            tracing::warn!(error = %e, "Evasion event dropped");
+                        }
                     }
                 }
 
@@ -290,23 +296,91 @@ mod platform {
 
     // ---- ntdll unhooking detection ------------------------------------------
 
+    /// Reference data for ntdll unhooking detection.
+    struct NtdllReference {
+        /// Clean .text section bytes read from on-disk ntdll.dll
+        ondisk_text: Vec<u8>,
+        /// RVA of the .text section
+        text_rva: u32,
+        /// Size of the .text section
+        text_size: u32,
+        /// Whether our own in-memory ntdll differs from on-disk (EDR hooks)
+        hooks_present: bool,
+    }
+
+    /// Build the reference by loading the on-disk ntdll and comparing it
+    /// with our own in-memory copy to detect whether hooks are installed.
+    fn build_ntdll_reference() -> Option<NtdllReference> {
+        let (ondisk_text, text_rva, text_size) = load_ondisk_ntdll_text()?;
+
+        // Read our own in-memory ntdll .text to check for hooks
+        let our_ntdll = unsafe {
+            GetModuleHandleA(windows::core::PCSTR(
+                b"ntdll.dll\0".as_ptr(),
+            ))
+        }
+        .ok()?;
+        let sample = ondisk_text.len().min(text_size as usize);
+        let our_text = unsafe {
+            std::slice::from_raw_parts(
+                (our_ntdll.0 as usize + text_rva as usize) as *const u8,
+                sample,
+            )
+        };
+
+        let our_diff = our_text
+            .iter()
+            .zip(ondisk_text.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        // >0.5% diff from on-disk indicates hooks are installed
+        let hooks_present = our_diff > sample / 200;
+
+        if hooks_present {
+            tracing::info!(
+                diff_bytes = our_diff,
+                total_bytes = sample,
+                "EDR hooks detected in our ntdll .text section"
+            );
+        } else {
+            tracing::debug!(
+                "No EDR hooks detected — ntdll unhooking detection inactive"
+            );
+        }
+
+        Some(NtdllReference {
+            ondisk_text,
+            text_rva,
+            text_size,
+            hooks_present,
+        })
+    }
+
     fn check_ntdll_unhooking(
         handle: HANDLE,
         pid: u32,
         hostname: &str,
-        reference: &Option<(Vec<u8>, u32, u32)>,
+        reference: &Option<NtdllReference>,
     ) -> Option<ThreatEvent> {
-        let (ref_text, text_rva, text_size) = reference.as_ref()?;
-        let ntdll_base = find_module_in_process(handle, "ntdll.dll")?;
+        let reference = reference.as_ref()?;
 
-        let sample_len = (*text_size as usize).min(ref_text.len());
+        // If no hooks are present in our environment, unhooking detection
+        // is not meaningful — every process would have a clean ntdll.
+        if !reference.hooks_present {
+            return None;
+        }
+
+        let ntdll_base = find_module_in_process(handle, "ntdll.dll")?;
+        let sample_len =
+            (reference.text_size as usize).min(reference.ondisk_text.len());
         let mut remote_text = vec![0u8; sample_len];
         let mut read = 0usize;
 
         let ok = unsafe {
             ReadProcessMemory(
                 handle,
-                (ntdll_base + *text_rva as usize)
+                (ntdll_base + reference.text_rva as usize)
                     as *const std::ffi::c_void,
                 remote_text.as_mut_ptr() as *mut std::ffi::c_void,
                 sample_len,
@@ -318,26 +392,19 @@ mod platform {
             return None;
         }
 
-        // Compare the remote process's ntdll .text with the on-disk reference.
-        // If the on-disk (clean) matches and it differs from what EDR hooks
-        // installed, the process has unhooked ntdll.
-        //
-        // We compare with the on-disk baseline.  Our own in-memory ntdll may
-        // have hooks that the target process removed — a significant diff
-        // against the on-disk copy means tampering.
+        // Compare the remote process's ntdll .text with the on-disk copy.
+        // If the remote copy closely matches the clean on-disk copy despite
+        // EDR hooks being present in our environment, the process has
+        // replaced its hooked ntdll with a clean one (unhooking).
         let diff_count = remote_text
             .iter()
-            .zip(ref_text.iter())
+            .zip(reference.ondisk_text.iter())
             .filter(|(a, b)| a != b)
             .count();
 
-        // If the remote copy matches the clean on-disk copy very closely
-        // but our in-memory copy would differ (due to hooks), that IS
-        // the unhooking scenario.  However, many legitimate processes also
-        // have a clean ntdll.  To reduce false positives we only alert when
-        // the diff is non-trivial (i.e. something was actively changed).
-        // Threshold: >1% of sampled bytes differ from on-disk.
-        if diff_count > sample_len / 100 {
+        // Threshold: fewer than 0.5% of bytes differ from the clean copy
+        // while hooks are known to be present → unhooking detected.
+        if diff_count < sample_len / 200 {
             return Some(ThreatEvent::new(
                 hostname,
                 EventSource::EvasionDetector,
@@ -348,8 +415,9 @@ mod platform {
                     pid: Some(pid),
                     process_name: None,
                     details: format!(
-                        "ntdll .text section differs by \
-                         {diff_count}/{sample_len} bytes vs on-disk reference"
+                        "ntdll .text matches clean on-disk copy \
+                         ({diff_count}/{sample_len} bytes differ) — \
+                         possible unhooking"
                     ),
                 },
             ));

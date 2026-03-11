@@ -35,7 +35,7 @@ impl EtwCollector {
 mod platform {
     use super::*;
     use crate::events::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use windows::core::GUID;
     use windows::Win32::Foundation::*;
@@ -237,6 +237,7 @@ mod platform {
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
         stop: Arc<AtomicBool>,
+        dropped: AtomicU64,
     }
 
     /// Start an ETW real-time trace session, enable the configured providers,
@@ -248,35 +249,61 @@ mod platform {
     ) -> Result<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
 
-        // ---- Try to clean up any stale session from a previous crash --------
-        cleanup_stale_session();
-
         // ---- allocate EVENT_TRACE_PROPERTIES --------------------------------
         let session_name_wide: Vec<u16> = SESSION_NAME
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let extra = session_name_wide.len() * 2;
-        let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + extra;
-        let mut buf = vec![0u8; total];
-        let props =
-            unsafe { &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-        props.Wnode.BufferSize = total as u32;
-        props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props.Wnode.ClientContext = 1; // QPC
-        props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        props.LoggerNameOffset =
-            std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+
+        let init_props = |buf: &mut Vec<u8>| {
+            let extra = session_name_wide.len() * 2;
+            let total =
+                std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + extra;
+            buf.resize(total, 0);
+            buf.fill(0);
+            let props = unsafe {
+                &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES)
+            };
+            props.Wnode.BufferSize = total as u32;
+            props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+            props.Wnode.ClientContext = 1; // QPC
+            props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+            props.LoggerNameOffset =
+                std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+            props
+        };
+
+        let mut buf = Vec::new();
+        let props = init_props(&mut buf);
 
         // ---- start trace ----------------------------------------------------
         let mut handle = CONTROLTRACE_HANDLE::default();
-        let status = unsafe {
+        let mut status = unsafe {
             StartTraceW(
                 &mut handle,
                 windows::core::PCWSTR(session_name_wide.as_ptr()),
                 props,
             )
         };
+
+        // ERROR_ALREADY_EXISTS (183): a session with the same name exists,
+        // likely from a previous crash. Stop it and retry once.
+        if status.0 == 183 {
+            tracing::warn!(
+                "ETW session already exists — stopping stale session"
+            );
+            stop_session();
+
+            let props = init_props(&mut buf);
+            status = unsafe {
+                StartTraceW(
+                    &mut handle,
+                    windows::core::PCWSTR(session_name_wide.as_ptr()),
+                    props,
+                )
+            };
+        }
+
         if status != WIN32_ERROR(0) {
             anyhow::bail!("StartTraceW failed: {status:?}");
         }
@@ -321,6 +348,7 @@ mod platform {
                 hostname,
                 tx,
                 stop: stop_clone,
+                dropped: AtomicU64::new(0),
             });
             let ctx_ptr = Box::into_raw(ctx);
 
@@ -380,12 +408,6 @@ mod platform {
         }
     }
 
-    /// Remove a leftover session from a previous crash so StartTraceW won't
-    /// fail with ERROR_ALREADY_EXISTS.
-    fn cleanup_stale_session() {
-        stop_session();
-    }
-
     // -----------------------------------------------------------------------
     // Event callback & mapping — now with UserData parsing
     // -----------------------------------------------------------------------
@@ -408,7 +430,15 @@ mod platform {
         if let Some(event) =
             unsafe { map_event(rec, provider_name, event_id, pid, &ctx.hostname) }
         {
-            let _ = ctx.tx.try_send(event);
+            if let Err(_) = ctx.tx.try_send(event) {
+                let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() || n % 1000 == 0 {
+                    tracing::warn!(
+                        total_dropped = n,
+                        "ETW events dropped due to channel backpressure"
+                    );
+                }
+            }
         }
     }
 

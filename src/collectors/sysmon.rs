@@ -51,7 +51,7 @@ impl SysmonCollector {
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use windows::core::PCWSTR;
     use windows::Win32::System::EventLog::*;
@@ -105,6 +105,7 @@ mod platform {
         let ctx = Box::new(SubscribeContext {
             hostname: hostname.to_string(),
             tx,
+            dropped: AtomicU64::new(0),
         });
         let ctx_ptr = Box::into_raw(ctx);
 
@@ -144,6 +145,7 @@ mod platform {
     struct SubscribeContext {
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
+        dropped: AtomicU64,
     }
 
     unsafe extern "system" fn subscription_callback(
@@ -158,7 +160,15 @@ mod platform {
         let ctx = unsafe { &*(usercontext as *const SubscribeContext) };
 
         if let Some(te) = render_and_map(event, &ctx.hostname) {
-            let _ = ctx.tx.try_send(te);
+            if let Err(_) = ctx.tx.try_send(te) {
+                let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() || n % 1000 == 0 {
+                    tracing::warn!(
+                        total_dropped = n,
+                        "Sysmon events dropped due to channel backpressure"
+                    );
+                }
+            }
         }
         0
     }
