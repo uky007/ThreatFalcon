@@ -17,4 +17,8 @@ pub trait Collector: Send + Sync {
     async fn start(&mut self, tx: mpsc::Sender<ThreatEvent>) -> Result<()>;
     /// Signal background threads to stop and clean up OS resources.
     async fn stop(&mut self) -> Result<()>;
+    /// Number of events dropped inside this collector (e.g. channel backpressure).
+    fn dropped_events(&self) -> u64 {
+        0
+    }
 }

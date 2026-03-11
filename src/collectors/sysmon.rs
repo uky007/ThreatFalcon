@@ -1,5 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -33,6 +35,7 @@ use super::Collector;
 pub struct SysmonCollector {
     config: SysmonConfig,
     hostname: String,
+    dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -42,6 +45,7 @@ impl SysmonCollector {
         Self {
             config,
             hostname,
+            dropped: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
         }
@@ -64,12 +68,13 @@ mod platform {
     pub fn start_subscription(
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
+        dropped: Arc<AtomicU64>,
     ) -> Result<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
 
         tokio::task::spawn_blocking(move || {
-            subscribe_events(&hostname, tx, stop_clone);
+            subscribe_events(&hostname, tx, stop_clone, dropped);
         });
 
         Ok(stop)
@@ -79,6 +84,7 @@ mod platform {
         hostname: &str,
         tx: mpsc::Sender<ThreatEvent>,
         stop: Arc<AtomicBool>,
+        dropped: Arc<AtomicU64>,
     ) {
         let channel_wide: Vec<u16> = SYSMON_CHANNEL
             .encode_utf16()
@@ -106,7 +112,7 @@ mod platform {
         let ctx = Box::new(SubscribeContext {
             hostname: hostname.to_string(),
             tx,
-            dropped: AtomicU64::new(0),
+            dropped,
         });
         let ctx_ptr = Box::into_raw(ctx);
 
@@ -150,7 +156,7 @@ mod platform {
     struct SubscribeContext {
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
-        dropped: AtomicU64,
+        dropped: Arc<AtomicU64>,
     }
 
     unsafe extern "system" fn subscription_callback(
@@ -252,6 +258,7 @@ impl Collector for SysmonCollector {
             let flag = platform::start_subscription(
                 self.hostname.clone(),
                 _tx,
+                self.dropped.clone(),
             )?;
             self.stop_flag = Some(flag);
             info!("Sysmon collector started (push-based subscription)");
@@ -271,5 +278,9 @@ impl Collector for SysmonCollector {
 
         info!("Sysmon collector stopped");
         Ok(())
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }

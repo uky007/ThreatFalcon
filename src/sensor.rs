@@ -94,9 +94,10 @@ impl Sensor {
 
         let mut writer = EventWriter::new(&self.config.output)?;
         let mut event_count = 0u64;
-        let mut drop_count = 0u64;
+        let mut write_failures = 0u64;
 
-        // Health tick — interval of 0 means disabled
+        // Health tick — interval of 0 disables periodic health events
+        // (a final shutdown health event is always emitted regardless)
         let health_interval = self.config.health_interval_secs;
         let mut health_tick = if health_interval > 0 {
             tokio::time::interval(std::time::Duration::from_secs(health_interval))
@@ -116,7 +117,7 @@ impl Sensor {
                         Some(evt) => {
                             if let Err(e) = writer.write_event(&evt) {
                                 error!(error = %e, "Failed to write event");
-                                drop_count += 1;
+                                write_failures += 1;
                             }
                             event_count += 1;
                             if event_count % 1000 == 0 {
@@ -130,11 +131,12 @@ impl Sensor {
                     }
                 }
                 _ = health_tick.tick() => {
+                    let total_dropped = write_failures + self.collector_drops();
                     let health = self.build_health_event(
                         &collector_states,
                         &start_time,
                         event_count,
-                        drop_count,
+                        total_dropped,
                     );
                     if let Err(e) = writer.write_event(&health) {
                         error!(error = %e, "Failed to write health event");
@@ -142,7 +144,7 @@ impl Sensor {
                     info!(
                         uptime_secs = start_time.elapsed().as_secs(),
                         events_total = event_count,
-                        events_dropped = drop_count,
+                        events_dropped = total_dropped,
                         "Health check"
                     );
                 }
@@ -168,11 +170,12 @@ impl Sensor {
         }
 
         // Final health event
+        let total_dropped = write_failures + self.collector_drops();
         let final_health = self.build_health_event(
             &collector_states,
             &start_time,
             event_count,
-            drop_count,
+            total_dropped,
         );
         if let Err(e) = writer.write_event(&final_health) {
             error!(error = %e, "Failed to write final health event");
@@ -180,6 +183,11 @@ impl Sensor {
 
         info!(total_events = event_count, "Sensor stopped");
         Ok(())
+    }
+
+    /// Sum of events dropped across all collectors (channel backpressure).
+    fn collector_drops(&self) -> u64 {
+        self.collectors.iter().map(|c| c.dropped_events()).sum()
     }
 
     fn build_health_event(
