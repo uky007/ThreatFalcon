@@ -1110,9 +1110,10 @@ mod platform {
         ps: usize,
     ) -> ThreatEvent {
         // Try to parse the common TI header present in all events.
+        // CallingProcessId is win:Pointer (ptr-sized), not u32.
         let header = data.and_then(|d| {
             let mut r = UserDataReader::new(d, ps);
-            let calling_pid = r.read_u32()?;
+            let calling_pid = r.read_pointer()? as u32;
             let _calling_create_time = r.read_u64()?;
             let _calling_start_key = r.read_u64()?;
             let _calling_sig_level = r.read_u8()?;
@@ -1126,13 +1127,14 @@ mod platform {
             header.unwrap_or((pid, 0, 0));
 
         // For remote operations (IDs 1-5), parse the target process fields.
+        // TargetProcessId is also win:Pointer.
         let target = if matches!(event_id, 1..=5) {
             data.and_then(|d| {
                 if header_end >= d.len() {
                     return None;
                 }
                 let mut r = UserDataReader::new(&d[header_end..], ps);
-                let target_pid = r.read_u32()?;
+                let target_pid = r.read_pointer()? as u32;
                 let _target_create_time = r.read_u64()?;
                 let _target_start_key = r.read_u64()?;
                 let _target_sig_level = r.read_u8()?;
@@ -1165,6 +1167,7 @@ mod platform {
                     let base = r.read_pointer()?;
                     let size = r.read_pointer()?;
                     let protection = r.read_u32()?;
+                    let _old_protection = r.read_u32()?;
                     Some((base, size, protection))
                 }
                 // MAPVIEW_REMOTE / MAPVIEW_LOCAL
@@ -1174,6 +1177,18 @@ mod platform {
                     let _alloc_type = r.read_u32()?;
                     let protection = r.read_u32()?;
                     Some((base, size, protection))
+                }
+                // QUEUEAPC_REMOTE
+                4 => {
+                    let _target_tid = r.read_u32()?;
+                    let apc_routine = r.read_pointer()?;
+                    Some((apc_routine, 0, 0))
+                }
+                // SETTHREADCONTEXT_REMOTE
+                5 => {
+                    let _target_tid = r.read_u32()?;
+                    let context_flags = r.read_u32()?;
+                    Some((0, 0, context_flags))
                 }
                 _ => None,
             }
@@ -1266,9 +1281,21 @@ mod platform {
             evidence.push(format!("Target PID: {target_pid}"));
         }
         if let Some((base, size, protection)) = specifics {
-            evidence.push(format!("BaseAddress: 0x{base:X}"));
-            evidence.push(format!("RegionSize: 0x{size:X}"));
-            evidence.push(format!("Protection: 0x{protection:08X}"));
+            match event_id {
+                4 => {
+                    // QUEUEAPC: base=ApcRoutine, size/protection unused
+                    evidence.push(format!("ApcRoutine: 0x{base:X}"));
+                }
+                5 => {
+                    // SETCONTEXT: protection=ContextFlags, base/size unused
+                    evidence.push(format!("ContextFlags: 0x{protection:08X}"));
+                }
+                _ => {
+                    evidence.push(format!("BaseAddress: 0x{base:X}"));
+                    evidence.push(format!("RegionSize: 0x{size:X}"));
+                    evidence.push(format!("Protection: 0x{protection:08X}"));
+                }
+            }
         }
 
         let details = if matches!(event_id, 1..=5) && target_pid > 0 {
@@ -1789,7 +1816,7 @@ mod tests {
 
     // --- Composite fixture: TI common header parsing -------------------------
 
-    /// Build a TI common header: CallingProcessId(u32),
+    /// Build a TI common header (64-bit): CallingProcessId(ptr),
     /// CallingProcessCreateTime(u64), CallingProcessStartKey(u64),
     /// CallingProcessSignatureLevel(u8),
     /// CallingProcessSectionSignatureLevel(u8),
@@ -1797,7 +1824,8 @@ mod tests {
     /// CallingThreadCreateTime(u64)
     fn build_ti_common_header(calling_pid: u32, calling_tid: u32) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&calling_pid.to_le_bytes()); // CallingProcessId
+        // CallingProcessId is win:Pointer (8 bytes on 64-bit)
+        buf.extend_from_slice(&(calling_pid as u64).to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes()); // CallingProcessCreateTime
         buf.extend_from_slice(&0u64.to_le_bytes()); // CallingProcessStartKey
         buf.push(6); // CallingProcessSignatureLevel
@@ -1808,14 +1836,15 @@ mod tests {
         buf
     }
 
-    /// Build TI target process header: TargetProcessId(u32),
+    /// Build TI target process header (64-bit): TargetProcessId(ptr),
     /// TargetProcessCreateTime(u64), TargetProcessStartKey(u64),
     /// TargetProcessSignatureLevel(u8),
     /// TargetProcessSectionSignatureLevel(u8),
     /// TargetProcessProtection(u8)
     fn build_ti_target_header(target_pid: u32) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&target_pid.to_le_bytes()); // TargetProcessId
+        // TargetProcessId is win:Pointer (8 bytes on 64-bit)
+        buf.extend_from_slice(&(target_pid as u64).to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes()); // TargetProcessCreateTime
         buf.extend_from_slice(&0u64.to_le_bytes()); // TargetProcessStartKey
         buf.push(0); // TargetProcessSignatureLevel
@@ -1829,7 +1858,7 @@ mod tests {
         let data = build_ti_common_header(1234, 5678);
         let mut r = UserDataReader::new(&data, 8);
 
-        let calling_pid = r.read_u32().unwrap();
+        let calling_pid = r.read_pointer().unwrap() as u32;
         let _create_time = r.read_u64().unwrap();
         let _start_key = r.read_u64().unwrap();
         let sig_level = r.read_u8().unwrap();
@@ -1856,12 +1885,11 @@ mod tests {
         data.extend(build_ti_target_header(999));
         data.extend_from_slice(&0x1000_0000u64.to_le_bytes()); // BaseAddress
         data.extend_from_slice(&0x2000u64.to_le_bytes()); // RegionSize
-        data.extend_from_slice(&0x3000u32.to_le_bytes()); // AllocationType (MEM_COMMIT | MEM_RESERVE)
+        data.extend_from_slice(&0x3000u32.to_le_bytes()); // AllocationType
         data.extend_from_slice(&0x40u32.to_le_bytes()); // Protection (PAGE_EXECUTE_READWRITE)
 
-        // Parse: common header
         let mut r = UserDataReader::new(&data, 8);
-        let calling_pid = r.read_u32().unwrap();
+        let calling_pid = r.read_pointer().unwrap() as u32;
         let _ct = r.read_u64().unwrap();
         let _sk = r.read_u64().unwrap();
         let _sl = r.read_u8().unwrap();
@@ -1870,7 +1898,7 @@ mod tests {
         let calling_tid = r.read_u32().unwrap();
         let _tct = r.read_u64().unwrap();
         // Target header
-        let target_pid = r.read_u32().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
         let _tpc = r.read_u64().unwrap();
         let _tpk = r.read_u64().unwrap();
         let _tsl = r.read_u8().unwrap();
@@ -1895,16 +1923,18 @@ mod tests {
     #[test]
     fn fixture_ti_protectvm_remote() {
         // TI event ID 2: common + target +
-        //   BaseAddress(ptr), RegionSize(ptr), Protection(u32)
+        //   BaseAddress(ptr), RegionSize(ptr), NewProtection(u32),
+        //   OldProtection(u32)
         let mut data = build_ti_common_header(500, 501);
         data.extend(build_ti_target_header(600));
         data.extend_from_slice(&0x7FFE_0000u64.to_le_bytes()); // BaseAddress
         data.extend_from_slice(&0x1000u64.to_le_bytes()); // RegionSize
-        data.extend_from_slice(&0x20u32.to_le_bytes()); // Protection (PAGE_EXECUTE_READ)
+        data.extend_from_slice(&0x20u32.to_le_bytes()); // NewProtection (PAGE_EXECUTE_READ)
+        data.extend_from_slice(&0x04u32.to_le_bytes()); // OldProtection (PAGE_READWRITE)
 
         let mut r = UserDataReader::new(&data, 8);
         // Skip common header
-        let _cp = r.read_u32().unwrap();
+        let _cp = r.read_pointer().unwrap();
         let _ct = r.read_u64().unwrap();
         let _sk = r.read_u64().unwrap();
         let _sl = r.read_u8().unwrap();
@@ -1913,7 +1943,7 @@ mod tests {
         let _tid = r.read_u32().unwrap();
         let _tct = r.read_u64().unwrap();
         // Skip target header
-        let target_pid = r.read_u32().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
         let _tc = r.read_u64().unwrap();
         let _tk = r.read_u64().unwrap();
         let _tsl = r.read_u8().unwrap();
@@ -1922,25 +1952,30 @@ mod tests {
         // Event-specific
         let base = r.read_pointer().unwrap();
         let size = r.read_pointer().unwrap();
-        let protection = r.read_u32().unwrap();
+        let new_protection = r.read_u32().unwrap();
+        let old_protection = r.read_u32().unwrap();
 
         assert_eq!(target_pid, 600);
         assert_eq!(base, 0x7FFE_0000);
         assert_eq!(size, 0x1000);
-        assert_eq!(protection, 0x20);
+        assert_eq!(new_protection, 0x20);
+        assert_eq!(old_protection, 0x04);
     }
 
-    // --- Composite fixture: TI QUEUEAPC_REMOTE (ID 4) — no specifics ---------
+    // --- Composite fixture: TI QUEUEAPC_REMOTE (ID 4) ------------------------
 
     #[test]
     fn fixture_ti_queueapc_remote() {
-        // TI event ID 4: common header + target header (no event-specific fields)
+        // TI event ID 4: common header + target header +
+        //   TargetThreadId(u32), ApcRoutine(ptr)
         let mut data = build_ti_common_header(800, 801);
         data.extend(build_ti_target_header(900));
+        data.extend_from_slice(&1234u32.to_le_bytes()); // TargetThreadId
+        data.extend_from_slice(&0x7FFB_DEAD_0000u64.to_le_bytes()); // ApcRoutine
 
         let mut r = UserDataReader::new(&data, 8);
         // Common
-        let calling_pid = r.read_u32().unwrap();
+        let calling_pid = r.read_pointer().unwrap() as u32;
         let _ct = r.read_u64().unwrap();
         let _sk = r.read_u64().unwrap();
         let _sl = r.read_u8().unwrap();
@@ -1949,10 +1984,58 @@ mod tests {
         let _tid = r.read_u32().unwrap();
         let _tct = r.read_u64().unwrap();
         // Target
-        let target_pid = r.read_u32().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        // Event-specific
+        let target_thread_id = r.read_u32().unwrap();
+        let apc_routine = r.read_pointer().unwrap();
 
         assert_eq!(calling_pid, 800);
         assert_eq!(target_pid, 900);
+        assert_eq!(target_thread_id, 1234);
+        assert_eq!(apc_routine, 0x7FFB_DEAD_0000);
+    }
+
+    // --- Composite fixture: TI SETCONTEXT_REMOTE (ID 5) ----------------------
+
+    #[test]
+    fn fixture_ti_setcontext_remote() {
+        // TI event ID 5: common header + target header +
+        //   TargetThreadId(u32), ContextFlags(u32)
+        let mut data = build_ti_common_header(700, 701);
+        data.extend(build_ti_target_header(750));
+        data.extend_from_slice(&4321u32.to_le_bytes()); // TargetThreadId
+        data.extend_from_slice(&0x10001Fu32.to_le_bytes()); // ContextFlags (CONTEXT_ALL)
+
+        let mut r = UserDataReader::new(&data, 8);
+        // Common
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // Target
+        let target_pid = r.read_pointer().unwrap() as u32;
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        // Event-specific
+        let target_thread_id = r.read_u32().unwrap();
+        let context_flags = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 700);
+        assert_eq!(target_pid, 750);
+        assert_eq!(target_thread_id, 4321);
+        assert_eq!(context_flags, 0x10001F);
     }
 
     // --- Composite fixture: TI ALLOCVM_LOCAL (ID 6) --------------------------
@@ -1970,7 +2053,7 @@ mod tests {
 
         let mut r = UserDataReader::new(&data, 8);
         // Common header
-        let calling_pid = r.read_u32().unwrap();
+        let calling_pid = r.read_pointer().unwrap() as u32;
         let _ct = r.read_u64().unwrap();
         let _sk = r.read_u64().unwrap();
         let _sl = r.read_u8().unwrap();
