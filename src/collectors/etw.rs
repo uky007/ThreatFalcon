@@ -38,6 +38,8 @@ impl EtwCollector {
 // ---------------------------------------------------------------------------
 // Cross-platform ETW data parsing utilities
 // ---------------------------------------------------------------------------
+// Used by platform module on Windows and by tests on all platforms.
+#[allow(dead_code)]
 pub(crate) mod parser {
     /// Cursor-based binary reader for ETW EVENT_RECORD.UserData payloads.
     pub struct UserDataReader<'a> {

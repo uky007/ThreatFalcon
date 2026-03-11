@@ -2,6 +2,7 @@
 //!
 //! This module is intentionally NOT gated behind `cfg(windows)` so that the
 //! parsing and mapping logic can be tested on any platform.
+#![allow(dead_code)] // Used by sysmon.rs on Windows only; tested on all platforms
 
 use std::collections::HashMap;
 
