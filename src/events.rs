@@ -66,6 +66,7 @@ impl ThreatEvent {
     }
 
     /// Create a detection event with rule metadata.
+    #[allow(dead_code)] // used by collectors on Windows only
     pub fn with_rule(
         hostname: &str,
         source: EventSource,

@@ -219,3 +219,139 @@ impl Sensor {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::*;
+    use tempfile::TempDir;
+
+    fn test_config(dir: &TempDir) -> SensorConfig {
+        SensorConfig {
+            hostname: "TEST-HOST".into(),
+            output: OutputConfig {
+                path: dir.path().join("test_events.jsonl"),
+                format: OutputFormat::JsonLines,
+                rotation_size_mb: 100,
+            },
+            collectors: CollectorConfig::default(),
+            health_interval_secs: 60,
+        }
+    }
+
+    /// On non-Windows, all collectors are no-ops so the sensor starts,
+    /// finds no event producers, and shuts down immediately — writing
+    /// only the final health event.
+    #[tokio::test]
+    async fn sensor_writes_final_health_event() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let output_path = config.output.path.clone();
+
+        let mut sensor = Sensor::new(config).unwrap();
+        sensor.run().await.unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // At least one event (the final health event)
+        assert!(!lines.is_empty(), "expected at least one event in output");
+
+        let last: ThreatEvent = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last.hostname, "TEST-HOST");
+        match &last.data {
+            EventData::SensorHealth {
+                events_total,
+                events_dropped,
+                collectors,
+                ..
+            } => {
+                assert_eq!(*events_total, 0);
+                assert_eq!(*events_dropped, 0);
+                // All 3 collectors should be present
+                assert_eq!(collectors.len(), 3);
+            }
+            _ => panic!("expected SensorHealth event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sensor_tracks_collector_states() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let output_path = config.output.path.clone();
+
+        let mut sensor = Sensor::new(config).unwrap();
+        sensor.run().await.unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let last_line = content.lines().last().unwrap();
+        let event: ThreatEvent = serde_json::from_str(last_line).unwrap();
+
+        match &event.data {
+            EventData::SensorHealth { collectors, .. } => {
+                let names: Vec<&str> = collectors.iter().map(|c| c.name.as_str()).collect();
+                assert!(names.contains(&"ETW"));
+                assert!(names.contains(&"Sysmon"));
+                assert!(names.contains(&"EvasionDetector"));
+
+                // On non-Windows, all collectors succeed start() but produce
+                // no events. Sysmon is disabled by default.
+                let sysmon = collectors.iter().find(|c| c.name == "Sysmon").unwrap();
+                assert_eq!(sysmon.state, CollectorState::Disabled);
+            }
+            _ => panic!("expected SensorHealth"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sensor_disabled_collectors() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        // Disable all collectors
+        config.collectors.etw.enabled = false;
+        config.collectors.sysmon.enabled = false;
+        config.collectors.evasion.enabled = false;
+        let output_path = config.output.path.clone();
+
+        let mut sensor = Sensor::new(config).unwrap();
+        sensor.run().await.unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let last_line = content.lines().last().unwrap();
+        let event: ThreatEvent = serde_json::from_str(last_line).unwrap();
+
+        match &event.data {
+            EventData::SensorHealth { collectors, .. } => {
+                // All should be Disabled
+                for c in collectors {
+                    assert_eq!(
+                        c.state,
+                        CollectorState::Disabled,
+                        "collector {} should be Disabled",
+                        c.name
+                    );
+                }
+            }
+            _ => panic!("expected SensorHealth"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sensor_health_disabled_still_emits_final() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        config.health_interval_secs = 0; // disable periodic
+        let output_path = config.output.path.clone();
+
+        let mut sensor = Sensor::new(config).unwrap();
+        sensor.run().await.unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        // Final health event should still be emitted
+        assert!(
+            content.contains("\"SensorHealth\""),
+            "final health event should be emitted even with periodic disabled"
+        );
+    }
+}
