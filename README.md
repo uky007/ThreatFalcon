@@ -1,5 +1,8 @@
 # ThreatFalcon
 
+[![crates.io](https://img.shields.io/crates/v/threatfalcon.svg)](https://crates.io/crates/threatfalcon)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ThreatFalcon is an experimental Windows endpoint telemetry sensor written in Rust.
 
 The project is aimed at a transparent, explainable, open source sensor that collects host telemetry and normalizes it into structured JSONL events.
