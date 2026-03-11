@@ -392,7 +392,7 @@ pub fn map_to_threat_event(
                          inspection — consistent with process herpaderping.",
                         "T1055",
                         "Process Injection",
-                        EvasionTechnique::ProcessHollowing,
+                        EvasionTechnique::ProcessHerpaderping,
                     ),
                     _ => (
                         "TF-SYS-001",
@@ -401,7 +401,7 @@ pub fn map_to_threat_event(
                          type. The specific technique could not be determined.",
                         "T1055",
                         "Process Injection",
-                        EvasionTechnique::ProcessHollowing,
+                        EvasionTechnique::Unknown,
                     ),
                 };
 
@@ -715,6 +715,12 @@ mod tests {
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
         let event = map_to_threat_event(&parsed, "host").unwrap();
+        match &event.data {
+            EventData::EvasionDetected { technique, .. } => {
+                assert!(matches!(technique, EvasionTechnique::ProcessHollowing));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
         let rule = event.rule.as_ref().expect("rule metadata should be present");
         assert_eq!(rule.id, "TF-SYS-001a");
         assert_eq!(rule.mitre.technique_id, "T1055.012");
@@ -733,6 +739,12 @@ mod tests {
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
         let event = map_to_threat_event(&parsed, "host").unwrap();
+        match &event.data {
+            EventData::EvasionDetected { technique, .. } => {
+                assert!(matches!(technique, EvasionTechnique::ProcessHerpaderping));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
         let rule = event.rule.as_ref().expect("rule metadata should be present");
         assert_eq!(rule.id, "TF-SYS-001b");
         assert_eq!(rule.mitre.technique_id, "T1055");
@@ -751,6 +763,12 @@ mod tests {
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
         let event = map_to_threat_event(&parsed, "host").unwrap();
+        match &event.data {
+            EventData::EvasionDetected { technique, .. } => {
+                assert!(matches!(technique, EvasionTechnique::Unknown));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
         let rule = event.rule.as_ref().expect("rule metadata should be present");
         assert_eq!(rule.id, "TF-SYS-001");
         assert_eq!(rule.mitre.technique_id, "T1055");

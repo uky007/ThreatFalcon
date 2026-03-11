@@ -977,8 +977,8 @@ mod platform {
                         .into(),
                     mitre: MitreRef {
                         tactic: "Defense Evasion".into(),
-                        technique_id: "T1203".into(),
-                        technique_name: "Exploitation for Client Execution".into(),
+                        technique_id: "N/A".into(),
+                        technique_name: "Unknown — TI payload not parsed".into(),
                     },
                     confidence: Confidence::Medium,
                     evidence: vec![
@@ -995,7 +995,7 @@ mod platform {
                     EventCategory::Evasion,
                     Severity::High,
                     EventData::EvasionDetected {
-                        technique: EvasionTechnique::ProcessHollowing,
+                        technique: EvasionTechnique::Unknown,
                         pid: Some(pid),
                         process_name: None,
                         details: format!("TI ETW event {event_id}"),

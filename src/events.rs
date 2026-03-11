@@ -242,8 +242,11 @@ pub enum EvasionTechnique {
     NtdllUnhooking,
     DirectSyscall,
     ProcessHollowing,
+    ProcessHerpaderping,
     DllSearchOrderHijack,
     ParentPidSpoofing,
+    /// Technique could not be determined from available evidence.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
