@@ -82,6 +82,11 @@ where
         }
 
         fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<u64, E> {
+            if v < 0 {
+                return Err(de::Error::custom(format!(
+                    "keywords must be non-negative, got {v}"
+                )));
+            }
             Ok(v as u64)
         }
 
@@ -348,6 +353,20 @@ mod tests {
         let cfg: SensorConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.collectors.etw.providers.len(), 1);
         assert_eq!(cfg.collectors.etw.providers[0].name, "Only-This");
+    }
+
+    #[test]
+    fn keywords_negative_rejected() {
+        let toml = r#"
+            [[collectors.etw.providers]]
+            name = "Test"
+            guid = "00000000-0000-0000-0000-000000000000"
+            keywords = -1
+        "#;
+        let result: std::result::Result<SensorConfig, _> = toml::from_str(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("non-negative"), "error was: {err}");
     }
 
     #[test]
