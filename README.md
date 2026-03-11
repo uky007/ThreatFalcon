@@ -12,7 +12,7 @@ ThreatFalcon is early-stage software.
 - ETW collection is implemented
 - Sysmon subscription and parsing are implemented, but disabled by default
 - Evasion-detection checks are implemented for selected techniques
-- Configuration file loading is not implemented yet
+- Configuration is loaded from `threatfalcon.toml` (TOML format)
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -115,6 +115,42 @@ RUST_LOG=info cargo run --release
 
 On startup, the sensor initializes enabled collectors, writes newline-delimited JSON events, and stops on `Ctrl-C`.
 
+## Configuration
+
+ThreatFalcon loads `threatfalcon.toml` from the current directory on startup. If the file is not found, built-in defaults are used.
+
+All sections are optional. Only the fields you want to override need to be specified.
+
+```toml
+# Override hostname (default: auto-detected from environment)
+hostname = "WORKSTATION-01"
+
+[output]
+path = "threatfalcon_events.jsonl"
+rotation_size_mb = 100
+
+[collectors.etw]
+enabled = true
+
+# Custom provider list (replaces defaults when specified)
+# providers = [
+#     { name = "Microsoft-Windows-Kernel-Process", guid = "22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716", level = 5, keywords = "0xFFFFFFFFFFFFFFFF" },
+# ]
+
+[collectors.sysmon]
+enabled = false
+
+[collectors.evasion]
+enabled = true
+scan_interval_ms = 5000
+detect_etw_patching = true
+detect_amsi_bypass = true
+detect_unhooking = true
+detect_direct_syscall = true
+```
+
+ETW provider `keywords` can be specified as a hex string (`"0xFFFFFFFFFFFFFFFF"`) or an integer.
+
 ## Output
 
 Events are written as JSON Lines. Each event includes:
@@ -156,7 +192,7 @@ Example event shape:
 
 ## Limitations
 
-- No external config file support yet
+- Config file is `threatfalcon.toml` in the current directory only (no system-wide path search)
 - No installer, service wrapper, or packaging yet
 - Some ETW payload parsing is best-effort and should be validated on real Windows hosts
 - Sysmon support depends on Sysmon being installed and configured
@@ -164,11 +200,16 @@ Example event shape:
 
 ## Roadmap
 
-- config file loading
+- `v1`: single-host Windows telemetry sensor
+- ~~config file loading~~ (done)
 - clearer rule and evidence metadata for detections
 - better Windows operational packaging
 - more test coverage for collectors and event mapping
 - documentation for privacy boundaries and collection scope
+- post-`v1`: multi-agent coordination and fleet visibility
+- post-`v1`: Active Directory and intranet endpoint visualization
+
+See [ROADMAP.md](/Users/uky/src/threatscope/ROADMAP.md) for the longer roadmap.
 
 ## License
 
