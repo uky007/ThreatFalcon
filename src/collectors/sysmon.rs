@@ -54,6 +54,7 @@ mod platform {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::EventLog::*;
 
     const SYSMON_CHANNEL: &str = "Microsoft-Windows-Sysmon/Operational";
@@ -126,7 +127,10 @@ mod platform {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(error = %e, "EvtSubscribe failed (is Sysmon installed?)");
-                unsafe { drop(Box::from_raw(ctx_ptr)); }
+                unsafe {
+                    drop(Box::from_raw(ctx_ptr));
+                    let _ = CloseHandle(signal);
+                }
                 return;
             }
         };
@@ -139,6 +143,7 @@ mod platform {
         unsafe {
             let _ = EvtClose(sub_handle);
             drop(Box::from_raw(ctx_ptr));
+            let _ = CloseHandle(signal);
         }
     }
 

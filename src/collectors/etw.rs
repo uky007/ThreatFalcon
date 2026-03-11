@@ -8,13 +8,13 @@ use crate::events::ThreatEvent;
 
 use super::Collector;
 
-const SESSION_NAME: &str = "ThreatFalcon-ETW";
-
 pub struct EtwCollector {
     config: EtwConfig,
     hostname: String,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(target_os = "windows")]
+    instance_lock: Option<isize>,
 }
 
 impl EtwCollector {
@@ -24,6 +24,8 @@ impl EtwCollector {
             hostname,
             #[cfg(target_os = "windows")]
             stop_flag: None,
+            #[cfg(target_os = "windows")]
+            instance_lock: None,
         }
     }
 }
@@ -40,6 +42,61 @@ mod platform {
     use windows::core::GUID;
     use windows::Win32::Foundation::*;
     use windows::Win32::System::Diagnostics::Etw::*;
+
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    const SESSION_NAME: &str = "ThreatFalcon-ETW";
+    const INSTANCE_MUTEX_NAME: &str = "Global\\ThreatFalcon-ETW";
+
+    /// Acquire a system-wide named mutex to prevent multiple instances.
+    ///
+    /// The mutex is automatically released by the OS when the owning process
+    /// exits (including crashes), which avoids both stale-lock and PID-reuse
+    /// problems inherent in PID lock files.
+    ///
+    /// Returns the raw HANDLE on success.  The caller must keep it alive for
+    /// the lifetime of the ETW session.
+    fn acquire_instance_lock() -> Result<isize> {
+        let wide: Vec<u16> = INSTANCE_MUTEX_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let handle = unsafe {
+            CreateMutexW(
+                None,
+                true, // bInitialOwner
+                windows::core::PCWSTR(wide.as_ptr()),
+            )
+        };
+
+        match handle {
+            Ok(h) => {
+                // CreateMutexW succeeds even when the mutex already exists
+                // (it opens it).  Distinguish via GetLastError.
+                let last_err = unsafe { GetLastError() };
+                if last_err == WIN32_ERROR(183) {
+                    // ERROR_ALREADY_EXISTS — another instance holds the mutex
+                    unsafe { let _ = CloseHandle(h); }
+                    anyhow::bail!(
+                        "Another ThreatFalcon instance is already running"
+                    );
+                }
+                Ok(h.0 as isize)
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to create instance mutex: {e}");
+            }
+        }
+    }
+
+    fn release_instance_lock(handle: isize) {
+        if handle != 0 {
+            unsafe {
+                let _ = CloseHandle(HANDLE(handle as *mut std::ffi::c_void));
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // UserDataReader: cursor-based binary reader for EVENT_RECORD.UserData
@@ -242,12 +299,19 @@ mod platform {
 
     /// Start an ETW real-time trace session, enable the configured providers,
     /// and spawn a blocking thread that consumes events.
+    ///
+    /// Returns `(stop_flag, instance_lock_handle)`.  The caller must keep
+    /// `instance_lock_handle` alive for the session's lifetime and pass it
+    /// to `stop_session()` on shutdown.
     pub fn start_session(
         providers: &[crate::config::EtwProviderConfig],
         hostname: String,
         tx: mpsc::Sender<ThreatEvent>,
-    ) -> Result<Arc<AtomicBool>> {
+    ) -> Result<(Arc<AtomicBool>, isize)> {
         let stop = Arc::new(AtomicBool::new(false));
+
+        // ---- multi-instance guard via named mutex ---------------------------
+        let instance_lock = acquire_instance_lock()?;
 
         // ---- allocate EVENT_TRACE_PROPERTIES --------------------------------
         let session_name_wide: Vec<u16> = SESSION_NAME
@@ -286,13 +350,14 @@ mod platform {
             )
         };
 
-        // ERROR_ALREADY_EXISTS (183): a session with the same name exists,
-        // likely from a previous crash. Stop it and retry once.
+        // ERROR_ALREADY_EXISTS (183): a stale session from a previous crash.
+        // We hold the named mutex, so no other live instance owns this
+        // session — safe to stop and retry.
         if status.0 == 183 {
             tracing::warn!(
-                "ETW session already exists — stopping stale session"
+                "Stale ETW session found — stopping and retrying"
             );
-            stop_session();
+            stop_trace();
 
             let props = init_props(&mut buf);
             status = unsafe {
@@ -336,10 +401,9 @@ mod platform {
 
         // ---- consume events in a blocking thread ----------------------------
         let stop_clone = stop.clone();
-        let session_name_owned = SESSION_NAME.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let session_wide: Vec<u16> = session_name_owned
+            let session_wide: Vec<u16> = SESSION_NAME
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
@@ -382,11 +446,12 @@ mod platform {
             }
         });
 
-        Ok(stop)
+        Ok((stop, instance_lock))
     }
 
-    /// Stop the ETW trace session (causes ProcessTrace to return).
-    pub fn stop_session() {
+    /// Stop the ETW trace (causes ProcessTrace to return) without releasing
+    /// the instance lock.  Used internally for stale-session cleanup.
+    fn stop_trace() {
         let session_name_wide: Vec<u16> = SESSION_NAME
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -406,6 +471,12 @@ mod platform {
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
+    }
+
+    /// Stop the ETW trace session and release the instance lock.
+    pub fn stop_session(instance_lock: isize) {
+        stop_trace();
+        release_instance_lock(instance_lock);
     }
 
     // -----------------------------------------------------------------------
@@ -937,12 +1008,13 @@ impl Collector for EtwCollector {
     async fn start(&mut self, _tx: mpsc::Sender<ThreatEvent>) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            let flag = platform::start_session(
+            let (flag, lock) = platform::start_session(
                 &self.config.providers,
                 self.hostname.clone(),
                 _tx,
             )?;
             self.stop_flag = Some(flag);
+            self.instance_lock = Some(lock);
             info!(
                 "ETW collector started with {} providers",
                 self.config.providers.len()
@@ -962,8 +1034,9 @@ impl Collector for EtwCollector {
             if let Some(flag) = self.stop_flag.take() {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            // Stop the ETW session — this causes ProcessTrace() to return
-            platform::stop_session();
+            // Stop the ETW session and release the instance lock
+            let lock = self.instance_lock.take().unwrap_or(0);
+            platform::stop_session(lock);
         }
 
         info!("ETW collector stopped");

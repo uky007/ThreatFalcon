@@ -304,7 +304,17 @@ mod platform {
         text_rva: u32,
         /// Size of the .text section
         text_size: u32,
-        /// Whether our own in-memory ntdll differs from on-disk (EDR hooks)
+        /// Whether EDR hooks are detected in the current environment.
+        ///
+        /// We compare our own in-memory ntdll against the on-disk copy.
+        /// If they differ significantly, EDR hooks are installed. Without
+        /// this guard, every unhooked process (including legitimate ones
+        /// that EDR never injected into) would trigger a false positive.
+        ///
+        /// Known limitation: if the EDR exempts our sensor process from
+        /// hooking, this will be false and unhooking detection inactive.
+        /// This is a deliberate trade-off — false negatives in that edge
+        /// case are preferable to mass false positives.
         hooks_present: bool,
     }
 
@@ -341,11 +351,13 @@ mod platform {
             tracing::info!(
                 diff_bytes = our_diff,
                 total_bytes = sample,
-                "EDR hooks detected in our ntdll .text section"
+                "EDR hooks detected in our ntdll — unhooking detection active"
             );
         } else {
-            tracing::debug!(
-                "No EDR hooks detected — ntdll unhooking detection inactive"
+            tracing::warn!(
+                "No EDR hooks detected in our ntdll — unhooking detection \
+                 will be inactive. If an EDR is installed but exempts this \
+                 sensor, this is a known limitation."
             );
         }
 
@@ -365,8 +377,8 @@ mod platform {
     ) -> Option<ThreatEvent> {
         let reference = reference.as_ref()?;
 
-        // If no hooks are present in our environment, unhooking detection
-        // is not meaningful — every process would have a clean ntdll.
+        // Without hooks in our environment, a "clean" ntdll in a target
+        // process is expected, not suspicious.  Skip to avoid false positives.
         if !reference.hooks_present {
             return None;
         }
