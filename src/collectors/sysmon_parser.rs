@@ -367,20 +367,75 @@ pub fn map_to_threat_event(
             },
         ),
 
-        // Event 25: Process Tampering
-        25 => (
-            EventCategory::Evasion,
-            Severity::Critical,
-            EventData::EvasionDetected {
-                technique: EvasionTechnique::ProcessHollowing,
-                pid: Some(parsed.get_u32("ProcessId")),
-                process_name: parsed.get("Image").map(String::from),
-                details: format!(
-                    "Sysmon ProcessTampering: {}",
-                    parsed.get_string("Type"),
-                ),
-            },
-        ),
+        // Event 25: Process Tampering — branch on Type for accurate mapping
+        25 => {
+            let tampering_type = parsed.get_string("Type");
+            let target_pid = parsed.get_u32("ProcessId");
+            let image = parsed.get("Image").map(String::from);
+
+            // Map Type to specific MITRE technique
+            let (rule_id, rule_name, description, technique_id, technique_name, technique) =
+                match tampering_type.as_str() {
+                    "Image is replaced" => (
+                        "TF-SYS-001a",
+                        "Process Hollowing Detected (Sysmon)",
+                        "The process image was replaced after creation, \
+                         indicating process hollowing.",
+                        "T1055.012",
+                        "Process Injection: Process Hollowing",
+                        EvasionTechnique::ProcessHollowing,
+                    ),
+                    "Image is locked for access" => (
+                        "TF-SYS-001b",
+                        "Process Herpaderping Detected (Sysmon)",
+                        "The process image file was locked, preventing \
+                         inspection — consistent with process herpaderping.",
+                        "T1055",
+                        "Process Injection",
+                        EvasionTechnique::ProcessHerpaderping,
+                    ),
+                    _ => (
+                        "TF-SYS-001",
+                        "Process Tampering Detected (Sysmon)",
+                        "Sysmon detected an unrecognized process tampering \
+                         type. The specific technique could not be determined.",
+                        "T1055",
+                        "Process Injection",
+                        EvasionTechnique::Unknown,
+                    ),
+                };
+
+            let rule = RuleMetadata {
+                id: rule_id.into(),
+                name: rule_name.into(),
+                description: description.into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: technique_id.into(),
+                    technique_name: technique_name.into(),
+                },
+                confidence: Confidence::High,
+                evidence: vec![
+                    "Sysmon Event ID 25 (ProcessTampering)".into(),
+                    format!("Tampering type: {tampering_type}"),
+                    format!("Target PID: {target_pid}"),
+                    format!("Image: {}", image.as_deref().unwrap_or("unknown")),
+                ],
+            };
+            return Some(ThreatEvent::with_rule(
+                hostname,
+                source,
+                EventCategory::Evasion,
+                Severity::Critical,
+                EventData::EvasionDetected {
+                    technique,
+                    pid: Some(target_pid),
+                    process_name: image,
+                    details: format!("Sysmon ProcessTampering: {tampering_type}"),
+                },
+                rule,
+            ));
+        }
 
         _ => return None,
     };
@@ -646,6 +701,96 @@ mod tests {
             }
             _ => panic!("expected ImageLoad"),
         }
+    }
+
+    #[test]
+    fn process_tampering_hollowing() {
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">9999</Data>
+    <Data Name="Image">C:\malware\hollowed.exe</Data>
+    <Data Name="Type">Image is replaced</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        match &event.data {
+            EventData::EvasionDetected { technique, .. } => {
+                assert!(matches!(technique, EvasionTechnique::ProcessHollowing));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
+        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        assert_eq!(rule.id, "TF-SYS-001a");
+        assert_eq!(rule.mitre.technique_id, "T1055.012");
+        assert!(rule.name.contains("Hollowing"));
+    }
+
+    #[test]
+    fn process_tampering_herpaderping() {
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">8888</Data>
+    <Data Name="Image">C:\malware\herp.exe</Data>
+    <Data Name="Type">Image is locked for access</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        match &event.data {
+            EventData::EvasionDetected { technique, .. } => {
+                assert!(matches!(technique, EvasionTechnique::ProcessHerpaderping));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
+        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        assert_eq!(rule.id, "TF-SYS-001b");
+        assert_eq!(rule.mitre.technique_id, "T1055");
+        assert!(rule.name.contains("Herpaderping"));
+    }
+
+    #[test]
+    fn process_tampering_unknown_type() {
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">7777</Data>
+    <Data Name="Image">C:\unknown.exe</Data>
+    <Data Name="Type">Something new</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        match &event.data {
+            EventData::EvasionDetected { technique, .. } => {
+                assert!(matches!(technique, EvasionTechnique::Unknown));
+            }
+            _ => panic!("expected EvasionDetected"),
+        }
+        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        assert_eq!(rule.id, "TF-SYS-001");
+        assert_eq!(rule.mitre.technique_id, "T1055");
+        assert!(rule.evidence.iter().any(|e| e.contains("Something new")));
+    }
+
+    #[test]
+    fn telemetry_events_have_no_rule() {
+        let xml = r#"<Event>
+  <System><EventID>1</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">1234</Data>
+    <Data Name="ParentProcessId">5678</Data>
+    <Data Name="Image">C:\test.exe</Data>
+    <Data Name="CommandLine">test.exe</Data>
+    <Data Name="User">SYSTEM</Data>
+    <Data Name="IntegrityLevel">High</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        assert!(event.rule.is_none(), "telemetry events should not have rule metadata");
     }
 
     #[test]

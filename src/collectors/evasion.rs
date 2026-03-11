@@ -209,7 +209,12 @@ mod platform {
 
         // 0xC3 = ret, 0xC2 = ret imm16 — both indicate patching
         if buf[0] == 0xC3 || buf[0] == 0xC2 {
-            return Some(ThreatEvent::new(
+            let evidence = vec![
+                format!("EtwEventWrite first bytes: {:02X} {:02X} {:02X} {:02X}", buf[0], buf[1], buf[2], buf[3]),
+                format!("ntdll base in target: 0x{ntdll_base:X}"),
+                format!("function offset: 0x{offset:X}"),
+            ];
+            return Some(ThreatEvent::with_rule(
                 hostname,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
@@ -223,6 +228,21 @@ mod platform {
                          {:02X} {:02X} {:02X} {:02X}",
                         buf[0], buf[1], buf[2], buf[3]
                     ),
+                },
+                RuleMetadata {
+                    id: "TF-EVA-001".into(),
+                    name: "ETW Event Write Patching".into(),
+                    description: "ntdll!EtwEventWrite has been patched to \
+                        return immediately, disabling user-mode ETW telemetry \
+                        for this process."
+                        .into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: "T1562.006".into(),
+                        technique_name: "Impair Defenses: Indicator Blocking".into(),
+                    },
+                    confidence: Confidence::High,
+                    evidence,
                 },
             ));
         }
@@ -274,7 +294,12 @@ mod platform {
         // Common AMSI patch: mov eax, 0x80070057; ret
         //   B8 57 00 07 80 C3
         if buf[0] == 0xB8 && buf[5] == 0xC3 {
-            return Some(ThreatEvent::new(
+            let evidence = vec![
+                format!("AmsiScanBuffer first bytes: {:02X?}", &buf[..6]),
+                format!("amsi.dll base in target: 0x{amsi_base:X}"),
+                format!("function offset: 0x{offset:X}"),
+            ];
+            return Some(ThreatEvent::with_rule(
                 hostname,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
@@ -287,6 +312,21 @@ mod platform {
                         "AmsiScanBuffer patched: first bytes = {:02X?}",
                         &buf[..6]
                     ),
+                },
+                RuleMetadata {
+                    id: "TF-EVA-002".into(),
+                    name: "AMSI Scan Buffer Bypass".into(),
+                    description: "amsi!AmsiScanBuffer has been patched to \
+                        return a hardcoded result, bypassing script content \
+                        inspection."
+                        .into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: "T1562.001".into(),
+                        technique_name: "Impair Defenses: Disable or Modify Tools".into(),
+                    },
+                    confidence: Confidence::High,
+                    evidence,
                 },
             ));
         }
@@ -417,7 +457,18 @@ mod platform {
         // Threshold: fewer than 0.5% of bytes differ from the clean copy
         // while hooks are known to be present → unhooking detected.
         if diff_count < sample_len / 200 {
-            return Some(ThreatEvent::new(
+            let pct = if sample_len > 0 {
+                (diff_count as f64 / sample_len as f64) * 100.0
+            } else {
+                0.0
+            };
+            let evidence = vec![
+                format!("{diff_count}/{sample_len} bytes differ from clean on-disk copy ({pct:.2}%)"),
+                format!("ntdll base in target: 0x{ntdll_base:X}"),
+                format!(".text RVA: 0x{:X}, size: {sample_len}", reference.text_rva),
+                "EDR hooks confirmed present in sensor's own ntdll".into(),
+            ];
+            return Some(ThreatEvent::with_rule(
                 hostname,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
@@ -431,6 +482,22 @@ mod platform {
                          ({diff_count}/{sample_len} bytes differ) — \
                          possible unhooking"
                     ),
+                },
+                RuleMetadata {
+                    id: "TF-EVA-003".into(),
+                    name: "ntdll User-Mode Hook Removal".into(),
+                    description: "The process's ntdll .text section closely \
+                        matches the clean on-disk copy despite EDR hooks \
+                        being present in the environment, indicating the \
+                        process has replaced its hooked ntdll."
+                        .into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: "T1562.001".into(),
+                        technique_name: "Impair Defenses: Disable or Modify Tools".into(),
+                    },
+                    confidence: Confidence::Medium,
+                    evidence,
                 },
             ));
         }

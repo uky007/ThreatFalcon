@@ -966,16 +966,44 @@ mod platform {
             // -----------------------------------------------------------
             // Threat Intelligence
             // -----------------------------------------------------------
-            "Microsoft-Windows-Threat-Intelligence" => (
-                EventCategory::Evasion,
-                Severity::High,
-                EventData::EvasionDetected {
-                    technique: EvasionTechnique::ProcessHollowing,
-                    pid: Some(pid),
-                    process_name: None,
-                    details: format!("TI ETW event {event_id}"),
-                },
-            ),
+            "Microsoft-Windows-Threat-Intelligence" => {
+                let rule = RuleMetadata {
+                    id: "TF-TI-001".into(),
+                    name: "Threat Intelligence ETW Event".into(),
+                    description: "Windows Threat Intelligence ETW provider \
+                        emitted an event. The specific technique cannot be \
+                        determined without parsing the TI event payload; \
+                        this rule captures the raw signal for triage."
+                        .into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: "N/A".into(),
+                        technique_name: "Unknown — TI payload not parsed".into(),
+                    },
+                    confidence: Confidence::Medium,
+                    evidence: vec![
+                        format!("TI ETW event ID: {event_id}"),
+                        format!("Source PID: {pid}"),
+                        "Specific technique unknown — TI UserData not yet parsed".into(),
+                    ],
+                };
+                let event = ThreatEvent::with_rule(
+                    hostname,
+                    EventSource::Etw {
+                        provider: provider.to_string(),
+                    },
+                    EventCategory::Evasion,
+                    Severity::High,
+                    EventData::EvasionDetected {
+                        technique: EvasionTechnique::Unknown,
+                        pid: Some(pid),
+                        process_name: None,
+                        details: format!("TI ETW event {event_id}"),
+                    },
+                    rule,
+                );
+                return Some(event);
+            }
 
             _ => return None,
         };
