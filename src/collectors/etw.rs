@@ -57,6 +57,15 @@ pub(crate) mod parser {
             }
         }
 
+        pub fn read_u8(&mut self) -> Option<u8> {
+            if self.pos >= self.data.len() {
+                return None;
+            }
+            let v = self.data[self.pos];
+            self.pos += 1;
+            Some(v)
+        }
+
         pub fn read_u16(&mut self) -> Option<u16> {
             if self.pos + 2 > self.data.len() {
                 return None;
@@ -612,6 +621,47 @@ mod platform {
                         },
                     )
                 }
+                5 => {
+                    // ImageLoad: ProcessId(u32), ImageBase(ptr),
+                    //   ImageSize(ptr), ImageCheckSum(u32),
+                    //   TimeDateStamp(u32), DefaultBase(ptr),
+                    //   SignatureLevel(u8), SignatureType(u8),
+                    //   ...padding/flags..., FileName(wstr)
+                    let (process_id, image_base, file_name) = data
+                        .and_then(|d| {
+                            let mut r = UserDataReader::new(d, ps);
+                            let process_id = r.read_u32()?;
+                            let image_base = r.read_pointer()?;
+                            let _image_size = r.read_pointer()?;
+                            let _checksum = r.read_u32()?;
+                            let _timestamp = r.read_u32()?;
+                            let _default_base = r.read_pointer()?;
+                            // SignatureLevel(u8) + SignatureType(u8) + 2 bytes
+                            let _sig_level = r.read_u8()?;
+                            let _sig_type = r.read_u8()?;
+                            r.skip(2); // padding/flags
+                            let file_name = r.read_utf16_nul();
+                            Some((process_id, image_base, file_name))
+                        })
+                        .unwrap_or((pid, 0, String::new()));
+                    let image_name = file_name
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(&file_name)
+                        .to_string();
+                    (
+                        EventCategory::ImageLoad,
+                        Severity::Info,
+                        EventData::ImageLoad {
+                            pid: process_id,
+                            image_path: file_name,
+                            image_name,
+                            signed: false,
+                            signature: None,
+                            hashes: None,
+                        },
+                    )
+                }
                 _ => return None,
             },
 
@@ -782,6 +832,40 @@ mod platform {
                             pid,
                             image_path: String::new(),
                             protocol: "UDP".into(),
+                            src_addr,
+                            src_port,
+                            dst_addr,
+                            dst_port,
+                            direction,
+                        },
+                    )
+                }
+                // UdpSendIPv6 (16) / UdpRecvIPv6 (18)
+                16 | 18 => {
+                    let parsed = data.and_then(|d| {
+                        let mut r = UserDataReader::new(d, ps);
+                        let _pid = r.read_u32()?;
+                        let _size = r.read_u32()?;
+                        let daddr = r.read_ipv6()?;
+                        let saddr = r.read_ipv6()?;
+                        let dport = r.read_u16_be()?;
+                        let sport = r.read_u16_be()?;
+                        Some((saddr, sport, daddr, dport))
+                    });
+                    let (src_addr, src_port, dst_addr, dst_port) =
+                        parsed.unwrap_or_default();
+                    let direction = if event_id == 16 {
+                        NetworkDirection::Outbound
+                    } else {
+                        NetworkDirection::Inbound
+                    };
+                    (
+                        EventCategory::Network,
+                        Severity::Info,
+                        EventData::NetworkConnect {
+                            pid,
+                            image_path: String::new(),
+                            protocol: "UDPv6".into(),
                             src_addr,
                             src_port,
                             dst_addr,
@@ -977,44 +1061,26 @@ mod platform {
 
             // -----------------------------------------------------------
             // Threat Intelligence
+            //
+            // UserData layout (community-documented, best-effort):
+            //   Common header (all TI events):
+            //     CallingProcessId(u32), CallingProcessCreateTime(u64),
+            //     CallingProcessStartKey(u64),
+            //     CallingProcessSignatureLevel(u8),
+            //     CallingProcessSectionSignatureLevel(u8),
+            //     CallingProcessProtection(u8),
+            //     CallingThreadId(u32),
+            //     CallingThreadCreateTime(u64)
+            //   Remote events (IDs 1-5) add target process header:
+            //     TargetProcessId(u32), TargetProcessCreateTime(u64),
+            //     TargetProcessStartKey(u64),
+            //     TargetProcessSignatureLevel(u8),
+            //     TargetProcessSectionSignatureLevel(u8),
+            //     TargetProcessProtection(u8)
+            //   Then event-specific fields (BaseAddress, RegionSize, etc.)
             // -----------------------------------------------------------
             "Microsoft-Windows-Threat-Intelligence" => {
-                let rule = RuleMetadata {
-                    id: "TF-TI-001".into(),
-                    name: "Threat Intelligence ETW Event".into(),
-                    description: "Windows Threat Intelligence ETW provider \
-                        emitted an event. The specific technique cannot be \
-                        determined without parsing the TI event payload; \
-                        this rule captures the raw signal for triage."
-                        .into(),
-                    mitre: MitreRef {
-                        tactic: "Defense Evasion".into(),
-                        technique_id: "N/A".into(),
-                        technique_name: "Unknown — TI payload not parsed".into(),
-                    },
-                    confidence: Confidence::Medium,
-                    evidence: vec![
-                        format!("TI ETW event ID: {event_id}"),
-                        format!("Source PID: {pid}"),
-                        "Specific technique unknown — TI UserData not yet parsed".into(),
-                    ],
-                };
-                let event = ThreatEvent::with_rule(
-                    hostname,
-                    EventSource::Etw {
-                        provider: provider.to_string(),
-                    },
-                    EventCategory::Evasion,
-                    Severity::High,
-                    EventData::EvasionDetected {
-                        technique: EvasionTechnique::Unknown,
-                        pid: Some(pid),
-                        process_name: None,
-                        details: format!("TI ETW event {event_id}"),
-                    },
-                    rule,
-                );
-                return Some(event);
+                return Some(map_ti_event(data, event_id, pid, hostname, ps));
             }
 
             _ => return None,
@@ -1029,6 +1095,214 @@ mod platform {
             sev,
             event_data,
         ))
+    }
+
+    /// Parse a Threat Intelligence ETW event with per-event-ID handling.
+    ///
+    /// The TI provider requires PPL or elevated privileges to receive events.
+    /// Field layouts are based on community research and may vary across
+    /// Windows versions; parsing is best-effort with graceful fallback.
+    fn map_ti_event(
+        data: Option<&[u8]>,
+        event_id: u16,
+        pid: u32,
+        hostname: &str,
+        ps: usize,
+    ) -> ThreatEvent {
+        // Try to parse the common TI header present in all events.
+        let header = data.and_then(|d| {
+            let mut r = UserDataReader::new(d, ps);
+            let calling_pid = r.read_u32()?;
+            let _calling_create_time = r.read_u64()?;
+            let _calling_start_key = r.read_u64()?;
+            let _calling_sig_level = r.read_u8()?;
+            let _calling_sec_sig_level = r.read_u8()?;
+            let _calling_protection = r.read_u8()?;
+            let calling_tid = r.read_u32()?;
+            let _calling_thread_create_time = r.read_u64()?;
+            Some((calling_pid, calling_tid, r.pos))
+        });
+        let (calling_pid, _calling_tid, header_end) =
+            header.unwrap_or((pid, 0, 0));
+
+        // For remote operations (IDs 1-5), parse the target process fields.
+        let target = if matches!(event_id, 1..=5) {
+            data.and_then(|d| {
+                if header_end >= d.len() {
+                    return None;
+                }
+                let mut r = UserDataReader::new(&d[header_end..], ps);
+                let target_pid = r.read_u32()?;
+                let _target_create_time = r.read_u64()?;
+                let _target_start_key = r.read_u64()?;
+                let _target_sig_level = r.read_u8()?;
+                let _target_sec_sig_level = r.read_u8()?;
+                let _target_protection = r.read_u8()?;
+                Some((target_pid, header_end + r.pos))
+            })
+        } else {
+            None
+        };
+        let (target_pid, post_target) = target.unwrap_or((0, header_end));
+
+        // Parse event-specific fields (address, size, protection).
+        let specifics = data.and_then(|d| {
+            if post_target >= d.len() {
+                return None;
+            }
+            let mut r = UserDataReader::new(&d[post_target..], ps);
+            match event_id {
+                // ALLOCVM_REMOTE / ALLOCVM_LOCAL
+                1 | 6 => {
+                    let base = r.read_pointer()?;
+                    let size = r.read_pointer()?;
+                    let _alloc_type = r.read_u32()?;
+                    let protection = r.read_u32()?;
+                    Some((base, size, protection))
+                }
+                // PROTECTVM_REMOTE / PROTECTVM_LOCAL
+                2 | 7 => {
+                    let base = r.read_pointer()?;
+                    let size = r.read_pointer()?;
+                    let protection = r.read_u32()?;
+                    Some((base, size, protection))
+                }
+                // MAPVIEW_REMOTE / MAPVIEW_LOCAL
+                3 | 8 => {
+                    let base = r.read_pointer()?;
+                    let size = r.read_pointer()?;
+                    let _alloc_type = r.read_u32()?;
+                    let protection = r.read_u32()?;
+                    Some((base, size, protection))
+                }
+                _ => None,
+            }
+        });
+
+        let (rule_id, name, description, technique_id, technique_name) = match event_id {
+            1 => (
+                "TF-TI-001",
+                "Remote Virtual Memory Allocation",
+                "A process allocated virtual memory in another process \
+                 (NtAllocateVirtualMemory). This is a common step in \
+                 process injection techniques.",
+                "T1055",
+                "Process Injection",
+            ),
+            2 => (
+                "TF-TI-002",
+                "Remote Memory Protection Change",
+                "A process changed memory protection in another process \
+                 (NtProtectVirtualMemory). Often used to make injected \
+                 code executable.",
+                "T1055",
+                "Process Injection",
+            ),
+            3 => (
+                "TF-TI-003",
+                "Remote Section Mapping",
+                "A process mapped a section into another process \
+                 (NtMapViewOfSection). Used in section-based injection \
+                 and process hollowing.",
+                "T1055",
+                "Process Injection",
+            ),
+            4 => (
+                "TF-TI-004",
+                "Remote APC Queue",
+                "A process queued an APC to a thread in another process \
+                 (NtQueueApcThread). This is the APC injection technique.",
+                "T1055.004",
+                "Process Injection: Asynchronous Procedure Call",
+            ),
+            5 => (
+                "TF-TI-005",
+                "Remote Thread Context Modification",
+                "A process modified the thread context of another process \
+                 (NtSetContextThread). Used in thread execution hijacking.",
+                "T1055.003",
+                "Process Injection: Thread Execution Hijacking",
+            ),
+            6 => (
+                "TF-TI-006",
+                "Local Virtual Memory Allocation (TI)",
+                "TI provider reported a local memory allocation flagged \
+                 for monitoring. May indicate self-injection or \
+                 memory manipulation.",
+                "T1055",
+                "Process Injection",
+            ),
+            7 => (
+                "TF-TI-007",
+                "Local Memory Protection Change (TI)",
+                "TI provider reported a local memory protection change. \
+                 May indicate code unpacking or self-modification.",
+                "T1027.002",
+                "Obfuscated Files or Information: Software Packing",
+            ),
+            8 => (
+                "TF-TI-008",
+                "Local Section Mapping (TI)",
+                "TI provider reported a local section mapping flagged \
+                 for monitoring.",
+                "T1055",
+                "Process Injection",
+            ),
+            _ => (
+                "TF-TI-000",
+                "Threat Intelligence ETW Event",
+                "Windows Threat Intelligence ETW provider emitted an \
+                 unrecognized event type.",
+                "N/A",
+                "Unknown",
+            ),
+        };
+
+        let mut evidence = vec![
+            format!("TI event ID: {event_id}"),
+            format!("Calling PID: {calling_pid}"),
+        ];
+        if matches!(event_id, 1..=5) && target_pid > 0 {
+            evidence.push(format!("Target PID: {target_pid}"));
+        }
+        if let Some((base, size, protection)) = specifics {
+            evidence.push(format!("BaseAddress: 0x{base:X}"));
+            evidence.push(format!("RegionSize: 0x{size:X}"));
+            evidence.push(format!("Protection: 0x{protection:08X}"));
+        }
+
+        let details = if matches!(event_id, 1..=5) && target_pid > 0 {
+            format!("{name}: PID {calling_pid} → PID {target_pid}")
+        } else {
+            format!("{name}: PID {calling_pid}")
+        };
+
+        ThreatEvent::with_rule(
+            hostname,
+            EventSource::Etw {
+                provider: "Microsoft-Windows-Threat-Intelligence".into(),
+            },
+            EventCategory::Evasion,
+            Severity::High,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::Unknown,
+                pid: Some(calling_pid),
+                process_name: None,
+                details,
+            },
+            RuleMetadata {
+                id: rule_id.into(),
+                name: name.into(),
+                description: description.into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: technique_id.into(),
+                    technique_name: technique_name.into(),
+                },
+                confidence: Confidence::Medium,
+                evidence,
+            },
+        )
     }
 }
 
@@ -1326,5 +1600,571 @@ mod tests {
     fn dns_type_unknown() {
         assert_eq!(dns_query_type_name(99), "TYPE99");
         assert_eq!(dns_query_type_name(0), "TYPE0");
+    }
+
+    // --- Composite fixture: ImageLoad (Kernel-Process ID 5) ------------------
+
+    #[test]
+    fn fixture_image_load_payload_64bit() {
+        // Simulate Kernel-Process event ID 5 (ImageLoad) UserData on 64-bit:
+        //   ProcessId(u32), ImageBase(ptr64), ImageSize(ptr64),
+        //   ImageCheckSum(u32), TimeDateStamp(u32), DefaultBase(ptr64),
+        //   SignatureLevel(u8), SignatureType(u8), padding(2),
+        //   FileName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&4200u32.to_le_bytes()); // ProcessId
+        data.extend_from_slice(&0x7FFB_1234_0000u64.to_le_bytes()); // ImageBase
+        data.extend_from_slice(&0x0010_0000u64.to_le_bytes()); // ImageSize
+        data.extend_from_slice(&0xABCD_1234u32.to_le_bytes()); // CheckSum
+        data.extend_from_slice(&0x6000_0000u32.to_le_bytes()); // TimeDateStamp
+        data.extend_from_slice(&0x1800_0000_0000u64.to_le_bytes()); // DefaultBase
+        data.push(6); // SignatureLevel
+        data.push(2); // SignatureType
+        data.extend_from_slice(&[0, 0]); // padding
+        data.extend_from_slice(&utf16_nul(r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let process_id = r.read_u32().unwrap();
+        let image_base = r.read_pointer().unwrap();
+        let _image_size = r.read_pointer().unwrap();
+        let _checksum = r.read_u32().unwrap();
+        let _timestamp = r.read_u32().unwrap();
+        let _default_base = r.read_pointer().unwrap();
+        let sig_level = r.read_u8().unwrap();
+        let sig_type = r.read_u8().unwrap();
+        r.skip(2);
+        let file_name = r.read_utf16_nul();
+
+        assert_eq!(process_id, 4200);
+        assert_eq!(image_base, 0x7FFB_1234_0000);
+        assert_eq!(sig_level, 6);
+        assert_eq!(sig_type, 2);
+        assert_eq!(
+            file_name,
+            r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"
+        );
+        // Verify image_name extraction logic
+        let image_name = file_name
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&file_name)
+            .to_string();
+        assert_eq!(image_name, "ntdll.dll");
+    }
+
+    #[test]
+    fn fixture_image_load_payload_32bit() {
+        // ImageLoad on 32-bit: pointers are 4 bytes
+        let mut data = Vec::new();
+        data.extend_from_slice(&500u32.to_le_bytes()); // ProcessId
+        data.extend_from_slice(&0x7700_0000u32.to_le_bytes()); // ImageBase (32-bit ptr)
+        data.extend_from_slice(&0x0008_0000u32.to_le_bytes()); // ImageSize (32-bit ptr)
+        data.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
+        data.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        data.extend_from_slice(&0x7700_0000u32.to_le_bytes()); // DefaultBase (32-bit ptr)
+        data.push(0); // SignatureLevel
+        data.push(0); // SignatureType
+        data.extend_from_slice(&[0, 0]); // padding
+        data.extend_from_slice(&utf16_nul(r"C:\Windows\System32\kernel32.dll"));
+
+        let mut r = UserDataReader::new(&data, 4);
+        let process_id = r.read_u32().unwrap();
+        let image_base = r.read_pointer().unwrap();
+        let _image_size = r.read_pointer().unwrap();
+        let _checksum = r.read_u32().unwrap();
+        let _timestamp = r.read_u32().unwrap();
+        let _default_base = r.read_pointer().unwrap();
+        let _sig_level = r.read_u8().unwrap();
+        let _sig_type = r.read_u8().unwrap();
+        r.skip(2);
+        let file_name = r.read_utf16_nul();
+
+        assert_eq!(process_id, 500);
+        assert_eq!(image_base, 0x7700_0000);
+        assert!(file_name.ends_with("kernel32.dll"));
+    }
+
+    // --- Composite fixture: UDP IPv4 network payload -------------------------
+
+    #[test]
+    fn fixture_udp_ipv4_payload() {
+        // Simulate Kernel-Network event ID 15 (UdpSendIPv4) UserData:
+        //   PID(u32), Size(u32), DstAddr(4), SrcAddr(4),
+        //   DstPort(u16 BE), SrcPort(u16 BE)
+        let mut data = Vec::new();
+        data.extend_from_slice(&200u32.to_le_bytes()); // PID
+        data.extend_from_slice(&64u32.to_le_bytes()); // Size
+        data.extend_from_slice(&[8, 8, 8, 8]); // DstAddr: 8.8.8.8
+        data.extend_from_slice(&[10, 0, 0, 1]); // SrcAddr: 10.0.0.1
+        data.extend_from_slice(&53u16.to_be_bytes()); // DstPort (BE)
+        data.extend_from_slice(&12345u16.to_be_bytes()); // SrcPort (BE)
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _size = r.read_u32().unwrap();
+        let dst_addr = r.read_ipv4().unwrap();
+        let src_addr = r.read_ipv4().unwrap();
+        let dst_port = r.read_u16_be().unwrap();
+        let src_port = r.read_u16_be().unwrap();
+
+        assert_eq!(dst_addr, "8.8.8.8");
+        assert_eq!(src_addr, "10.0.0.1");
+        assert_eq!(dst_port, 53);
+        assert_eq!(src_port, 12345);
+    }
+
+    // --- Composite fixture: UDP IPv6 network payload -------------------------
+
+    #[test]
+    fn fixture_udp_ipv6_payload() {
+        // Simulate Kernel-Network event ID 16 (UdpSendIPv6) UserData:
+        //   PID(u32), Size(u32), DstAddr(16), SrcAddr(16),
+        //   DstPort(u16 BE), SrcPort(u16 BE)
+        let mut data = Vec::new();
+        data.extend_from_slice(&300u32.to_le_bytes()); // PID
+        data.extend_from_slice(&128u32.to_le_bytes()); // Size
+        // DstAddr: 2001:4860:4860::8888
+        let dst_v6: [u8; 16] = [
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x88, 0x88,
+        ];
+        data.extend_from_slice(&dst_v6);
+        // SrcAddr: ::1
+        let mut src_v6 = [0u8; 16];
+        src_v6[15] = 1;
+        data.extend_from_slice(&src_v6);
+        data.extend_from_slice(&53u16.to_be_bytes()); // DstPort (BE)
+        data.extend_from_slice(&54321u16.to_be_bytes()); // SrcPort (BE)
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _size = r.read_u32().unwrap();
+        let dst_addr = r.read_ipv6().unwrap();
+        let src_addr = r.read_ipv6().unwrap();
+        let dst_port = r.read_u16_be().unwrap();
+        let src_port = r.read_u16_be().unwrap();
+
+        assert_eq!(dst_addr, "2001:4860:4860::8888");
+        assert_eq!(src_addr, "::1");
+        assert_eq!(dst_port, 53);
+        assert_eq!(src_port, 54321);
+    }
+
+    // --- Composite fixture: TCP IPv6 network payload -------------------------
+
+    #[test]
+    fn fixture_tcp_ipv6_payload() {
+        // Simulate Kernel-Network event ID 11 (TcpSendIPv6) UserData
+        let mut data = Vec::new();
+        data.extend_from_slice(&400u32.to_le_bytes()); // PID
+        data.extend_from_slice(&1024u32.to_le_bytes()); // Size
+        // DstAddr: fe80::1
+        let mut dst_v6 = [0u8; 16];
+        dst_v6[0] = 0xfe;
+        dst_v6[1] = 0x80;
+        dst_v6[15] = 1;
+        data.extend_from_slice(&dst_v6);
+        // SrcAddr: fe80::2
+        let mut src_v6 = [0u8; 16];
+        src_v6[0] = 0xfe;
+        src_v6[1] = 0x80;
+        src_v6[15] = 2;
+        data.extend_from_slice(&src_v6);
+        data.extend_from_slice(&80u16.to_be_bytes()); // DstPort
+        data.extend_from_slice(&60000u16.to_be_bytes()); // SrcPort
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _size = r.read_u32().unwrap();
+        let dst_addr = r.read_ipv6().unwrap();
+        let src_addr = r.read_ipv6().unwrap();
+        let dst_port = r.read_u16_be().unwrap();
+        let src_port = r.read_u16_be().unwrap();
+
+        assert_eq!(dst_addr, "fe80::1");
+        assert_eq!(src_addr, "fe80::2");
+        assert_eq!(dst_port, 80);
+        assert_eq!(src_port, 60000);
+    }
+
+    // --- Composite fixture: TI common header parsing -------------------------
+
+    /// Build a TI common header: CallingProcessId(u32),
+    /// CallingProcessCreateTime(u64), CallingProcessStartKey(u64),
+    /// CallingProcessSignatureLevel(u8),
+    /// CallingProcessSectionSignatureLevel(u8),
+    /// CallingProcessProtection(u8), CallingThreadId(u32),
+    /// CallingThreadCreateTime(u64)
+    fn build_ti_common_header(calling_pid: u32, calling_tid: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&calling_pid.to_le_bytes()); // CallingProcessId
+        buf.extend_from_slice(&0u64.to_le_bytes()); // CallingProcessCreateTime
+        buf.extend_from_slice(&0u64.to_le_bytes()); // CallingProcessStartKey
+        buf.push(6); // CallingProcessSignatureLevel
+        buf.push(6); // CallingProcessSectionSignatureLevel
+        buf.push(0x31); // CallingProcessProtection (PsProtectedSignerAntimalware-Light)
+        buf.extend_from_slice(&calling_tid.to_le_bytes()); // CallingThreadId
+        buf.extend_from_slice(&0u64.to_le_bytes()); // CallingThreadCreateTime
+        buf
+    }
+
+    /// Build TI target process header: TargetProcessId(u32),
+    /// TargetProcessCreateTime(u64), TargetProcessStartKey(u64),
+    /// TargetProcessSignatureLevel(u8),
+    /// TargetProcessSectionSignatureLevel(u8),
+    /// TargetProcessProtection(u8)
+    fn build_ti_target_header(target_pid: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&target_pid.to_le_bytes()); // TargetProcessId
+        buf.extend_from_slice(&0u64.to_le_bytes()); // TargetProcessCreateTime
+        buf.extend_from_slice(&0u64.to_le_bytes()); // TargetProcessStartKey
+        buf.push(0); // TargetProcessSignatureLevel
+        buf.push(0); // TargetProcessSectionSignatureLevel
+        buf.push(0); // TargetProcessProtection
+        buf
+    }
+
+    #[test]
+    fn fixture_ti_common_header_parse() {
+        let data = build_ti_common_header(1234, 5678);
+        let mut r = UserDataReader::new(&data, 8);
+
+        let calling_pid = r.read_u32().unwrap();
+        let _create_time = r.read_u64().unwrap();
+        let _start_key = r.read_u64().unwrap();
+        let sig_level = r.read_u8().unwrap();
+        let sec_sig_level = r.read_u8().unwrap();
+        let protection = r.read_u8().unwrap();
+        let calling_tid = r.read_u32().unwrap();
+        let _thread_create_time = r.read_u64().unwrap();
+
+        assert_eq!(calling_pid, 1234);
+        assert_eq!(calling_tid, 5678);
+        assert_eq!(sig_level, 6);
+        assert_eq!(sec_sig_level, 6);
+        assert_eq!(protection, 0x31);
+    }
+
+    // --- Composite fixture: TI ALLOCVM_REMOTE (ID 1) -------------------------
+
+    #[test]
+    fn fixture_ti_allocvm_remote() {
+        // TI event ID 1: common header + target header +
+        //   BaseAddress(ptr), RegionSize(ptr), AllocationType(u32),
+        //   Protection(u32)
+        let mut data = build_ti_common_header(100, 200);
+        data.extend(build_ti_target_header(999));
+        data.extend_from_slice(&0x1000_0000u64.to_le_bytes()); // BaseAddress
+        data.extend_from_slice(&0x2000u64.to_le_bytes()); // RegionSize
+        data.extend_from_slice(&0x3000u32.to_le_bytes()); // AllocationType (MEM_COMMIT | MEM_RESERVE)
+        data.extend_from_slice(&0x40u32.to_le_bytes()); // Protection (PAGE_EXECUTE_READWRITE)
+
+        // Parse: common header
+        let mut r = UserDataReader::new(&data, 8);
+        let calling_pid = r.read_u32().unwrap();
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _prot = r.read_u8().unwrap();
+        let calling_tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // Target header
+        let target_pid = r.read_u32().unwrap();
+        let _tpc = r.read_u64().unwrap();
+        let _tpk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        // Event-specific
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let _alloc_type = r.read_u32().unwrap();
+        let protection = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 100);
+        assert_eq!(calling_tid, 200);
+        assert_eq!(target_pid, 999);
+        assert_eq!(base, 0x1000_0000);
+        assert_eq!(size, 0x2000);
+        assert_eq!(protection, 0x40); // PAGE_EXECUTE_READWRITE
+    }
+
+    // --- Composite fixture: TI PROTECTVM_REMOTE (ID 2) -----------------------
+
+    #[test]
+    fn fixture_ti_protectvm_remote() {
+        // TI event ID 2: common + target +
+        //   BaseAddress(ptr), RegionSize(ptr), Protection(u32)
+        let mut data = build_ti_common_header(500, 501);
+        data.extend(build_ti_target_header(600));
+        data.extend_from_slice(&0x7FFE_0000u64.to_le_bytes()); // BaseAddress
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // RegionSize
+        data.extend_from_slice(&0x20u32.to_le_bytes()); // Protection (PAGE_EXECUTE_READ)
+
+        let mut r = UserDataReader::new(&data, 8);
+        // Skip common header
+        let _cp = r.read_u32().unwrap();
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // Skip target header
+        let target_pid = r.read_u32().unwrap();
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        // Event-specific
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let protection = r.read_u32().unwrap();
+
+        assert_eq!(target_pid, 600);
+        assert_eq!(base, 0x7FFE_0000);
+        assert_eq!(size, 0x1000);
+        assert_eq!(protection, 0x20);
+    }
+
+    // --- Composite fixture: TI QUEUEAPC_REMOTE (ID 4) — no specifics ---------
+
+    #[test]
+    fn fixture_ti_queueapc_remote() {
+        // TI event ID 4: common header + target header (no event-specific fields)
+        let mut data = build_ti_common_header(800, 801);
+        data.extend(build_ti_target_header(900));
+
+        let mut r = UserDataReader::new(&data, 8);
+        // Common
+        let calling_pid = r.read_u32().unwrap();
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // Target
+        let target_pid = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 800);
+        assert_eq!(target_pid, 900);
+    }
+
+    // --- Composite fixture: TI ALLOCVM_LOCAL (ID 6) --------------------------
+
+    #[test]
+    fn fixture_ti_allocvm_local() {
+        // TI event ID 6: common header (no target) +
+        //   BaseAddress(ptr), RegionSize(ptr), AllocationType(u32),
+        //   Protection(u32)
+        let mut data = build_ti_common_header(1500, 1501);
+        data.extend_from_slice(&0x0040_0000u64.to_le_bytes()); // BaseAddress
+        data.extend_from_slice(&0x4000u64.to_le_bytes()); // RegionSize
+        data.extend_from_slice(&0x1000u32.to_le_bytes()); // AllocationType
+        data.extend_from_slice(&0x04u32.to_le_bytes()); // Protection (PAGE_READWRITE)
+
+        let mut r = UserDataReader::new(&data, 8);
+        // Common header
+        let calling_pid = r.read_u32().unwrap();
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // No target header for local events
+        // Event-specific
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let _alloc_type = r.read_u32().unwrap();
+        let protection = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 1500);
+        assert_eq!(base, 0x0040_0000);
+        assert_eq!(size, 0x4000);
+        assert_eq!(protection, 0x04);
+    }
+
+    // --- Composite fixture: Registry CreateKey (ID 1) ------------------------
+
+    #[test]
+    fn fixture_registry_create_key_payload() {
+        // Kernel-Registry event ID 1 (CreateKey):
+        //   BaseObject(ptr), KeyObject(ptr), Status(u32), Disposition(u32),
+        //   BaseName(wstr), RelativeName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xFFFF_F800_0000u64.to_le_bytes()); // BaseObject
+        data.extend_from_slice(&0xFFFF_F801_0000u64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status (SUCCESS)
+        data.extend_from_slice(&1u32.to_le_bytes()); // Disposition (REG_CREATED_NEW_KEY)
+        data.extend_from_slice(&utf16_nul(r"\REGISTRY\MACHINE\SOFTWARE"));
+        data.extend_from_slice(&utf16_nul("TestApp"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _base_obj = r.read_pointer().unwrap();
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let _disposition = r.read_u32().unwrap(); // CreateKey has Disposition
+        let base = r.read_utf16_nul();
+        let rel = r.read_utf16_nul();
+
+        let key = if base.is_empty() {
+            rel
+        } else if rel.is_empty() {
+            base
+        } else {
+            format!("{base}\\{rel}")
+        };
+        assert_eq!(key, r"\REGISTRY\MACHINE\SOFTWARE\TestApp");
+    }
+
+    // --- Composite fixture: Registry DeleteKey (ID 3) ------------------------
+
+    #[test]
+    fn fixture_registry_delete_key_payload() {
+        // Kernel-Registry event ID 3 (DeleteKey):
+        //   KeyObject(ptr), Status(u32), KeyName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&utf16_nul(r"\REGISTRY\USER\S-1-5-21\Volatile"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let key = r.read_utf16_nul();
+
+        assert_eq!(key, r"\REGISTRY\USER\S-1-5-21\Volatile");
+    }
+
+    // --- Composite fixture: Registry DeleteValue (ID 6) ----------------------
+
+    #[test]
+    fn fixture_registry_delete_value_payload() {
+        // Kernel-Registry event ID 6 (DeleteValueKey):
+        //   KeyObject(ptr), Status(u32), KeyName(wstr), ValueName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\Evil"));
+        data.extend_from_slice(&utf16_nul("RunOnce"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let key = r.read_utf16_nul();
+        let value_name = r.read_utf16_nul();
+
+        assert_eq!(key, r"HKLM\SOFTWARE\Evil");
+        assert_eq!(value_name, "RunOnce");
+    }
+
+    // --- Composite fixture: ProcessStop (Kernel-Process ID 2) ----------------
+
+    #[test]
+    fn fixture_process_stop_payload() {
+        // Kernel-Process event ID 2 (ProcessStop):
+        //   PID(u32), CreateTime(u64), ExitTime(u64), ExitCode(u32),
+        //   ImageName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&5678u32.to_le_bytes()); // PID
+        data.extend_from_slice(&1000u64.to_le_bytes()); // CreateTime
+        data.extend_from_slice(&2000u64.to_le_bytes()); // ExitTime
+        data.extend_from_slice(&0u32.to_le_bytes()); // ExitCode
+        data.extend_from_slice(&utf16_nul(r"C:\Windows\System32\notepad.exe"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let pid = r.read_u32().unwrap();
+        let _create_time = r.read_u64().unwrap();
+        let _exit_time = r.read_u64().unwrap();
+        let exit_code = r.read_u32().unwrap();
+        let image = r.read_utf16_nul();
+
+        assert_eq!(pid, 5678);
+        assert_eq!(exit_code, 0);
+        assert_eq!(image, r"C:\Windows\System32\notepad.exe");
+    }
+
+    // --- Composite fixture: PowerShell ScriptBlock (ID 4104) -----------------
+
+    #[test]
+    fn fixture_powershell_scriptblock_payload() {
+        // PowerShell event ID 4104:
+        //   MessageNumber(i32), MessageTotal(i32), ScriptBlockText(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // MessageNumber
+        data.extend_from_slice(&1u32.to_le_bytes()); // MessageTotal
+        data.extend_from_slice(&utf16_nul("Invoke-Mimikatz"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _msg_num = r.read_u32().unwrap();
+        let _msg_total = r.read_u32().unwrap();
+        let content = r.read_utf16_nul();
+
+        assert_eq!(content, "Invoke-Mimikatz");
+    }
+
+    // --- Composite fixture: AMSI scan (ID 1101) ------------------------------
+
+    #[test]
+    fn fixture_amsi_scan_payload() {
+        // AMSI event ID 1101:
+        //   session(ptr), scanStatus(u32), appname(wstr),
+        //   contentname(wstr), contentsize(u32)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xABCD_0000u64.to_le_bytes()); // session (ptr)
+        data.extend_from_slice(&32768u32.to_le_bytes()); // scanStatus (AMSI_RESULT_DETECTED)
+        data.extend_from_slice(&utf16_nul("PowerShell"));
+        data.extend_from_slice(&utf16_nul("malware.ps1"));
+        data.extend_from_slice(&256u32.to_le_bytes()); // contentsize
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _session = r.read_pointer().unwrap();
+        let scan_result = r.read_u32().unwrap();
+        let app_name = r.read_utf16_nul();
+        let content_name = r.read_utf16_nul();
+        let content_size = r.read_u32().unwrap();
+
+        assert_eq!(scan_result, 32768);
+        assert_eq!(app_name, "PowerShell");
+        assert_eq!(content_name, "malware.ps1");
+        assert_eq!(content_size, 256);
+        // Severity should be High when scan_result >= 32768
+        assert!(scan_result >= 32768);
+    }
+
+    // --- UserDataReader: read_u8 test ----------------------------------------
+
+    #[test]
+    fn read_u8_basic() {
+        let data = [0xFF, 0x42];
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.read_u8(), Some(0xFF));
+        assert_eq!(r.read_u8(), Some(0x42));
+        assert_eq!(r.read_u8(), None);
+    }
+
+    // --- UserDataReader: skip test -------------------------------------------
+
+    #[test]
+    fn skip_advances_position() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let mut r = UserDataReader::new(&data, 8);
+        r.skip(4);
+        assert_eq!(r.read_u32(), Some(0x08070605));
+    }
+
+    #[test]
+    fn skip_past_end_clamps() {
+        let data = [0x01, 0x02];
+        let mut r = UserDataReader::new(&data, 8);
+        r.skip(100); // should clamp to data.len()
+        assert_eq!(r.read_u8(), None);
     }
 }
