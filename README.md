@@ -34,6 +34,7 @@ ThreatFalcon currently normalizes telemetry into a unified `ThreatEvent` model w
 - DNS events
 - script-related events
 - evasion-detection events
+- sensor health events (periodic heartbeat with uptime, throughput, collector status)
 
 Collection sources:
 
@@ -124,6 +125,9 @@ All sections are optional. Only the fields you want to override need to be speci
 ```toml
 # Override hostname (default: auto-detected from environment)
 hostname = "WORKSTATION-01"
+
+# Health event interval in seconds (default: 60, 0 = disabled)
+health_interval_secs = 60
 
 [output]
 path = "threatfalcon_events.jsonl"

@@ -92,6 +92,7 @@ pub enum EventSource {
     Etw { provider: String },
     Sysmon { event_id: u16 },
     EvasionDetector,
+    Sensor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +105,7 @@ pub enum EventCategory {
     Dns,
     Evasion,
     Script,
+    Health,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -209,6 +211,27 @@ pub enum EventData {
         operation: PipeOperation,
         image_path: String,
     },
+    SensorHealth {
+        uptime_secs: u64,
+        events_total: u64,
+        events_dropped: u64,
+        collectors: Vec<CollectorStatus>,
+    },
+}
+
+/// Status of a single collector, included in health events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorStatus {
+    pub name: String,
+    pub state: CollectorState,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CollectorState {
+    Running,
+    Stopped,
+    Disabled,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,4 +276,79 @@ pub enum EvasionTechnique {
 pub enum PipeOperation {
     Created,
     Connected,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_event_serialization() {
+        let event = ThreatEvent::new(
+            "TEST-HOST",
+            EventSource::Sensor,
+            EventCategory::Health,
+            Severity::Info,
+            EventData::SensorHealth {
+                uptime_secs: 120,
+                events_total: 5000,
+                events_dropped: 3,
+                collectors: vec![
+                    CollectorStatus {
+                        name: "ETW".into(),
+                        state: CollectorState::Running,
+                    },
+                    CollectorStatus {
+                        name: "Sysmon".into(),
+                        state: CollectorState::Disabled,
+                    },
+                ],
+            },
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"SensorHealth\""));
+        assert!(json.contains("\"uptime_secs\":120"));
+        assert!(json.contains("\"events_total\":5000"));
+        assert!(json.contains("\"events_dropped\":3"));
+        assert!(json.contains("\"Running\""));
+        assert!(json.contains("\"Disabled\""));
+        // rule should not be present for health events
+        assert!(!json.contains("\"rule\""));
+    }
+
+    #[test]
+    fn health_event_roundtrip() {
+        let event = ThreatEvent::new(
+            "HOST",
+            EventSource::Sensor,
+            EventCategory::Health,
+            Severity::Info,
+            EventData::SensorHealth {
+                uptime_secs: 60,
+                events_total: 100,
+                events_dropped: 0,
+                collectors: vec![],
+            },
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: ThreatEvent = serde_json::from_str(&json).unwrap();
+
+        match deserialized.data {
+            EventData::SensorHealth {
+                uptime_secs,
+                events_total,
+                events_dropped,
+                collectors,
+            } => {
+                assert_eq!(uptime_secs, 60);
+                assert_eq!(events_total, 100);
+                assert_eq!(events_dropped, 0);
+                assert!(collectors.is_empty());
+            }
+            _ => panic!("expected SensorHealth"),
+        }
+        assert!(deserialized.rule.is_none());
+    }
 }

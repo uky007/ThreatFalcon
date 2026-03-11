@@ -10,6 +10,8 @@ pub struct SensorConfig {
     pub hostname: String,
     pub output: OutputConfig,
     pub collectors: CollectorConfig,
+    /// Interval in seconds between health events (0 = disabled).
+    pub health_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,7 @@ impl Default for SensorConfig {
             hostname: hostname(),
             output: OutputConfig::default(),
             collectors: CollectorConfig::default(),
+            health_interval_secs: 60,
         }
     }
 }
