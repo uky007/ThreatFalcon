@@ -969,20 +969,22 @@ mod platform {
             "Microsoft-Windows-Threat-Intelligence" => {
                 let rule = RuleMetadata {
                     id: "TF-TI-001".into(),
-                    name: "Threat Intelligence ETW Alert".into(),
+                    name: "Threat Intelligence ETW Event".into(),
                     description: "Windows Threat Intelligence ETW provider \
-                        reported suspicious activity such as process \
-                        hollowing or code injection."
+                        emitted an event. The specific technique cannot be \
+                        determined without parsing the TI event payload; \
+                        this rule captures the raw signal for triage."
                         .into(),
                     mitre: MitreRef {
                         tactic: "Defense Evasion".into(),
-                        technique_id: "T1055".into(),
-                        technique_name: "Process Injection".into(),
+                        technique_id: "T1203".into(),
+                        technique_name: "Exploitation for Client Execution".into(),
                     },
-                    confidence: Confidence::High,
+                    confidence: Confidence::Medium,
                     evidence: vec![
                         format!("TI ETW event ID: {event_id}"),
                         format!("Source PID: {pid}"),
+                        "Specific technique unknown — TI UserData not yet parsed".into(),
                     ],
                 };
                 let event = ThreatEvent::with_rule(
