@@ -104,7 +104,10 @@ impl Sink for FileSink {
         let len = line.len() as u64;
 
         if self.rotation_bytes > 0 && self.bytes_written + len >= self.rotation_bytes {
-            self.rotate()?;
+            if let Err(e) = self.rotate() {
+                self.events_dropped += 1;
+                return Err(e);
+            }
         }
 
         if let Err(e) = self.writer.write_all(line.as_bytes()).and_then(|_| self.writer.flush()) {
