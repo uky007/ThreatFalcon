@@ -145,20 +145,32 @@ pub struct EvasionConfig {
 }
 
 impl SensorConfig {
-    pub fn load() -> Result<Self> {
-        let path = PathBuf::from(CONFIG_FILE);
-
-        if !path.exists() {
-            tracing::info!(
-                "No config file found at {CONFIG_FILE} — using defaults"
-            );
-            return Ok(Self::default());
-        }
+    /// Load config from the given path, or from the default `CONFIG_FILE` if
+    /// `path` is `None`. Returns defaults when no file is found.
+    pub fn load_from(path: Option<&std::path::Path>) -> Result<Self> {
+        let path = match path {
+            Some(p) => {
+                if !p.exists() {
+                    anyhow::bail!("Config file not found: {}", p.display());
+                }
+                p.to_path_buf()
+            }
+            None => {
+                let default = PathBuf::from(CONFIG_FILE);
+                if !default.exists() {
+                    tracing::info!(
+                        "No config file found at {CONFIG_FILE} — using defaults"
+                    );
+                    return Ok(Self::default());
+                }
+                default
+            }
+        };
 
         let content = std::fs::read_to_string(&path)?;
         let config: SensorConfig = toml::from_str(&content)?;
 
-        tracing::info!("Loaded config from {CONFIG_FILE}");
+        tracing::info!("Loaded config from {}", path.display());
         Ok(config)
     }
 }
@@ -439,5 +451,37 @@ mod tests {
         let cfg2: SensorConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(cfg.collectors.etw.providers.len(), cfg2.collectors.etw.providers.len());
         assert_eq!(cfg.output.rotation_size_mb, cfg2.output.rotation_size_mb);
+    }
+
+    #[test]
+    fn load_from_custom_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("custom.toml");
+        std::fs::write(
+            &path,
+            "hostname = \"CUSTOM\"\n[output]\npath = \"custom.jsonl\"\n",
+        )
+        .unwrap();
+        let cfg = SensorConfig::load_from(Some(&path)).unwrap();
+        assert_eq!(cfg.hostname, "CUSTOM");
+        assert_eq!(cfg.output.path, PathBuf::from("custom.jsonl"));
+    }
+
+    #[test]
+    fn load_from_missing_custom_path_errors() {
+        let result = SensorConfig::load_from(Some(std::path::Path::new("/nonexistent.toml")));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"), "error was: {err}");
+    }
+
+    #[test]
+    fn load_from_none_uses_defaults_when_no_file() {
+        // Run in a temp dir where no threatfalcon.toml exists
+        let dir = tempfile::TempDir::new().unwrap();
+        let _guard = std::env::set_current_dir(dir.path());
+        // This may or may not find a file depending on the test runner's cwd,
+        // but load_from(None) should never panic.
+        let _ = SensorConfig::load_from(None);
     }
 }

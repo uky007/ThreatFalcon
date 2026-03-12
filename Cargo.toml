@@ -20,6 +20,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 async-trait = "0.1"
 toml = "0.8"
+clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -39,6 +40,8 @@ windows = { version = "0.58", features = [
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
+assert_cmd = "2"
+predicates = "3"
 
 [profile.release]
 opt-level = 3

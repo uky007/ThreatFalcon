@@ -16,8 +16,8 @@ ThreatFalcon is early-stage software.
 - Sysmon subscription and parsing are implemented, but disabled by default
 - Evasion-oriented signal collection is implemented for selected techniques
 - Sensor health events are available for local runtime visibility
-- Configuration is loaded from `threatfalcon.toml` (TOML format)
-- Events are written locally; no remote transport is built in
+- Configuration is loaded from `threatfalcon.toml` (TOML format), overridable via `--config`
+- Output supports file, stdout, and HTTP POST sinks
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -80,7 +80,7 @@ ThreatFalcon is split into a small number of clear components:
 
 - `src/sensor.rs`: collector lifecycle, event channel, shutdown handling
 - `src/events.rs`: unified event schema
-- `src/output.rs`: JSONL writer and log rotation
+- `src/output.rs`: sink abstraction (file, stdout, HTTP POST)
 - `src/collectors/etw.rs`: ETW real-time session and event mapping
 - `src/collectors/sysmon.rs`: Sysmon Event Log subscription
 - `src/collectors/sysmon_parser.rs`: Sysmon XML parsing and mapping
@@ -119,6 +119,40 @@ ThreatFalcon is intended to run on Windows.
 cargo run --release
 ```
 
+### CLI Options
+
+```
+threatfalcon [OPTIONS]
+
+Options:
+  --config <PATH>       Path to config file (default: threatfalcon.toml)
+  --stdout              Force output to stdout (overrides config file)
+  --output <PATH>       Override output file path (overrides config file)
+  --validate-config     Validate config and exit
+  --dump-default-config Dump default config as TOML and exit
+  -h, --help            Print help
+  -V, --version         Print version
+```
+
+Examples:
+
+```bash
+# Run with a custom config file
+cargo run --release -- --config /path/to/config.toml
+
+# Output events to stdout for quick inspection
+cargo run --release -- --stdout
+
+# Write events to a specific file
+cargo run --release -- --output /var/log/threatfalcon.jsonl
+
+# Validate a config file without starting the sensor
+cargo run --release -- --config myconfig.toml --validate-config
+
+# Dump the built-in default config
+cargo run --release -- --dump-default-config > threatfalcon.toml
+```
+
 Logging can be controlled with `RUST_LOG`:
 
 ```bash
@@ -129,7 +163,7 @@ On startup, the sensor initializes enabled collectors, writes newline-delimited 
 
 ## Configuration
 
-ThreatFalcon loads `threatfalcon.toml` from the current directory on startup. If the file is not found, built-in defaults are used.
+ThreatFalcon loads `threatfalcon.toml` from the current directory on startup. If the file is not found, built-in defaults are used. Use `--config <path>` to load from a different location, or `--stdout` / `--output <path>` to override the output destination from the command line.
 
 All sections are optional. Only the fields you want to override need to be specified.
 
@@ -141,9 +175,17 @@ hostname = "WORKSTATION-01"
 # A final shutdown health event is always emitted regardless of this setting.
 health_interval_secs = 60
 
+# Output sink type: "file" (default), "stdout", or "http"
 [output]
+# type = "file"
 path = "threatfalcon_events.jsonl"
 rotation_size_mb = 100
+# type = "stdout"
+# pretty = true
+# type = "http"
+# url = "https://example.com/api/events"
+# batch_size = 100
+# timeout_secs = 10
 
 [collectors.etw]
 enabled = true
@@ -208,7 +250,6 @@ Example event shape:
 
 ## Limitations
 
-- Config file is `threatfalcon.toml` in the current directory only (no system-wide path search)
 - No installer, service wrapper, or packaging yet
 - Some ETW payload parsing is best-effort and should be validated on real Windows hosts
 - Sysmon support depends on Sysmon being installed and configured
