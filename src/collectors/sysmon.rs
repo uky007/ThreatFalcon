@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::SysmonConfig;
-use crate::events::ThreatEvent;
+use crate::events::{AgentInfo, ThreatEvent};
 
 use super::Collector;
 
@@ -35,17 +35,17 @@ use super::Collector;
 pub struct SysmonCollector {
     config: SysmonConfig,
     #[allow(dead_code)] // used on Windows only
-    hostname: String,
+    agent: AgentInfo,
     dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl SysmonCollector {
-    pub fn new(config: SysmonConfig, hostname: String) -> Self {
+    pub fn new(config: SysmonConfig, agent: AgentInfo) -> Self {
         Self {
             config,
-            hostname,
+            agent,
             dropped: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
@@ -67,7 +67,7 @@ mod platform {
     /// Use EvtSubscribe for push-based event delivery, avoiding the duplicate
     /// re-read problem of poll-based EvtQuery.
     pub fn start_subscription(
-        hostname: String,
+        agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
     ) -> Result<Arc<AtomicBool>> {
@@ -75,14 +75,14 @@ mod platform {
         let stop_clone = stop.clone();
 
         tokio::task::spawn_blocking(move || {
-            subscribe_events(&hostname, tx, stop_clone, dropped);
+            subscribe_events(&agent, tx, stop_clone, dropped);
         });
 
         Ok(stop)
     }
 
     fn subscribe_events(
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         stop: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
@@ -111,7 +111,7 @@ mod platform {
         };
 
         let ctx = Box::new(SubscribeContext {
-            hostname: hostname.to_string(),
+            agent: agent.clone(),
             tx,
             dropped,
         });
@@ -155,7 +155,7 @@ mod platform {
     }
 
     struct SubscribeContext {
-        hostname: String,
+        agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
     }
@@ -171,7 +171,7 @@ mod platform {
 
         let ctx = unsafe { &*(usercontext as *const SubscribeContext) };
 
-        if let Some(te) = render_and_map(event, &ctx.hostname) {
+        if let Some(te) = render_and_map(event, &ctx.agent) {
             if let Err(_) = ctx.tx.try_send(te) {
                 let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() || n % 1000 == 0 {
@@ -188,11 +188,11 @@ mod platform {
     /// Render a Sysmon event to XML and map it to a ThreatEvent.
     fn render_and_map(
         evt: EVT_HANDLE,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
     ) -> Option<ThreatEvent> {
         let xml = render_event_xml(evt)?;
         let parsed = super::super::sysmon_parser::parse_sysmon_xml(&xml)?;
-        super::super::sysmon_parser::map_to_threat_event(&parsed, hostname)
+        super::super::sysmon_parser::map_to_threat_event(&parsed, agent)
     }
 
     /// Render the event as XML via EvtRender.
@@ -257,7 +257,7 @@ impl Collector for SysmonCollector {
         #[cfg(target_os = "windows")]
         {
             let flag = platform::start_subscription(
-                self.hostname.clone(),
+                self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
             )?;

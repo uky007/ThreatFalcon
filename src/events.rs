@@ -2,12 +2,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Shared identity that every event is stamped with.
+#[derive(Debug, Clone)]
+pub struct AgentInfo {
+    pub hostname: String,
+    pub agent_id: Uuid,
+}
+
 /// Unified telemetry event from all collection sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreatEvent {
     pub id: Uuid,
     pub timestamp: DateTime<Utc>,
     pub hostname: String,
+    pub agent_id: Uuid,
+    pub sensor_version: String,
     pub source: EventSource,
     pub category: EventCategory,
     pub severity: Severity,
@@ -47,7 +56,7 @@ pub enum Confidence {
 impl ThreatEvent {
     /// Create a telemetry event (no rule metadata).
     pub fn new(
-        hostname: &str,
+        agent: &AgentInfo,
         source: EventSource,
         category: EventCategory,
         severity: Severity,
@@ -56,7 +65,9 @@ impl ThreatEvent {
         Self {
             id: Uuid::new_v4(),
             timestamp: Utc::now(),
-            hostname: hostname.to_string(),
+            hostname: agent.hostname.clone(),
+            agent_id: agent.agent_id,
+            sensor_version: env!("CARGO_PKG_VERSION").to_string(),
             source,
             category,
             severity,
@@ -68,7 +79,7 @@ impl ThreatEvent {
     /// Create a detection event with rule metadata.
     #[allow(dead_code)] // used by collectors on Windows only
     pub fn with_rule(
-        hostname: &str,
+        agent: &AgentInfo,
         source: EventSource,
         category: EventCategory,
         severity: Severity,
@@ -78,7 +89,9 @@ impl ThreatEvent {
         Self {
             id: Uuid::new_v4(),
             timestamp: Utc::now(),
-            hostname: hostname.to_string(),
+            hostname: agent.hostname.clone(),
+            agent_id: agent.agent_id,
+            sensor_version: env!("CARGO_PKG_VERSION").to_string(),
             source,
             category,
             severity,
@@ -292,10 +305,17 @@ pub enum PipeOperation {
 mod tests {
     use super::*;
 
+    fn test_agent() -> AgentInfo {
+        AgentInfo {
+            hostname: "TEST-HOST".into(),
+            agent_id: Uuid::nil(),
+        }
+    }
+
     #[test]
     fn health_event_serialization() {
         let event = ThreatEvent::new(
-            "TEST-HOST",
+            &test_agent(),
             EventSource::Sensor,
             EventCategory::Health,
             Severity::Info,
@@ -324,6 +344,8 @@ mod tests {
         assert!(json.contains("\"events_dropped\":3"));
         assert!(json.contains("\"Running\""));
         assert!(json.contains("\"Disabled\""));
+        assert!(json.contains("\"agent_id\""));
+        assert!(json.contains("\"sensor_version\""));
         // rule should not be present for health events
         assert!(!json.contains("\"rule\""));
     }
@@ -331,7 +353,7 @@ mod tests {
     #[test]
     fn health_event_roundtrip() {
         let event = ThreatEvent::new(
-            "HOST",
+            &test_agent(),
             EventSource::Sensor,
             EventCategory::Health,
             Severity::Info,
@@ -372,7 +394,7 @@ mod tests {
     #[test]
     fn telemetry_event_has_no_rule() {
         let event = ThreatEvent::new(
-            "HOST",
+            &test_agent(),
             EventSource::Etw {
                 provider: "Microsoft-Windows-Kernel-Process".into(),
             },
@@ -394,7 +416,7 @@ mod tests {
     #[test]
     fn detection_event_has_rule() {
         let event = ThreatEvent::with_rule(
-            "HOST",
+            &test_agent(),
             EventSource::Etw {
                 provider: "Microsoft-Windows-Threat-Intelligence".into(),
             },
@@ -425,7 +447,7 @@ mod tests {
     #[test]
     fn rule_metadata_roundtrip() {
         let event = ThreatEvent::with_rule(
-            "HOST",
+            &test_agent(),
             EventSource::EvasionDetector,
             EventCategory::Evasion,
             Severity::Critical,
@@ -472,7 +494,7 @@ mod tests {
     fn rule_metadata_json_excludes_null_rule() {
         // ThreatEvent::new() produces rule: None which should be omitted
         let event = ThreatEvent::new(
-            "H",
+            &test_agent(),
             EventSource::Sensor,
             EventCategory::Health,
             Severity::Info,

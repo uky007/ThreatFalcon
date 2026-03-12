@@ -155,7 +155,7 @@ fn decode_xml_entities(s: &str) -> String {
 /// Convert a parsed Sysmon event into a unified `ThreatEvent`.
 pub fn map_to_threat_event(
     parsed: &SysmonParsedEvent,
-    hostname: &str,
+    agent: &AgentInfo,
 ) -> Option<ThreatEvent> {
     let eid = parsed.event_id;
     let source = EventSource::Sysmon { event_id: eid };
@@ -424,7 +424,7 @@ pub fn map_to_threat_event(
                 ],
             };
             return Some(ThreatEvent::with_rule(
-                hostname,
+                agent,
                 source,
                 EventCategory::Evasion,
                 Severity::Critical,
@@ -441,7 +441,7 @@ pub fn map_to_threat_event(
         _ => return None,
     };
 
-    Some(ThreatEvent::new(hostname, source, cat, sev, data))
+    Some(ThreatEvent::new(agent, source, cat, sev, data))
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +451,14 @@ pub fn map_to_threat_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn test_agent() -> AgentInfo {
+        AgentInfo {
+            hostname: "test-host".into(),
+            agent_id: Uuid::nil(),
+        }
+    }
 
     fn sample_process_create() -> &'static str {
         r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
@@ -534,7 +542,7 @@ mod tests {
     #[test]
     fn map_process_create() {
         let parsed = parse_sysmon_xml(sample_process_create()).unwrap();
-        let event = map_to_threat_event(&parsed, "test-host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
 
         assert_eq!(event.hostname, "test-host");
         assert!(matches!(
@@ -574,7 +582,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::NetworkConnect {
                 pid,
@@ -606,7 +614,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::NetworkConnect { direction, .. } => {
                 assert!(matches!(direction, NetworkDirection::Inbound));
@@ -625,7 +633,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::FileDelete { pid, path } => {
                 assert_eq!(*pid, 999);
@@ -645,7 +653,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::FileCreate {
                 operation, path, ..
@@ -670,7 +678,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::ProcessAccess {
                 granted_access, ..
@@ -692,7 +700,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::ImageLoad {
                 image_name, signed, ..
@@ -715,7 +723,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::EvasionDetected { technique, .. } => {
                 assert!(matches!(technique, EvasionTechnique::ProcessHollowing));
@@ -739,7 +747,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::EvasionDetected { technique, .. } => {
                 assert!(matches!(technique, EvasionTechnique::ProcessHerpaderping));
@@ -763,7 +771,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
             EventData::EvasionDetected { technique, .. } => {
                 assert!(matches!(technique, EvasionTechnique::Unknown));
@@ -790,7 +798,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         assert!(event.rule.is_none(), "telemetry events should not have rule metadata");
     }
 
@@ -801,7 +809,7 @@ mod tests {
   <EventData></EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        assert!(map_to_threat_event(&parsed, "host").is_none());
+        assert!(map_to_threat_event(&parsed, &test_agent()).is_none());
     }
 
     // --- Rule metadata consistency tests -------------------------------------
@@ -819,7 +827,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         assert_eq!(event.severity, Severity::Critical);
     }
 
@@ -835,7 +843,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         let rule = event.rule.unwrap();
         assert_eq!(rule.confidence, Confidence::High);
     }
@@ -855,7 +863,7 @@ mod tests {
                 tampering_type
             );
             let parsed = parse_sysmon_xml(&xml).unwrap();
-            let event = map_to_threat_event(&parsed, "host").unwrap();
+            let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
             let rule = event.rule.unwrap();
             assert_eq!(
                 rule.mitre.tactic, "Defense Evasion",
@@ -878,7 +886,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         let rule = event.rule.unwrap();
         assert!(
             rule.evidence.iter().any(|e| e.contains("Event ID 25")),
@@ -901,7 +909,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         assert!(event.rule.is_none(), "CreateRemoteThread is telemetry, not detection");
         assert_eq!(event.severity, Severity::High, "suspicious telemetry has elevated severity");
     }

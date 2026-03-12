@@ -211,6 +211,10 @@ hostname = "WORKSTATION-01"
 # A final shutdown health event is always emitted regardless of this setting.
 health_interval_secs = 60
 
+# Path to persistent agent state file (default: threatfalcon.state)
+# A stable agent_id is generated on first run and reused across restarts.
+# state_path = "threatfalcon.state"
+
 # Output sink type: "file" (default), "stdout", or "http"
 [output]
 # type = "file"
@@ -259,6 +263,8 @@ Events are written as JSON Lines. Each event includes:
 - unique event ID
 - UTC timestamp
 - hostname
+- stable agent ID (persisted across restarts)
+- sensor version
 - source
 - category
 - severity
@@ -271,6 +277,8 @@ Example event shape:
   "id": "2d8f7b0b-8f6b-4d77-b870-4e8c1a2f0f16",
   "timestamp": "2026-03-11T00:00:00Z",
   "hostname": "HOST01",
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "sensor_version": "0.1.1",
   "source": {
     "Etw": {
       "provider": "Microsoft-Windows-Kernel-Process"

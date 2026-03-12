@@ -5,6 +5,7 @@ mod output;
 mod sensor;
 #[cfg(target_os = "windows")]
 mod service;
+mod state;
 
 use std::path::PathBuf;
 

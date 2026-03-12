@@ -15,6 +15,8 @@ pub struct SensorConfig {
     /// Interval in seconds between periodic health events (0 = periodic
     /// disabled; a final shutdown health event is always emitted).
     pub health_interval_secs: u64,
+    /// Path to the persistent agent state file (stores agent_id).
+    pub state_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +199,7 @@ impl Default for SensorConfig {
             output: OutputConfig::default(),
             collectors: CollectorConfig::default(),
             health_interval_secs: 60,
+            state_path: PathBuf::from("threatfalcon.state"),
         }
     }
 }

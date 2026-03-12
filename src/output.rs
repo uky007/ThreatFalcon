@@ -365,9 +365,16 @@ mod tests {
         }
     }
 
+    fn test_agent() -> AgentInfo {
+        AgentInfo {
+            hostname: "TEST".into(),
+            agent_id: uuid::Uuid::nil(),
+        }
+    }
+
     fn dummy_event() -> ThreatEvent {
         ThreatEvent::new(
-            "TEST",
+            &test_agent(),
             EventSource::Sensor,
             EventCategory::Health,
             Severity::Info,

@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::EvasionConfig;
-use crate::events::ThreatEvent;
+use crate::events::{AgentInfo, ThreatEvent};
 
 use super::Collector;
 
@@ -22,17 +22,17 @@ use super::Collector;
 pub struct EvasionCollector {
     config: EvasionConfig,
     #[allow(dead_code)] // used on Windows only
-    hostname: String,
+    agent: AgentInfo,
     dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl EvasionCollector {
-    pub fn new(config: EvasionConfig, hostname: String) -> Self {
+    pub fn new(config: EvasionConfig, agent: AgentInfo) -> Self {
         Self {
             config,
-            hostname,
+            agent,
             dropped: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
@@ -54,7 +54,7 @@ mod platform {
 
     pub fn start_scanner(
         config: EvasionConfig,
-        hostname: String,
+        agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
     ) -> Result<Arc<AtomicBool>> {
@@ -62,7 +62,7 @@ mod platform {
         let stop_clone = stop.clone();
 
         tokio::task::spawn_blocking(move || {
-            scan_loop(&config, &hostname, &tx, &stop_clone, &dropped);
+            scan_loop(&config, &agent, &tx, &stop_clone, &dropped);
         });
 
         Ok(stop)
@@ -70,7 +70,7 @@ mod platform {
 
     fn scan_loop(
         config: &EvasionConfig,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
         tx: &mpsc::Sender<ThreatEvent>,
         stop: &Arc<AtomicBool>,
         dropped: &Arc<AtomicU64>,
@@ -100,7 +100,7 @@ mod platform {
 
                 if config.detect_etw_patching {
                     if let Some(evt) =
-                        check_etw_patching(handle, *pid, hostname)
+                        check_etw_patching(handle, *pid, agent)
                     {
                         if let Err(e) = tx.try_send(evt) {
                             dropped.fetch_add(1, Ordering::Relaxed);
@@ -111,7 +111,7 @@ mod platform {
 
                 if config.detect_amsi_bypass {
                     if let Some(evt) =
-                        check_amsi_bypass(handle, *pid, hostname)
+                        check_amsi_bypass(handle, *pid, agent)
                     {
                         if let Err(e) = tx.try_send(evt) {
                             dropped.fetch_add(1, Ordering::Relaxed);
@@ -124,7 +124,7 @@ mod platform {
                     if let Some(evt) = check_ntdll_unhooking(
                         handle,
                         *pid,
-                        hostname,
+                        agent,
                         &ntdll_reference,
                     ) {
                         if let Err(e) = tx.try_send(evt) {
@@ -181,7 +181,7 @@ mod platform {
     fn check_etw_patching(
         handle: HANDLE,
         pid: u32,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
     ) -> Option<ThreatEvent> {
         let ntdll_base = find_module_in_process(handle, "ntdll.dll")?;
 
@@ -225,7 +225,7 @@ mod platform {
                 format!("function offset: 0x{offset:X}"),
             ];
             return Some(ThreatEvent::with_rule(
-                hostname,
+                agent,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
                 Severity::Critical,
@@ -265,7 +265,7 @@ mod platform {
     fn check_amsi_bypass(
         handle: HANDLE,
         pid: u32,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
     ) -> Option<ThreatEvent> {
         let amsi_base = find_module_in_process(handle, "amsi.dll")?;
 
@@ -310,7 +310,7 @@ mod platform {
                 format!("function offset: 0x{offset:X}"),
             ];
             return Some(ThreatEvent::with_rule(
-                hostname,
+                agent,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
                 Severity::Critical,
@@ -422,7 +422,7 @@ mod platform {
     fn check_ntdll_unhooking(
         handle: HANDLE,
         pid: u32,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
         reference: &Option<NtdllReference>,
     ) -> Option<ThreatEvent> {
         let reference = reference.as_ref()?;
@@ -479,7 +479,7 @@ mod platform {
                 "EDR hooks confirmed present in sensor's own ntdll".into(),
             ];
             return Some(ThreatEvent::with_rule(
-                hostname,
+                agent,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
                 Severity::High,
@@ -646,7 +646,7 @@ impl Collector for EvasionCollector {
         {
             let flag = platform::start_scanner(
                 self.config.clone(),
-                self.hostname.clone(),
+                self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
             )?;
