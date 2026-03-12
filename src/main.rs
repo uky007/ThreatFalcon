@@ -48,7 +48,7 @@ struct Cli {
     dump_default_config: bool,
 
     /// Run as a Windows service (used by SCM, not for manual invocation)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["stdout", "output"])]
     service: bool,
 }
 
