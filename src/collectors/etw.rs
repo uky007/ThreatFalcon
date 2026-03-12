@@ -165,6 +165,18 @@ pub(crate) mod parser {
             self.pos
         }
 
+        pub fn remaining(&self) -> usize {
+            self.data.len().saturating_sub(self.pos)
+        }
+
+        /// Read exactly `n` bytes as UTF-16LE, decode, and strip trailing NULs.
+        pub fn read_utf16_bytes(&mut self, n: usize) -> String {
+            let end = (self.pos + n).min(self.data.len());
+            let result = self.decode_utf16(self.pos, end);
+            self.pos = end;
+            result.trim_end_matches('\0').to_string()
+        }
+
         #[allow(dead_code)]
         pub fn skip(&mut self, n: usize) {
             self.pos = (self.pos + n).min(self.data.len());
@@ -552,6 +564,20 @@ mod platform {
         }
     }
 
+    /// Map SE_SIGNING_TYPE to a human-readable signer name.
+    fn signature_type_name(sig_type: u8) -> String {
+        match sig_type {
+            0 => "None".into(),
+            1 => "Embedded".into(),
+            2 => "Cached".into(),
+            3 => "CatalogCached".into(),
+            4 => "CatalogNotCached".into(),
+            5 => "CatalogHint".into(),
+            6 => "PackageCatalog".into(),
+            _ => format!("Type{sig_type}"),
+        }
+    }
+
     /// Map a raw ETW event into a `ThreatEvent`, parsing UserData payload.
     ///
     /// # Safety
@@ -631,28 +657,35 @@ mod platform {
                     //   TimeDateStamp(u32), DefaultBase(ptr),
                     //   SignatureLevel(u8), SignatureType(u8),
                     //   ...padding/flags..., FileName(wstr)
-                    let (process_id, _image_base, file_name) = data
+                    let (process_id, sig_level, sig_type, file_name) = data
                         .and_then(|d| {
                             let mut r = UserDataReader::new(d, ps);
                             let process_id = r.read_u32()?;
-                            let image_base = r.read_pointer()?;
+                            let _image_base = r.read_pointer()?;
                             let _image_size = r.read_pointer()?;
                             let _checksum = r.read_u32()?;
                             let _timestamp = r.read_u32()?;
                             let _default_base = r.read_pointer()?;
-                            // SignatureLevel(u8) + SignatureType(u8) + 2 bytes
-                            let _sig_level = r.read_u8()?;
-                            let _sig_type = r.read_u8()?;
+                            let sig_level = r.read_u8()?;
+                            let sig_type = r.read_u8()?;
                             r.skip(2); // padding/flags
                             let file_name = r.read_utf16_nul();
-                            Some((process_id, image_base, file_name))
+                            Some((process_id, sig_level, sig_type, file_name))
                         })
-                        .unwrap_or((pid, 0, String::new()));
+                        .unwrap_or((pid, 0, 0, String::new()));
                     let image_name = file_name
                         .rsplit('\\')
                         .next()
                         .unwrap_or(&file_name)
                         .to_string();
+                    // SE_SIGNING_LEVEL: 0=Unchecked, 1=Unsigned,
+                    // 4+=Authenticode/Microsoft/Windows
+                    let signed = sig_level >= 4;
+                    let signature = if signed {
+                        Some(signature_type_name(sig_type))
+                    } else {
+                        None
+                    };
                     (
                         EventCategory::ImageLoad,
                         Severity::Info,
@@ -660,8 +693,8 @@ mod platform {
                             pid: process_id,
                             image_path: file_name,
                             image_name,
-                            signed: false,
-                            signature: None,
+                            signed,
+                            signature,
                             hashes: None,
                         },
                     )
@@ -730,6 +763,52 @@ mod platform {
                             pid,
                             path,
                             operation: FileOperation::Create,
+                        },
+                    )
+                }
+                13 => {
+                    // SetInfo: IrpPtr(ptr), FileObject(ptr), TTID(u32),
+                    //   InfoClass(u32), FileName(wstr)
+                    let path = data
+                        .and_then(|d| {
+                            let mut r = UserDataReader::new(d, ps);
+                            r.read_pointer()?; // IrpPtr
+                            r.read_pointer()?; // FileObject
+                            r.read_u32()?; // TTID
+                            r.read_u32()?; // InfoClass
+                            Some(r.read_utf16_nul())
+                        })
+                        .unwrap_or_default();
+                    (
+                        EventCategory::File,
+                        Severity::Info,
+                        EventData::FileCreate {
+                            pid,
+                            path,
+                            operation: FileOperation::SetInfo,
+                        },
+                    )
+                }
+                14 => {
+                    // Rename: IrpPtr(ptr), FileObject(ptr), TTID(u32),
+                    //   InfoClass(u32), FileName(wstr)
+                    let path = data
+                        .and_then(|d| {
+                            let mut r = UserDataReader::new(d, ps);
+                            r.read_pointer()?; // IrpPtr
+                            r.read_pointer()?; // FileObject
+                            r.read_u32()?; // TTID
+                            r.read_u32()?; // InfoClass
+                            Some(r.read_utf16_nul())
+                        })
+                        .unwrap_or_default();
+                    (
+                        EventCategory::File,
+                        Severity::Info,
+                        EventData::FileCreate {
+                            pid,
+                            path,
+                            operation: FileOperation::Rename,
                         },
                     )
                 }
@@ -889,12 +968,13 @@ mod platform {
                     1 => RegistryOperation::CreateKey,
                     2 => RegistryOperation::CreateKey, // OpenKey
                     3 => RegistryOperation::DeleteKey,
+                    4 => RegistryOperation::RenameKey,
                     5 => RegistryOperation::SetValue,
                     6 => RegistryOperation::DeleteValue,
                     _ => return None,
                 };
 
-                let (key, value_name) = data
+                let (key, value_name, value_data) = data
                     .and_then(|d| {
                         let mut r = UserDataReader::new(d, ps);
                         match event_id {
@@ -918,26 +998,52 @@ mod platform {
                                 } else {
                                     format!("{base}\\{rel}")
                                 };
-                                Some((key, None))
+                                Some((key, None, None))
                             }
                             3 => {
                                 // DeleteKey: KeyObject(ptr), Status(u32),
                                 //   KeyName(wstr)
                                 r.read_pointer()?;
                                 r.read_u32()?;
-                                Some((r.read_utf16_nul(), None))
+                                Some((r.read_utf16_nul(), None, None))
+                            }
+                            4 => {
+                                // RenameKey: KeyObject(ptr), Status(u32),
+                                //   OldKeyName(wstr), NewKeyName(wstr)
+                                r.read_pointer()?;
+                                r.read_u32()?;
+                                let old_name = r.read_utf16_nul();
+                                let new_name = r.read_utf16_nul();
+                                Some((old_name, Some(new_name), None))
                             }
                             5 => {
                                 // SetValueKey: KeyObject(ptr), Status(u32),
                                 //   Type(u32), DataSize(u32),
-                                //   KeyName(wstr), ValueName(wstr)
+                                //   KeyName(wstr), ValueName(wstr),
+                                //   CapturedDataSize(u16), CapturedData(bytes)
                                 r.read_pointer()?;
-                                r.read_u32()?;
-                                r.read_u32()?;
-                                r.read_u32()?;
+                                r.read_u32()?; // Status
+                                let reg_type = r.read_u32()?;
+                                let _data_size = r.read_u32()?;
                                 let key = r.read_utf16_nul();
                                 let vn = r.read_utf16_nul();
-                                Some((key, Some(vn)))
+                                // Try to capture REG_SZ (1) / REG_EXPAND_SZ (2)
+                                // value data from CapturedData if present
+                                let vd = if matches!(reg_type, 1 | 2) {
+                                    if let Some(cap_size) = r.read_u16() {
+                                        let cap = cap_size as usize;
+                                        if cap > 0 && r.remaining() >= cap {
+                                            Some(r.read_utf16_bytes(cap))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                Some((key, Some(vn), vd))
                             }
                             6 => {
                                 // DeleteValueKey: KeyObject(ptr),
@@ -947,7 +1053,7 @@ mod platform {
                                 r.read_u32()?;
                                 let key = r.read_utf16_nul();
                                 let vn = r.read_utf16_nul();
-                                Some((key, Some(vn)))
+                                Some((key, Some(vn), None))
                             }
                             _ => None,
                         }
@@ -962,7 +1068,7 @@ mod platform {
                         operation,
                         key,
                         value_name,
-                        value_data: None,
+                        value_data,
                     },
                 )
             }
@@ -971,9 +1077,8 @@ mod platform {
             // DNS-Client
             // -----------------------------------------------------------
             "Microsoft-Windows-DNS-Client" => match event_id {
-                3006 | 3008 => {
-                    // QueryCompleted/QueryInitiated:
-                    //   QueryName(wstr), QueryType(u16), ...
+                3006 => {
+                    // QueryInitiated: QueryName(wstr), QueryType(u16)
                     let (query_name, query_type) = data
                         .and_then(|d| {
                             let mut r = UserDataReader::new(d, ps);
@@ -990,6 +1095,37 @@ mod platform {
                             query_name,
                             query_type: dns_query_type_name(query_type),
                             response: None,
+                        },
+                    )
+                }
+                3008 => {
+                    // QueryCompleted: QueryName(wstr), QueryType(u16),
+                    //   QueryOptions(u32), QueryStatus(u32),
+                    //   QueryResults(wstr)
+                    let (query_name, query_type, response) = data
+                        .and_then(|d| {
+                            let mut r = UserDataReader::new(d, ps);
+                            let name = r.read_utf16_nul();
+                            let qtype = r.read_u16()?;
+                            let _options = r.read_u32()?;
+                            let status = r.read_u32()?;
+                            let resp = if status == 0 && r.remaining() > 0 {
+                                let s = r.read_utf16_nul();
+                                if s.is_empty() { None } else { Some(s) }
+                            } else {
+                                None
+                            };
+                            Some((name, qtype, resp))
+                        })
+                        .unwrap_or_default();
+                    (
+                        EventCategory::Dns,
+                        Severity::Info,
+                        EventData::DnsQuery {
+                            pid,
+                            query_name,
+                            query_type: dns_query_type_name(query_type),
+                            response,
                         },
                     )
                 }
@@ -1130,9 +1266,9 @@ mod platform {
         let (calling_pid, _calling_tid, header_end) =
             header.unwrap_or((pid, 0, 0));
 
-        // For remote operations (IDs 1-5), parse the target process fields.
-        // TargetProcessId is also win:Pointer.
-        let target = if matches!(event_id, 1..=5) {
+        // For remote operations (IDs 1-5, 9-10), parse the target process
+        // fields. TargetProcessId is also win:Pointer.
+        let target = if matches!(event_id, 1..=5 | 9..=10) {
             data.and_then(|d| {
                 if header_end >= d.len() {
                     return None;
@@ -1193,6 +1329,12 @@ mod platform {
                     let _target_tid = r.read_u32()?;
                     let context_flags = r.read_u32()?;
                     Some((0, 0, context_flags))
+                }
+                // SUSPEND_THREAD_REMOTE / RESUME_THREAD_REMOTE
+                // Target thread ID only
+                9 | 10 => {
+                    let target_tid = r.read_u32()?;
+                    Some((target_tid as u64, 0, 0))
                 }
                 _ => None,
             }
@@ -1267,6 +1409,24 @@ mod platform {
                 "T1055",
                 "Process Injection",
             ),
+            9 => (
+                "TF-TI-009",
+                "Remote Thread Suspension",
+                "A process suspended a thread in another process \
+                 (NtSuspendThread). Used in process injection to \
+                 freeze a target before modifying its state.",
+                "T1055",
+                "Process Injection",
+            ),
+            10 => (
+                "TF-TI-010",
+                "Remote Thread Resume",
+                "A process resumed a thread in another process \
+                 (NtResumeThread). Often follows injection setup \
+                 to trigger execution of injected code.",
+                "T1055",
+                "Process Injection",
+            ),
             _ => (
                 "TF-TI-000",
                 "Threat Intelligence ETW Event",
@@ -1281,7 +1441,7 @@ mod platform {
             format!("TI event ID: {event_id}"),
             format!("Calling PID: {calling_pid}"),
         ];
-        if matches!(event_id, 1..=5) && target_pid > 0 {
+        if matches!(event_id, 1..=5 | 9..=10) && target_pid > 0 {
             evidence.push(format!("Target PID: {target_pid}"));
         }
         if let Some((base, size, protection)) = specifics {
@@ -1294,6 +1454,10 @@ mod platform {
                     // SETCONTEXT: protection=ContextFlags, base/size unused
                     evidence.push(format!("ContextFlags: 0x{protection:08X}"));
                 }
+                9 | 10 => {
+                    // SUSPEND/RESUME: base=TargetThreadId
+                    evidence.push(format!("Target TID: {base}"));
+                }
                 _ => {
                     evidence.push(format!("BaseAddress: 0x{base:X}"));
                     evidence.push(format!("RegionSize: 0x{size:X}"));
@@ -1302,7 +1466,7 @@ mod platform {
             }
         }
 
-        let details = if matches!(event_id, 1..=5) && target_pid > 0 {
+        let details = if matches!(event_id, 1..=5 | 9..=10) && target_pid > 0 {
             format!("{name}: PID {calling_pid} → PID {target_pid}")
         } else {
             format!("{name}: PID {calling_pid}")
@@ -2253,5 +2417,307 @@ mod tests {
         let mut r = UserDataReader::new(&data, 8);
         r.skip(100); // should clamp to data.len()
         assert_eq!(r.read_u8(), None);
+    }
+
+    // --- ImageLoad: signature level interpretation ---------------------------
+
+    #[test]
+    fn fixture_image_load_signed_detection() {
+        // sig_level >= 4 means signed; sig_type maps to signer name
+        let mut data = Vec::new();
+        data.extend_from_slice(&1000u32.to_le_bytes()); // ProcessId
+        data.extend_from_slice(&0x7FFB_0000_0000u64.to_le_bytes()); // ImageBase
+        data.extend_from_slice(&0x0001_0000u64.to_le_bytes()); // ImageSize
+        data.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
+        data.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        data.extend_from_slice(&0u64.to_le_bytes()); // DefaultBase
+        data.push(6); // SignatureLevel (Windows signed)
+        data.push(4); // SignatureType (CatalogNotCached)
+        data.extend_from_slice(&[0, 0]); // padding
+        data.extend_from_slice(&utf16_nul(r"C:\Windows\System32\ntdll.dll"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _base = r.read_pointer().unwrap();
+        let _size = r.read_pointer().unwrap();
+        let _chk = r.read_u32().unwrap();
+        let _ts = r.read_u32().unwrap();
+        let _db = r.read_pointer().unwrap();
+        let sig_level = r.read_u8().unwrap();
+        let sig_type = r.read_u8().unwrap();
+
+        assert_eq!(sig_level, 6);
+        assert!(sig_level >= 4, "sig_level >= 4 means signed");
+        assert_eq!(sig_type, 4);
+    }
+
+    #[test]
+    fn fixture_image_load_unsigned() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2000u32.to_le_bytes()); // ProcessId
+        data.extend_from_slice(&0x0040_0000u64.to_le_bytes()); // ImageBase
+        data.extend_from_slice(&0x0001_0000u64.to_le_bytes()); // ImageSize
+        data.extend_from_slice(&0u32.to_le_bytes()); // CheckSum
+        data.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        data.extend_from_slice(&0u64.to_le_bytes()); // DefaultBase
+        data.push(1); // SignatureLevel (Unsigned)
+        data.push(0); // SignatureType (None)
+        data.extend_from_slice(&[0, 0]); // padding
+        data.extend_from_slice(&utf16_nul(r"C:\Temp\malware.dll"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _base = r.read_pointer().unwrap();
+        let _size = r.read_pointer().unwrap();
+        let _chk = r.read_u32().unwrap();
+        let _ts = r.read_u32().unwrap();
+        let _db = r.read_pointer().unwrap();
+        let sig_level = r.read_u8().unwrap();
+
+        assert!(sig_level < 4, "sig_level < 4 means unsigned");
+    }
+
+    // --- Registry: RenameKey (ID 4) ------------------------------------------
+
+    #[test]
+    fn fixture_registry_rename_key_payload() {
+        // Kernel-Registry event ID 4 (RenameKey):
+        //   KeyObject(ptr), Status(u32), OldKeyName(wstr), NewKeyName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xAAAA_BBBBu64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\OldApp"));
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\NewApp"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let old_name = r.read_utf16_nul();
+        let new_name = r.read_utf16_nul();
+
+        assert_eq!(old_name, r"HKLM\SOFTWARE\OldApp");
+        assert_eq!(new_name, r"HKLM\SOFTWARE\NewApp");
+    }
+
+    // --- Registry: SetValue with captured data (REG_SZ) ----------------------
+
+    #[test]
+    fn fixture_registry_set_value_with_data() {
+        // SetValueKey with REG_SZ CapturedData
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&1u32.to_le_bytes()); // Type (REG_SZ)
+        data.extend_from_slice(&64u32.to_le_bytes()); // DataSize
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\Test"));
+        data.extend_from_slice(&utf16_nul("MyValue"));
+        // CapturedDataSize(u16) + CapturedData (UTF-16LE "hello")
+        let captured = utf16_nul("hello");
+        data.extend_from_slice(&(captured.len() as u16).to_le_bytes());
+        data.extend_from_slice(&captured);
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let reg_type = r.read_u32().unwrap();
+        let _data_size = r.read_u32().unwrap();
+        let key = r.read_utf16_nul();
+        let value_name = r.read_utf16_nul();
+        // CapturedData
+        let cap_size = r.read_u16().unwrap() as usize;
+        let value_data = r.read_utf16_bytes(cap_size);
+
+        assert_eq!(reg_type, 1); // REG_SZ
+        assert_eq!(key, r"HKLM\SOFTWARE\Test");
+        assert_eq!(value_name, "MyValue");
+        assert_eq!(value_data, "hello");
+    }
+
+    // --- DNS: QueryCompleted with response -----------------------------------
+
+    #[test]
+    fn fixture_dns_query_completed_with_response() {
+        // DNS-Client event 3008 (QueryCompleted):
+        //   QueryName(wstr), QueryType(u16), QueryOptions(u32),
+        //   QueryStatus(u32), QueryResults(wstr)
+        let mut data = utf16_nul("evil.example.com");
+        data.extend_from_slice(&1u16.to_le_bytes()); // QueryType = A
+        data.extend_from_slice(&0u32.to_le_bytes()); // QueryOptions
+        data.extend_from_slice(&0u32.to_le_bytes()); // QueryStatus = SUCCESS
+        data.extend_from_slice(&utf16_nul("1.2.3.4;5.6.7.8"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let query_name = r.read_utf16_nul();
+        let query_type = r.read_u16().unwrap();
+        let _options = r.read_u32().unwrap();
+        let status = r.read_u32().unwrap();
+        let response = if status == 0 && r.remaining() > 0 {
+            let s = r.read_utf16_nul();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+
+        assert_eq!(query_name, "evil.example.com");
+        assert_eq!(dns_query_type_name(query_type), "A");
+        assert_eq!(status, 0);
+        assert_eq!(response, Some("1.2.3.4;5.6.7.8".into()));
+    }
+
+    #[test]
+    fn fixture_dns_query_completed_no_response() {
+        // DNS-Client event 3008 with failed status (no results)
+        let mut data = utf16_nul("nx.example.com");
+        data.extend_from_slice(&1u16.to_le_bytes()); // QueryType = A
+        data.extend_from_slice(&0u32.to_le_bytes()); // QueryOptions
+        data.extend_from_slice(&0x2328u32.to_le_bytes()); // QueryStatus = DNS_ERROR_RCODE_NXDOMAIN (9003)
+
+        let mut r = UserDataReader::new(&data, 8);
+        let query_name = r.read_utf16_nul();
+        let _query_type = r.read_u16().unwrap();
+        let _options = r.read_u32().unwrap();
+        let status = r.read_u32().unwrap();
+        let response = if status == 0 && r.remaining() > 0 {
+            let s = r.read_utf16_nul();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+
+        assert_eq!(query_name, "nx.example.com");
+        assert_ne!(status, 0);
+        assert!(response.is_none());
+    }
+
+    // --- File: SetInfo (ID 13) and Rename (ID 14) ----------------------------
+
+    #[test]
+    fn fixture_file_setinfo_payload() {
+        // Kernel-File event ID 13 (SetInfo):
+        //   IrpPtr(ptr), FileObject(ptr), TTID(u32), InfoClass(u32),
+        //   FileName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xFFFF_0000u64.to_le_bytes()); // IrpPtr
+        data.extend_from_slice(&0xAAAA_0000u64.to_le_bytes()); // FileObject
+        data.extend_from_slice(&100u32.to_le_bytes()); // TTID
+        data.extend_from_slice(&4u32.to_le_bytes()); // InfoClass
+        data.extend_from_slice(&utf16_nul(r"C:\Users\Admin\file.txt"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _irp = r.read_pointer().unwrap();
+        let _fobj = r.read_pointer().unwrap();
+        let _ttid = r.read_u32().unwrap();
+        let _info_class = r.read_u32().unwrap();
+        let path = r.read_utf16_nul();
+
+        assert_eq!(path, r"C:\Users\Admin\file.txt");
+    }
+
+    #[test]
+    fn fixture_file_rename_payload() {
+        // Kernel-File event ID 14 (Rename):
+        //   IrpPtr(ptr), FileObject(ptr), TTID(u32), InfoClass(u32),
+        //   FileName(wstr)
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xBBBB_0000u64.to_le_bytes()); // IrpPtr
+        data.extend_from_slice(&0xCCCC_0000u64.to_le_bytes()); // FileObject
+        data.extend_from_slice(&200u32.to_le_bytes()); // TTID
+        data.extend_from_slice(&10u32.to_le_bytes()); // InfoClass (FileRenameInformation)
+        data.extend_from_slice(&utf16_nul(r"C:\Users\Admin\renamed.txt"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _irp = r.read_pointer().unwrap();
+        let _fobj = r.read_pointer().unwrap();
+        let _ttid = r.read_u32().unwrap();
+        let _info_class = r.read_u32().unwrap();
+        let path = r.read_utf16_nul();
+
+        assert_eq!(path, r"C:\Users\Admin\renamed.txt");
+    }
+
+    // --- TI: SuspendThread (ID 9) / ResumeThread (ID 10) --------------------
+
+    #[test]
+    fn fixture_ti_suspend_thread_remote() {
+        // TI event ID 9: common header + target header + TargetThreadId(u32)
+        let mut data = build_ti_common_header(300, 301);
+        data.extend(build_ti_target_header(400));
+        data.extend_from_slice(&5555u32.to_le_bytes()); // TargetThreadId
+
+        let mut r = UserDataReader::new(&data, 8);
+        // Common
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // Target
+        let target_pid = r.read_pointer().unwrap() as u32;
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        // Event-specific
+        let target_tid = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 300);
+        assert_eq!(target_pid, 400);
+        assert_eq!(target_tid, 5555);
+    }
+
+    #[test]
+    fn fixture_ti_resume_thread_remote() {
+        // TI event ID 10: same layout as ID 9
+        let mut data = build_ti_common_header(600, 601);
+        data.extend(build_ti_target_header(700));
+        data.extend_from_slice(&7777u32.to_le_bytes()); // TargetThreadId
+
+        let mut r = UserDataReader::new(&data, 8);
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        let target_tid = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 600);
+        assert_eq!(target_pid, 700);
+        assert_eq!(target_tid, 7777);
+    }
+
+    // --- UserDataReader: remaining() and read_utf16_bytes() ------------------
+
+    #[test]
+    fn remaining_tracks_correctly() {
+        let data = [0u8; 16];
+        let mut r = UserDataReader::new(&data, 8);
+        assert_eq!(r.remaining(), 16);
+        r.read_u32().unwrap();
+        assert_eq!(r.remaining(), 12);
+        r.read_u64().unwrap();
+        assert_eq!(r.remaining(), 4);
+    }
+
+    #[test]
+    fn read_utf16_bytes_fixed_length() {
+        // "AB" in UTF-16LE = [0x41, 0x00, 0x42, 0x00]
+        let data = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00];
+        let mut r = UserDataReader::new(&data, 8);
+        let s = r.read_utf16_bytes(4); // read 4 bytes = 2 chars
+        assert_eq!(s, "AB");
+        assert_eq!(r.remaining(), 2);
     }
 }
