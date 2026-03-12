@@ -10,7 +10,7 @@ use crate::collectors::sysmon::SysmonCollector;
 use crate::collectors::Collector;
 use crate::config::SensorConfig;
 use crate::events::*;
-use crate::output::EventWriter;
+use crate::output;
 
 const EVENT_CHANNEL_SIZE: usize = 10_000;
 
@@ -92,7 +92,7 @@ impl Sensor {
             .count();
         info!(active_collectors = active, "Sensor running");
 
-        let mut writer = EventWriter::new(&self.config.output)?;
+        let mut writer = output::create_sink(&self.config.output)?;
         let mut event_count = 0u64;
         let mut write_failures = 0u64;
 
@@ -115,7 +115,7 @@ impl Sensor {
                 event = rx.recv() => {
                     match event {
                         Some(evt) => {
-                            if let Err(e) = writer.write_event(&evt) {
+                            if let Err(e) = writer.send(&evt).await {
                                 error!(error = %e, "Failed to write event");
                                 write_failures += 1;
                             }
@@ -138,7 +138,7 @@ impl Sensor {
                         event_count,
                         total_dropped,
                     );
-                    if let Err(e) = writer.write_event(&health) {
+                    if let Err(e) = writer.send(&health).await {
                         error!(error = %e, "Failed to write health event");
                     }
                     info!(
@@ -177,8 +177,13 @@ impl Sensor {
             event_count,
             total_dropped,
         );
-        if let Err(e) = writer.write_event(&final_health) {
+        if let Err(e) = writer.send(&final_health).await {
             error!(error = %e, "Failed to write final health event");
+        }
+
+        // Ensure all buffered events are delivered (important for HTTP sink)
+        if let Err(e) = writer.flush().await {
+            error!(error = %e, "Failed to flush sink on shutdown");
         }
 
         info!(total_events = event_count, "Sensor stopped");
@@ -231,8 +236,8 @@ mod tests {
             hostname: "TEST-HOST".into(),
             output: OutputConfig {
                 path: dir.path().join("test_events.jsonl"),
-                format: OutputFormat::JsonLines,
                 rotation_size_mb: 100,
+                ..OutputConfig::default()
             },
             collectors: CollectorConfig::default(),
             health_interval_secs: 60,

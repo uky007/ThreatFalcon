@@ -18,14 +18,32 @@ pub struct SensorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutputConfig {
+    /// Sink type: "file" (default), "stdout", or "http".
+    #[serde(rename = "type")]
+    pub sink_type: SinkType,
+    /// Path for file sink output.
     pub path: PathBuf,
-    pub format: OutputFormat,
+    /// Max file size in MB before rotation (0 = no rotation). File sink only.
     pub rotation_size_mb: u64,
+    /// Pretty-print JSON output. Stdout sink only.
+    pub pretty: bool,
+    /// Endpoint URL for HTTP sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Number of events to batch before POSTing. HTTP sink only.
+    pub batch_size: usize,
+    /// HTTP request timeout in seconds. HTTP sink only.
+    pub timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum OutputFormat {
-    JsonLines,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SinkType {
+    #[serde(rename = "file")]
+    File,
+    #[serde(rename = "stdout")]
+    Stdout,
+    #[serde(rename = "http")]
+    Http,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,12 +174,22 @@ impl Default for SensorConfig {
     }
 }
 
+impl Default for SinkType {
+    fn default() -> Self {
+        Self::File
+    }
+}
+
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
+            sink_type: SinkType::File,
             path: PathBuf::from("threatfalcon_events.jsonl"),
-            format: OutputFormat::JsonLines,
             rotation_size_mb: 100,
+            pretty: false,
+            url: None,
+            batch_size: 100,
+            timeout_secs: 10,
         }
     }
 }
@@ -273,6 +301,7 @@ mod tests {
         assert!(cfg.collectors.etw.enabled);
         assert!(!cfg.collectors.sysmon.enabled);
         assert!(cfg.collectors.evasion.enabled);
+        assert_eq!(cfg.output.sink_type, SinkType::File);
         assert_eq!(cfg.output.rotation_size_mb, 100);
         assert_eq!(cfg.collectors.etw.providers.len(), 8);
     }
@@ -282,6 +311,7 @@ mod tests {
         let cfg: SensorConfig = toml::from_str("").unwrap();
         assert!(cfg.collectors.etw.enabled);
         assert_eq!(cfg.collectors.etw.providers.len(), 8);
+        assert_eq!(cfg.output.sink_type, SinkType::File);
         assert_eq!(cfg.output.rotation_size_mb, 100);
     }
 
@@ -299,12 +329,41 @@ mod tests {
         "#;
         let cfg: SensorConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.hostname, "WORKSTATION-01");
+        assert_eq!(cfg.output.sink_type, SinkType::File); // default
         assert_eq!(cfg.output.path, PathBuf::from("custom.jsonl"));
         assert_eq!(cfg.output.rotation_size_mb, 50);
         assert!(cfg.collectors.sysmon.enabled);
         // Untouched fields keep defaults
         assert!(cfg.collectors.etw.enabled);
         assert!(cfg.collectors.evasion.enabled);
+    }
+
+    #[test]
+    fn stdout_sink_config() {
+        let toml = r#"
+            [output]
+            type = "stdout"
+            pretty = true
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.output.sink_type, SinkType::Stdout);
+        assert!(cfg.output.pretty);
+    }
+
+    #[test]
+    fn http_sink_config() {
+        let toml = r#"
+            [output]
+            type = "http"
+            url = "https://example.com/api/events"
+            batch_size = 50
+            timeout_secs = 30
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.output.sink_type, SinkType::Http);
+        assert_eq!(cfg.output.url.as_deref(), Some("https://example.com/api/events"));
+        assert_eq!(cfg.output.batch_size, 50);
+        assert_eq!(cfg.output.timeout_secs, 30);
     }
 
     #[test]
