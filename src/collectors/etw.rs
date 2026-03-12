@@ -1387,25 +1387,27 @@ mod platform {
             6 => (
                 "TF-TI-006",
                 "Local Virtual Memory Allocation (TI)",
-                "TI provider reported a local memory allocation flagged \
-                 for monitoring. May indicate self-injection or \
-                 memory manipulation.",
+                "TI provider flagged a local executable memory allocation. \
+                 Common in legitimate JIT compilers and loaders; suspicious \
+                 when combined with other injection indicators.",
                 "T1055",
                 "Process Injection",
             ),
             7 => (
                 "TF-TI-007",
                 "Local Memory Protection Change (TI)",
-                "TI provider reported a local memory protection change. \
-                 May indicate code unpacking or self-modification.",
+                "TI provider flagged a local memory protection change to \
+                 executable. Common in code unpacking, JIT, and .NET; \
+                 suspicious when the process is not a known runtime.",
                 "T1027.002",
                 "Obfuscated Files or Information: Software Packing",
             ),
             8 => (
                 "TF-TI-008",
                 "Local Section Mapping (TI)",
-                "TI provider reported a local section mapping flagged \
-                 for monitoring.",
+                "TI provider flagged a local executable section mapping. \
+                 Common in normal DLL loading; suspicious when the mapped \
+                 section is not backed by a known image.",
                 "T1055",
                 "Process Injection",
             ),
@@ -1472,32 +1474,50 @@ mod platform {
             format!("{name}: PID {calling_pid}")
         };
 
-        ThreatEvent::with_rule(
-            hostname,
-            EventSource::Etw {
-                provider: "Microsoft-Windows-Threat-Intelligence".into(),
-            },
-            EventCategory::Evasion,
-            Severity::High,
-            EventData::EvasionDetected {
-                technique: EvasionTechnique::Unknown,
-                pid: Some(calling_pid),
-                process_name: None,
-                details,
-            },
-            RuleMetadata {
-                id: rule_id.into(),
-                name: name.into(),
-                description: description.into(),
-                mitre: MitreRef {
-                    tactic: "Defense Evasion".into(),
-                    technique_id: technique_id.into(),
-                    technique_name: technique_name.into(),
+        let source = EventSource::Etw {
+            provider: "Microsoft-Windows-Threat-Intelligence".into(),
+        };
+        let event_data = EventData::EvasionDetected {
+            technique: EvasionTechnique::Unknown,
+            pid: Some(calling_pid),
+            process_name: None,
+            details,
+        };
+
+        // Local operations (IDs 6-8) are telemetry: the TI provider flagged
+        // them, but they are common in JIT, .NET, and DLL loaders, so we
+        // emit them without rule metadata for contextual analysis.
+        // Remote operations (IDs 1-5, 9-10) are detections: cross-process
+        // memory manipulation is inherently suspicious.
+        if matches!(event_id, 6..=8) {
+            ThreatEvent::new(
+                hostname,
+                source,
+                EventCategory::Evasion,
+                Severity::Medium,
+                event_data,
+            )
+        } else {
+            ThreatEvent::with_rule(
+                hostname,
+                source,
+                EventCategory::Evasion,
+                Severity::High,
+                event_data,
+                RuleMetadata {
+                    id: rule_id.into(),
+                    name: name.into(),
+                    description: description.into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: technique_id.into(),
+                        technique_name: technique_name.into(),
+                    },
+                    confidence: Confidence::Medium,
+                    evidence,
                 },
-                confidence: Confidence::Medium,
-                evidence,
-            },
-        )
+            )
+        }
     }
 }
 
