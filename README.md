@@ -283,7 +283,7 @@ Example event shape:
   "timestamp": "2026-03-11T00:00:00Z",
   "hostname": "HOST01",
   "agent_id": "550e8400-e29b-41d4-a716-446655440000",
-  "sensor_version": "0.1.1",
+  "sensor_version": "0.2.0",
   "source": {
     "Etw": {
       "provider": "Microsoft-Windows-Kernel-Process"
