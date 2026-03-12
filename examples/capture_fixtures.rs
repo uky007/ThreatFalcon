@@ -28,6 +28,7 @@ mod capture {
     struct CaptureContext {
         count: AtomicU32,
         stop: Arc<AtomicBool>,
+        session_name_wide: Vec<u16>,
     }
 
     pub fn run() {
@@ -37,26 +38,41 @@ mod capture {
         println!();
 
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
 
-        // Ctrl+C handler
-        ctrlc::set_handler(move || {
-            stop_clone.store(true, Ordering::SeqCst);
-        })
-        .expect("Failed to set Ctrl+C handler");
+        // Ctrl+C handler — use Windows SetConsoleCtrlHandler directly
+        // to avoid an external dependency on the ctrlc crate.
+        {
+            let stop_clone = stop.clone();
+            unsafe {
+                windows::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(ctrl_handler),
+                    true,
+                )
+                .expect("Failed to set Ctrl+C handler");
+            }
+            // Store the stop flag where the handler can reach it.
+            // Safe because the handler is registered once before any
+            // concurrent access.
+            STOP_FLAG.store(
+                Arc::into_raw(stop_clone) as *mut _,
+                Ordering::Release,
+            );
+        }
 
-        // Providers to capture (subset — no TI since it requires PPL)
+        // Providers to capture — GUIDs match the sensor's default config
+        // (see src/config.rs default_etw_providers).
+        // TI is included for completeness but requires PPL to receive events.
         let providers = vec![
             // Kernel-Process
-            ("22FB2CD6-6757-4FCB-B826-A443BB184F30", "Kernel-Process", 0x10u64),
+            ("22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716", "Kernel_Process", 0xFFFFFFFFFFFFFFFFu64),
             // Kernel-File
-            ("EDD08927-9CC4-4E65-B970-C2560FB5C289", "Kernel-File", 0x10u64),
+            ("EDD08927-9CC4-4E65-B970-C2560FB5C289", "Kernel_File", 0xFFFFFFFFFFFFFFFFu64),
             // Kernel-Network
-            ("7DD42A49-5329-4832-8DFD-43D979153A88", "Kernel-Network", 0x10u64),
+            ("7DD42A49-5329-4832-8DFD-43D979153A88", "Kernel_Network", 0xFFFFFFFFFFFFFFFFu64),
             // Kernel-Registry
-            ("70EB4F03-C1DE-4F73-A051-33D13D5413BD", "Kernel-Registry", 0x10u64),
+            ("70EB4F03-C1DE-4F73-A051-33D13D5413BD", "Kernel_Registry", 0xFFFFFFFFFFFFFFFFu64),
             // DNS-Client
-            ("1C95126E-7EEA-49A9-A3FE-A378B03DDB4D", "DNS-Client", 0xFFFFFFFFFFFFFFFFu64),
+            ("1C95126E-7EEA-49A9-A3FE-A378B03DDB4D", "DNS_Client", 0xFFFFFFFFFFFFFFFFu64),
         ];
 
         // Allocate session
@@ -117,6 +133,7 @@ mod capture {
         let ctx = Box::new(CaptureContext {
             count: AtomicU32::new(0),
             stop: stop.clone(),
+            session_name_wide: session_wide.clone(),
         });
         let ctx_ptr = Box::into_raw(ctx);
 
@@ -140,6 +157,9 @@ mod capture {
             return;
         }
 
+        // Store session name for the Ctrl+C handler before ProcessTrace blocks
+        let _ = SESSION_WIDE.set(session_wide.clone());
+
         eprintln!("Capturing up to {MAX_EVENTS} events (Ctrl+C to stop)...");
 
         let status = unsafe { ProcessTrace(&[trace], None, None) };
@@ -152,7 +172,15 @@ mod capture {
             drop(Box::from_raw(ctx_ptr));
         }
 
-        // Stop session
+        // Stop session (belt-and-suspenders — callback may have already
+        // stopped it, but ControlTraceW is idempotent on a stopped session)
+        stop_session(&session_wide);
+
+        eprintln!("Done.");
+    }
+
+    /// Stop the ETW trace session so ProcessTrace returns.
+    fn stop_session(session_wide: &[u16]) {
         let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
         let mut buf = vec![0u8; total];
         let props = unsafe {
@@ -167,8 +195,37 @@ mod capture {
                 EVENT_TRACE_CONTROL_STOP,
             );
         }
+    }
 
-        eprintln!("Done.");
+    // -----------------------------------------------------------------------
+    // Ctrl+C handler (Win32 ConsoleCtrlHandler)
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicPtr;
+
+    /// Global pointer to the stop flag, set once before the handler fires.
+    static STOP_FLAG: AtomicPtr<AtomicBool> =
+        AtomicPtr::new(std::ptr::null_mut());
+
+    /// Global copy of the session name for the handler to stop the trace.
+    /// Set once before ProcessTrace is called.
+    static SESSION_WIDE: std::sync::OnceLock<Vec<u16>> =
+        std::sync::OnceLock::new();
+
+    unsafe extern "system" fn ctrl_handler(
+        _ctrl_type: u32,
+    ) -> BOOL {
+        // Signal the stop flag so the callback stops emitting events
+        let ptr = STOP_FLAG.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe { &*ptr }.store(true, Ordering::SeqCst);
+        }
+        // Stop the ETW session so ProcessTrace returns immediately.
+        // This is the key fix: without this, ProcessTrace blocks forever.
+        if let Some(sw) = SESSION_WIDE.get() {
+            stop_session(sw);
+        }
+        TRUE
     }
 
     unsafe extern "system" fn capture_callback(record: *mut EVENT_RECORD) {
@@ -176,12 +233,15 @@ mod capture {
         let ctx = unsafe { &*(rec.UserContext as *const CaptureContext) };
 
         if ctx.stop.load(Ordering::Relaxed) {
+            // Stop the session from the callback so ProcessTrace returns.
+            stop_session(&ctx.session_name_wide);
             return;
         }
 
         let n = ctx.count.fetch_add(1, Ordering::Relaxed);
         if n >= MAX_EVENTS {
             ctx.stop.store(true, Ordering::SeqCst);
+            stop_session(&ctx.session_name_wide);
             return;
         }
 
@@ -199,23 +259,23 @@ mod capture {
         };
 
         let provider_name = match provider.data1 {
-            0x22FB2CD6 => "Kernel-Process",
-            0xEDD08927 => "Kernel-File",
-            0x7DD42A49 => "Kernel-Network",
-            0x70EB4F03 => "Kernel-Registry",
-            0x1C95126E => "DNS-Client",
-            0xF4E1897C => "Threat-Intelligence",
+            0x22FB2CD6 => "Kernel_Process",
+            0xEDD08927 => "Kernel_File",
+            0x7DD42A49 => "Kernel_Network",
+            0x70EB4F03 => "Kernel_Registry",
+            0x1C95126E => "DNS_Client",
+            0xF4E1897C => "Threat_Intelligence",
             _ => return,
         };
 
         // Filter to event IDs we care about
         let dominated = match provider_name {
-            "Kernel-Process" => matches!(event_id, 1 | 2 | 5),
-            "Kernel-File" => matches!(event_id, 10..=14),
-            "Kernel-Network" => matches!(event_id, 10..=18),
-            "Kernel-Registry" => matches!(event_id, 1..=6),
-            "DNS-Client" => matches!(event_id, 3006 | 3008),
-            "Threat-Intelligence" => matches!(event_id, 1..=10),
+            "Kernel_Process" => matches!(event_id, 1 | 2 | 5),
+            "Kernel_File" => matches!(event_id, 10..=14),
+            "Kernel_Network" => matches!(event_id, 10..=18),
+            "Kernel_Registry" => matches!(event_id, 1..=6),
+            "DNS_Client" => matches!(event_id, 3006 | 3008),
+            "Threat_Intelligence" => matches!(event_id, 1..=10),
             _ => false,
         };
         if !dominated {
@@ -235,7 +295,7 @@ mod capture {
             "// provider={provider_name} event_id={event_id} pid={pid} \
              ptr_size={ptr_size} len={len}"
         );
-        println!("const {provider_name}_{event_id}_{n}: &str = \"{hex}\";");
+        println!("const {provider_name}_E{event_id}_{n}: &str = \"{hex}\";");
         println!();
     }
 
