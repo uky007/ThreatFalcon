@@ -4,12 +4,12 @@
 //! state file.  Subsequent runs re-use the same id so the agent is stable
 //! across restarts.
 //!
-//! File creation uses `create_new` (O_CREAT|O_EXCL) for atomic exclusive
-//! creation, preventing two concurrent first-run processes from generating
-//! divergent agent IDs.
+//! Atomicity: the new state is written to a temp file in the same directory,
+//! then renamed into place. On Unix `rename(2)` is atomic; on Windows
+//! `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` is as close as we get.
+//! A concurrent reader will see either the old (non-existent) path or the
+//! fully-written file — never a partial write.
 
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -23,8 +23,9 @@ struct StateFile {
 
 /// Load `agent_id` from `path`, or generate and persist a new one.
 ///
-/// Uses exclusive file creation (`create_new`) so that concurrent first-run
-/// processes cannot both observe "file missing" and write different IDs.
+/// Creation is atomic: content is written to a temporary file first, then
+/// renamed into the final path. A concurrent process that loses the rename
+/// race simply reads the winner's file.
 pub fn load_or_create_agent_id(path: &Path) -> Result<Uuid> {
     // Ensure parent directories exist.
     if let Some(parent) = path.parent() {
@@ -33,26 +34,51 @@ pub fn load_or_create_agent_id(path: &Path) -> Result<Uuid> {
         }
     }
 
-    // Try exclusive create — only one process can win this race.
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            let id = Uuid::new_v4();
-            let state = StateFile { agent_id: id };
-            let content = toml::to_string_pretty(&state)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
+    // Fast path: file already exists — just read it.
+    if path.exists() {
+        let content = std::fs::read_to_string(path)?;
+        let state: StateFile = toml::from_str(&content)?;
+        tracing::info!(agent_id = %state.agent_id, path = %path.display(), "Loaded agent state");
+        return Ok(state.agent_id);
+    }
+
+    // Slow path: generate a new ID and write atomically via temp+rename.
+    let id = Uuid::new_v4();
+    let state = StateFile { agent_id: id };
+    let content = toml::to_string_pretty(&state)?;
+
+    // Write to a temp file in the same directory (same filesystem) so
+    // rename is atomic and never crosses mount points.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::fs::write(tmp.path(), content.as_bytes())?;
+
+    // persist() does rename on Unix, MoveFileEx on Windows.
+    // If the target already appeared between our exists() check and now,
+    // persist will overwrite on Unix (atomic) or fail on Windows —
+    // either way the final file is valid. On Windows rename failure,
+    // fall back to reading the winner's file.
+    match tmp.persist(path) {
+        Ok(_) => {
             tracing::info!(agent_id = %id, path = %path.display(), "Created new agent state");
             Ok(id)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // File exists — another process may have just created it, or it
-            // was there from a previous run. Read and return its agent_id.
-            let content = std::fs::read_to_string(path)?;
-            let state: StateFile = toml::from_str(&content)?;
-            tracing::info!(agent_id = %state.agent_id, path = %path.display(), "Loaded agent state");
-            Ok(state.agent_id)
+        Err(e) => {
+            // Another process won the race and placed the file first.
+            // Read their ID instead of ours.
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                let state: StateFile = toml::from_str(&content)?;
+                tracing::info!(
+                    agent_id = %state.agent_id,
+                    path = %path.display(),
+                    "Lost rename race — loaded winner's agent state"
+                );
+                Ok(state.agent_id)
+            } else {
+                Err(e.error.into())
+            }
         }
-        Err(e) => Err(e.into()),
     }
 }
 
