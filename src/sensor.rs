@@ -94,7 +94,6 @@ impl Sensor {
 
         let mut writer = output::create_sink(&self.config.output)?;
         let mut event_count = 0u64;
-        let mut write_failures = 0u64;
 
         // Health tick — interval of 0 disables periodic health events
         // (a final shutdown health event is always emitted regardless)
@@ -117,7 +116,6 @@ impl Sensor {
                         Some(evt) => {
                             if let Err(e) = writer.send(&evt).await {
                                 error!(error = %e, "Failed to write event");
-                                write_failures += 1;
                             }
                             event_count += 1;
                             if event_count % 1000 == 0 {
@@ -131,7 +129,7 @@ impl Sensor {
                     }
                 }
                 _ = health_tick.tick() => {
-                    let total_dropped = write_failures + self.collector_drops();
+                    let total_dropped = writer.dropped_events() + self.collector_drops();
                     let health = self.build_health_event(
                         &collector_states,
                         &start_time,
@@ -169,8 +167,13 @@ impl Sensor {
             }
         }
 
-        // Final health event
-        let total_dropped = write_failures + self.collector_drops();
+        // Flush buffered events before final health so drop counts are accurate
+        if let Err(e) = writer.flush().await {
+            error!(error = %e, "Failed to flush sink on shutdown");
+        }
+
+        // Final health event (includes any drops from flush above)
+        let total_dropped = writer.dropped_events() + self.collector_drops();
         let final_health = self.build_health_event(
             &collector_states,
             &start_time,
@@ -181,9 +184,9 @@ impl Sensor {
             error!(error = %e, "Failed to write final health event");
         }
 
-        // Ensure all buffered events are delivered (important for HTTP sink)
+        // Flush the final health event itself
         if let Err(e) = writer.flush().await {
-            error!(error = %e, "Failed to flush sink on shutdown");
+            error!(error = %e, "Failed to flush final health event");
         }
 
         info!(total_events = event_count, "Sensor stopped");

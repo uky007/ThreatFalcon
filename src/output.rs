@@ -19,6 +19,8 @@ pub trait Sink: Send {
     fn name(&self) -> &str;
     async fn send(&mut self, event: &ThreatEvent) -> Result<()>;
     async fn flush(&mut self) -> Result<()>;
+    /// Total number of events this sink failed to deliver.
+    fn dropped_events(&self) -> u64;
 }
 
 /// Construct the appropriate sink from config.
@@ -50,6 +52,7 @@ pub struct FileSink {
     rotation_bytes: u64,
     base_path: String,
     generation: u32,
+    events_dropped: u64,
 }
 
 impl FileSink {
@@ -65,6 +68,7 @@ impl FileSink {
             rotation_bytes: config.rotation_size_mb * 1024 * 1024,
             base_path: path,
             generation,
+            events_dropped: 0,
         })
     }
 
@@ -103,8 +107,10 @@ impl Sink for FileSink {
             self.rotate()?;
         }
 
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.flush()?;
+        if let Err(e) = self.writer.write_all(line.as_bytes()).and_then(|_| self.writer.flush()) {
+            self.events_dropped += 1;
+            return Err(e.into());
+        }
         self.bytes_written += len;
 
         Ok(())
@@ -113,6 +119,10 @@ impl Sink for FileSink {
     async fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.events_dropped
     }
 }
 
@@ -123,6 +133,7 @@ impl Sink for FileSink {
 pub struct StdoutSink {
     writer: Box<dyn Write + Send>,
     pretty: bool,
+    events_dropped: u64,
 }
 
 impl StdoutSink {
@@ -130,6 +141,7 @@ impl StdoutSink {
         Self {
             writer: Box::new(std::io::stdout()),
             pretty,
+            events_dropped: 0,
         }
     }
 }
@@ -147,14 +159,20 @@ impl Sink for StdoutSink {
             serde_json::to_string(event)?
         };
         let line = format!("{json}\n");
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.flush()?;
+        if let Err(e) = self.writer.write_all(line.as_bytes()).and_then(|_| self.writer.flush()) {
+            self.events_dropped += 1;
+            return Err(e.into());
+        }
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.events_dropped
     }
 }
 
@@ -167,6 +185,7 @@ pub struct HttpSink {
     url: String,
     batch_size: usize,
     buffer: Vec<String>,
+    events_dropped: u64,
 }
 
 impl HttpSink {
@@ -179,6 +198,7 @@ impl HttpSink {
             url: url.to_string(),
             batch_size: batch_size.max(1),
             buffer: Vec::with_capacity(batch_size),
+            events_dropped: 0,
         })
     }
 
@@ -223,8 +243,9 @@ impl HttpSink {
         }
 
         // Discard buffer to prevent unbounded growth
-        let count = self.buffer.len();
+        let count = self.buffer.len() as u64;
         self.buffer.clear();
+        self.events_dropped += count;
         tracing::warn!(
             events_lost = count,
             "HTTP sink discarded events after 3 failed attempts"
@@ -250,6 +271,10 @@ impl Sink for HttpSink {
 
     async fn flush(&mut self) -> Result<()> {
         self.flush_buffer().await
+    }
+
+    fn dropped_events(&self) -> u64 {
+        self.events_dropped
     }
 }
 
@@ -354,6 +379,7 @@ mod tests {
             rotation_bytes,
             base_path: path.to_string_lossy().to_string(),
             generation: 0,
+            events_dropped: 0,
         };
 
         for _ in 0..3 {
@@ -402,6 +428,7 @@ mod tests {
             rotation_bytes: 10,
             base_path: base.to_string_lossy().to_string(),
             generation: gen,
+            events_dropped: 0,
         };
 
         let evt = dummy_event();
@@ -459,6 +486,7 @@ mod tests {
             rotation_bytes: 100,
             base_path: path.to_string_lossy().to_string(),
             generation: 0,
+            events_dropped: 0,
         };
 
         let evt = dummy_event();
@@ -482,6 +510,7 @@ mod tests {
             rotation_bytes: 200,
             base_path: path.to_string_lossy().to_string(),
             generation: 0,
+            events_dropped: 0,
         };
 
         let evt = dummy_event();
@@ -517,6 +546,7 @@ mod tests {
         let mut sink = StdoutSink {
             writer: Box::new(TestWriter(buf.clone())),
             pretty: false,
+            events_dropped: 0,
         };
 
         sink.send(&dummy_event()).await.unwrap();
@@ -534,6 +564,7 @@ mod tests {
         let mut sink = StdoutSink {
             writer: Box::new(TestWriter(buf.clone())),
             pretty: true,
+            events_dropped: 0,
         };
 
         sink.send(&dummy_event()).await.unwrap();
@@ -550,6 +581,7 @@ mod tests {
         let mut sink = StdoutSink {
             writer: Box::new(TestWriter(buf.clone())),
             pretty: false,
+            events_dropped: 0,
         };
         sink.flush().await.unwrap();
     }
@@ -682,8 +714,38 @@ mod tests {
         assert!(result.is_err());
         // Buffer should be cleared even on failure
         assert_eq!(sink.buffer.len(), 0);
+        // dropped_events should reflect the discarded event
+        assert_eq!(sink.dropped_events(), 1);
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn http_sink_dropped_events_tracks_batch_count() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect_at_least(3)
+            .create_async()
+            .await;
+
+        let mut sink = HttpSink::new(
+            &format!("{}/events", server.url()),
+            5, // batch_size = 5
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(sink.dropped_events(), 0);
+
+        // Fill buffer to batch_size to trigger flush
+        for _ in 0..5 {
+            let _ = sink.send(&dummy_event()).await;
+        }
+
+        // All 5 events in the failed batch should be counted
+        assert_eq!(sink.dropped_events(), 5);
     }
 
     #[tokio::test]
