@@ -73,6 +73,10 @@ mod capture {
             ("70EB4F03-C1DE-4F73-A051-33D13D5413BD", "Kernel_Registry", 0xFFFFFFFFFFFFFFFFu64),
             // DNS-Client
             ("1C95126E-7EEA-49A9-A3FE-A378B03DDB4D", "DNS_Client", 0xFFFFFFFFFFFFFFFFu64),
+            // Threat-Intelligence (requires PPL; EnableTraceEx2 will fail
+            // without it, but including it means the tool works out of the
+            // box if the process does have the right protection level)
+            ("F4E1897C-BB5D-5668-F1D8-040F4D8DD344", "Threat_Intelligence", 0xFFFFFFFFFFFFFFFFu64),
         ];
 
         // Allocate session
