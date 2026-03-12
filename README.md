@@ -186,6 +186,13 @@ rotation_size_mb = 100
 # url = "https://example.com/api/events"
 # batch_size = 100
 # timeout_secs = 10
+# bearer_token = "your-token-here"
+# retry_count = 3
+# retry_backoff_ms = 100
+# gzip = false
+# [output.headers]
+# X-Sensor-Id = "sensor-001"
+# X-Api-Key = "key-abc"
 
 [collectors.etw]
 enabled = true

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 const CONFIG_FILE: &str = "threatfalcon.toml";
 
@@ -34,6 +36,19 @@ pub struct OutputConfig {
     pub batch_size: usize,
     /// HTTP request timeout in seconds. HTTP sink only.
     pub timeout_secs: u64,
+    /// Bearer token for HTTP sink Authorization header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    /// Custom HTTP headers (key-value pairs). HTTP sink only.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+    /// Number of retry attempts on HTTP failure (default: 3).
+    pub retry_count: u32,
+    /// Base backoff in milliseconds between retries (default: 100).
+    /// Actual delay = retry_backoff_ms * attempt_number.
+    pub retry_backoff_ms: u64,
+    /// Compress HTTP request body with gzip. HTTP sink only.
+    pub gzip: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,6 +217,11 @@ impl Default for OutputConfig {
             url: None,
             batch_size: 100,
             timeout_secs: 10,
+            bearer_token: None,
+            headers: HashMap::new(),
+            retry_count: 3,
+            retry_backoff_ms: 100,
+            gzip: false,
         }
     }
 }
