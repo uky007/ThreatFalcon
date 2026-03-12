@@ -156,9 +156,15 @@ impl Sensor {
                         "Health check"
                     );
                 }
-                _ = shutdown_rx.changed() => {
-                    info!("Shutdown signal received");
-                    break;
+                result = shutdown_rx.changed() => {
+                    // Only shut down on an explicit true signal, not on
+                    // channel close (sender dropped). This ensures a
+                    // future service caller that accidentally drops the
+                    // sender does not silently terminate the sensor.
+                    if result.is_ok() && *shutdown_rx.borrow() {
+                        info!("Shutdown signal received");
+                        break;
+                    }
                 }
             }
         }
@@ -251,12 +257,11 @@ mod tests {
     use crate::config::*;
     use tempfile::TempDir;
 
-    /// Create a shutdown receiver for tests. The sensor will shut down
-    /// when all collectors finish (channel closes), so we don't need to
-    /// actually signal it — just provide a valid receiver.
-    fn test_shutdown_rx() -> watch::Receiver<bool> {
-        let (_tx, rx) = watch::channel(false);
-        rx
+    /// Create a shutdown channel for tests. Returns both halves so the
+    /// sender stays alive — the sensor shuts down via the collector
+    /// channel closing (rx.recv() → None), not via a dropped sender.
+    fn test_shutdown() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        watch::channel(false)
     }
 
     fn test_config(dir: &TempDir) -> SensorConfig {
@@ -282,7 +287,8 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run(test_shutdown_rx()).await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = test_shutdown();
+        sensor.run(shutdown_rx).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -315,7 +321,8 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run(test_shutdown_rx()).await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = test_shutdown();
+        sensor.run(shutdown_rx).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let last_line = content.lines().last().unwrap();
@@ -348,7 +355,8 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run(test_shutdown_rx()).await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = test_shutdown();
+        sensor.run(shutdown_rx).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let last_line = content.lines().last().unwrap();
@@ -378,7 +386,8 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run(test_shutdown_rx()).await.unwrap();
+        let (_shutdown_tx, shutdown_rx) = test_shutdown();
+        sensor.run(shutdown_rx).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         // Final health event should still be emitted
