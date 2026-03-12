@@ -61,8 +61,11 @@ The built-in default configuration currently does the following:
 - disables Sysmon collection by default
 - enables evasion-oriented checks
 - emits periodic health events every 60 seconds by default
+- disk spool for the HTTP sink is disabled by default (opt-in via `spool_dir`)
 
 By default, ThreatFalcon writes events locally only and does not transmit telemetry to a remote service.
+
+When the HTTP sink is configured with `spool_dir`, failed batches are written to disk instead of dropped. Spooled batches are re-sent on the next successful POST or periodic health flush (every `health_interval_secs`), whichever comes first. This prevents event loss during network outages or server maintenance. Spool size is capped by `spool_max_mb` (default: 256 MB).
 
 The default ETW provider set includes:
 
@@ -230,6 +233,8 @@ rotation_size_mb = 100
 # retry_count = 3
 # retry_backoff_ms = 100
 # gzip = false
+# spool_dir = "spool"
+# spool_max_mb = 256
 # [output.headers]
 # X-Sensor-Id = "sensor-001"
 # X-Api-Key = "key-abc"

@@ -51,6 +51,14 @@ pub struct OutputConfig {
     pub retry_backoff_ms: u64,
     /// Compress HTTP request body with gzip. HTTP sink only.
     pub gzip: bool,
+    /// Directory for disk-backed spool when HTTP delivery fails.
+    /// When set, failed batches are written to disk instead of dropped,
+    /// and re-sent when the endpoint recovers. HTTP sink only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool_dir: Option<PathBuf>,
+    /// Maximum total spool size in MB (default: 256). HTTP sink only.
+    /// When exceeded, new spool writes fall back to dropping events.
+    pub spool_max_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,14 +220,20 @@ impl SensorConfig {
             }
         };
 
-        Ok(config.resolve_state_path(anchor))
+        Ok(config.resolve_paths(anchor))
     }
 
-    /// If `state_path` is relative, resolve it against `anchor`.
-    fn resolve_state_path(mut self, anchor: Option<PathBuf>) -> Self {
-        if self.state_path.is_relative() {
-            if let Some(base) = anchor {
+    /// Resolve relative paths against `anchor` so they are stable
+    /// regardless of process working directory.
+    fn resolve_paths(mut self, anchor: Option<PathBuf>) -> Self {
+        if let Some(ref base) = anchor {
+            if self.state_path.is_relative() {
                 self.state_path = base.join(&self.state_path);
+            }
+            if let Some(ref dir) = self.output.spool_dir {
+                if dir.is_relative() {
+                    self.output.spool_dir = Some(base.join(dir));
+                }
             }
         }
         self
@@ -259,6 +273,8 @@ impl Default for OutputConfig {
             retry_count: 3,
             retry_backoff_ms: 100,
             gzip: false,
+            spool_dir: None,
+            spool_max_mb: 256,
         }
     }
 }

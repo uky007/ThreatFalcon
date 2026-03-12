@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::config::{OutputConfig, SinkType};
 use crate::events::ThreatEvent;
+use crate::spool::DiskSpool;
 
 // ---------------------------------------------------------------------------
 // Sink trait
@@ -22,6 +23,14 @@ pub trait Sink: Send {
     async fn flush(&mut self) -> Result<()>;
     /// Total number of events this sink failed to deliver.
     fn dropped_events(&self) -> u64;
+    /// Number of spool files currently on disk (HTTP sink only).
+    fn spool_files(&self) -> u64 {
+        0
+    }
+    /// Total spool bytes currently on disk (HTTP sink only).
+    fn spool_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// Construct the appropriate sink from config.
@@ -185,6 +194,7 @@ pub struct HttpSink {
     gzip: bool,
     bearer_token: Option<String>,
     headers: HashMap<String, String>,
+    spool: Option<DiskSpool>,
 }
 
 impl HttpSink {
@@ -197,6 +207,12 @@ impl HttpSink {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()?;
+
+        let spool = match config.spool_dir {
+            Some(ref dir) => Some(DiskSpool::open(dir, config.spool_max_mb)?),
+            None => None,
+        };
+
         Ok(Self {
             client,
             url: url.clone(),
@@ -208,16 +224,12 @@ impl HttpSink {
             gzip: config.gzip,
             bearer_token: config.bearer_token.clone(),
             headers: config.headers.clone(),
+            spool,
         })
     }
 
-    async fn flush_buffer(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let payload = format!("[{}]", self.buffer.join(","));
-
+    /// Attempt to POST a JSON payload with retries.
+    async fn try_post(&self, payload: &str) -> Result<()> {
         // Optionally gzip-compress the body
         let (body, content_encoding) = if self.gzip {
             use std::io::Write as _;
@@ -226,7 +238,7 @@ impl HttpSink {
             encoder.write_all(payload.as_bytes())?;
             (encoder.finish()?, Some("gzip"))
         } else {
-            (payload.into_bytes(), None)
+            (payload.as_bytes().to_vec(), None)
         };
 
         let mut last_err = None;
@@ -250,7 +262,6 @@ impl HttpSink {
 
             match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    self.buffer.clear();
                     return Ok(());
                 }
                 Ok(resp) => {
@@ -272,16 +283,113 @@ impl HttpSink {
             }
         }
 
-        // Discard buffer to prevent unbounded growth
-        let count = self.buffer.len() as u64;
-        self.buffer.clear();
-        self.events_dropped += count;
-        tracing::warn!(
-            events_lost = count,
-            retry_count = self.retry_count,
-            "HTTP sink discarded events after failed attempts"
-        );
         Err(last_err.unwrap())
+    }
+
+    async fn flush_buffer(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let payload = format!("[{}]", self.buffer.join(","));
+        let count = self.buffer.len() as u64;
+
+        match self.try_post(&payload).await {
+            Ok(()) => {
+                self.buffer.clear();
+                // Opportunistically drain spooled batches
+                self.drain_spool().await;
+                Ok(())
+            }
+            Err(e) => {
+                self.buffer.clear();
+                // Try to spool instead of dropping
+                if let Some(ref mut spool) = self.spool {
+                    match spool.write(payload.as_bytes()) {
+                        Ok(()) => {
+                            tracing::warn!(
+                                events = count,
+                                spool_files = spool.file_count(),
+                                "HTTP sink spooled batch to disk"
+                            );
+                            return Ok(());
+                        }
+                        Err(spool_err) => {
+                            self.events_dropped += count;
+                            tracing::error!(
+                                events_lost = count,
+                                spool_error = %spool_err,
+                                "HTTP sink dropped events (spool write failed)"
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+                // No spool configured — existing drop behavior
+                self.events_dropped += count;
+                tracing::warn!(
+                    events_lost = count,
+                    retry_count = self.retry_count,
+                    "HTTP sink discarded events after failed attempts"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Try to re-send spooled batches (oldest first). Stops on first
+    /// failure so we don't overwhelm a recovering endpoint.
+    async fn drain_spool(&mut self) {
+        let files = match self.spool.as_ref() {
+            Some(s) => match s.pending() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to list spool files");
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        for path in files {
+            let payload = match DiskSpool::read(&path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "Removing unreadable spool file");
+                    if let Some(ref mut spool) = self.spool {
+                        let _ = spool.remove(&path);
+                    }
+                    continue;
+                }
+            };
+
+            let payload_str = match std::str::from_utf8(&payload) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::warn!(path = %path.display(), "Removing non-UTF8 spool file");
+                    if let Some(ref mut spool) = self.spool {
+                        let _ = spool.remove(&path);
+                    }
+                    continue;
+                }
+            };
+
+            match self.try_post(payload_str).await {
+                Ok(()) => {
+                    if let Some(ref mut spool) = self.spool {
+                        if let Err(e) = spool.remove(&path) {
+                            tracing::warn!(path = %path.display(), error = %e, "Failed to remove drained spool file");
+                        } else {
+                            tracing::info!(path = %path.display(), "Drained spooled batch");
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::debug!("Spool drain paused, server unavailable");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -301,11 +409,24 @@ impl Sink for HttpSink {
     }
 
     async fn flush(&mut self) -> Result<()> {
-        self.flush_buffer().await
+        self.flush_buffer().await?;
+        // Attempt spool drain even when the buffer was empty, so that
+        // periodic health flushes act as a drain trigger when the
+        // endpoint recovers but no new events are flowing.
+        self.drain_spool().await;
+        Ok(())
     }
 
     fn dropped_events(&self) -> u64 {
         self.events_dropped
+    }
+
+    fn spool_files(&self) -> u64 {
+        self.spool.as_ref().map(|s| s.file_count()).unwrap_or(0)
+    }
+
+    fn spool_bytes(&self) -> u64 {
+        self.spool.as_ref().map(|s| s.total_bytes()).unwrap_or(0)
     }
 }
 
@@ -901,5 +1022,249 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("url"), "error should mention missing url: {err}");
+    }
+
+    // --- HttpSink + spool integration tests ----------------------------------
+
+    fn http_config_with_spool(url: &str, batch_size: usize, spool_dir: &Path) -> OutputConfig {
+        OutputConfig {
+            sink_type: SinkType::Http,
+            url: Some(url.to_string()),
+            batch_size,
+            timeout_secs: 2,
+            retry_count: 1,
+            retry_backoff_ms: 10,
+            spool_dir: Some(spool_dir.to_path_buf()),
+            spool_max_mb: 10,
+            ..OutputConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn http_sink_spools_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let config = http_config_with_spool(
+            &format!("{}/events", server.url()),
+            1,
+            &spool_dir,
+        );
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        // send triggers flush → HTTP fails → events spooled, not dropped
+        let result = sink.send(&dummy_event()).await;
+        assert!(result.is_ok(), "spooled events should return Ok");
+        assert_eq!(sink.spool_files(), 1);
+        assert_eq!(sink.dropped_events(), 0);
+        assert!(sink.spool_bytes() > 0);
+
+        // Verify spool file exists on disk
+        let spool_files: Vec<_> = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".spool"))
+            .collect();
+        assert_eq!(spool_files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_sink_drains_spool_on_recovery() {
+        let dir = TempDir::new().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let mut server = mockito::Server::new_async().await;
+
+        // Phase 1: server is down → events get spooled
+        let mock_fail = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect(1) // one retry attempt
+            .create_async()
+            .await;
+
+        let config = http_config_with_spool(
+            &format!("{}/events", server.url()),
+            1,
+            &spool_dir,
+        );
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        sink.send(&dummy_event()).await.unwrap();
+        assert_eq!(sink.spool_files(), 1);
+        mock_fail.assert_async().await;
+
+        // Phase 2: server recovers → next send succeeds and drains spool
+        let mock_ok = server
+            .mock("POST", "/events")
+            .with_status(200)
+            .expect(2) // one for the live batch, one for the spooled batch
+            .create_async()
+            .await;
+
+        sink.send(&dummy_event()).await.unwrap();
+        mock_ok.assert_async().await;
+
+        // Spool should be empty after drain — both on disk and in the counter
+        assert_eq!(sink.spool_files(), 0);
+        assert_eq!(sink.spool_bytes(), 0);
+        let spool_files: Vec<_> = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".spool"))
+            .collect();
+        assert_eq!(spool_files.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_sink_spool_full_falls_back_to_drop() {
+        let dir = TempDir::new().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        // Very small spool cap: 0 MB → any write exceeds it
+        let mut config = http_config_with_spool(
+            &format!("{}/events", server.url()),
+            1,
+            &spool_dir,
+        );
+        config.spool_max_mb = 0;
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        let result = sink.send(&dummy_event()).await;
+        assert!(result.is_err(), "should error when spool is full");
+        assert_eq!(sink.dropped_events(), 1);
+        assert_eq!(sink.spool_files(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_sink_no_spool_preserves_drop_behavior() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let config = http_config(&format!("{}/events", server.url()), 1);
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        let result = sink.send(&dummy_event()).await;
+        assert!(result.is_err());
+        assert_eq!(sink.dropped_events(), 1);
+        assert_eq!(sink.spool_files(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_sink_drain_stops_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let mut server = mockito::Server::new_async().await;
+
+        // Phase 1: spool 3 batches
+        let mock_fail = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect_at_least(3)
+            .create_async()
+            .await;
+
+        let config = http_config_with_spool(
+            &format!("{}/events", server.url()),
+            1,
+            &spool_dir,
+        );
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        for _ in 0..3 {
+            sink.send(&dummy_event()).await.unwrap();
+        }
+        assert_eq!(sink.spool_files(), 3);
+        mock_fail.assert_async().await;
+
+        // Phase 2: server accepts exactly 2 POSTs (live batch + 1 spool),
+        // then fails on the second spool file
+        let mock_ok = server
+            .mock("POST", "/events")
+            .with_status(200)
+            .expect(2)
+            .create_async()
+            .await;
+        let mock_fail2 = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+
+        sink.send(&dummy_event()).await.unwrap();
+        mock_ok.assert_async().await;
+        mock_fail2.assert_async().await;
+
+        // 2 spool files should remain (3 spooled, 1 drained, drain stopped)
+        let remaining: Vec<_> = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".spool"))
+            .collect();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    /// flush() with an empty buffer should still drain the spool.
+    /// This simulates a periodic health flush triggering drain when
+    /// no new events are flowing.
+    #[tokio::test]
+    async fn http_sink_flush_drains_spool_without_new_events() {
+        let dir = TempDir::new().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let mut server = mockito::Server::new_async().await;
+
+        // Phase 1: server down → spool 1 batch
+        let mock_fail = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = http_config_with_spool(
+            &format!("{}/events", server.url()),
+            1,
+            &spool_dir,
+        );
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        sink.send(&dummy_event()).await.unwrap();
+        assert_eq!(sink.spool_files(), 1);
+        mock_fail.assert_async().await;
+
+        // Phase 2: server recovers, no new events — just flush()
+        let mock_ok = server
+            .mock("POST", "/events")
+            .with_status(200)
+            .expect(1) // the spooled batch
+            .create_async()
+            .await;
+
+        // Empty buffer flush should still drain the spool
+        assert!(sink.buffer.is_empty());
+        sink.flush().await.unwrap();
+
+        mock_ok.assert_async().await;
+        assert_eq!(sink.spool_files(), 0);
+        assert_eq!(sink.spool_bytes(), 0);
     }
 }

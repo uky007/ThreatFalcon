@@ -142,6 +142,8 @@ impl Sensor {
                     let sink_status = SinkStatus {
                         sink_type: writer.name().to_string(),
                         events_dropped: writer.dropped_events(),
+                        spool_files: writer.spool_files(),
+                        spool_bytes: writer.spool_bytes(),
                     };
                     let health = self.build_health_event(
                         &collector_states,
@@ -202,6 +204,8 @@ impl Sensor {
         let sink_status = SinkStatus {
             sink_type: writer.name().to_string(),
             events_dropped: writer.dropped_events(),
+            spool_files: writer.spool_files(),
+            spool_bytes: writer.spool_bytes(),
         };
         let final_health = self.build_health_event(
             &collector_states,
