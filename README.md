@@ -65,7 +65,7 @@ The built-in default configuration currently does the following:
 
 By default, ThreatFalcon writes events locally only and does not transmit telemetry to a remote service.
 
-When the HTTP sink is configured with `spool_dir`, failed batches are written to disk instead of dropped and re-sent when the endpoint recovers. This prevents event loss during network outages or server maintenance. Spool size is capped by `spool_max_mb` (default: 256 MB).
+When the HTTP sink is configured with `spool_dir`, failed batches are written to disk instead of dropped. Spooled batches are re-sent on the next successful POST or periodic health flush (every `health_interval_secs`), whichever comes first. This prevents event loss during network outages or server maintenance. Spool size is capped by `spool_max_mb` (default: 256 MB).
 
 The default ETW provider set includes:
 

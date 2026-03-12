@@ -409,7 +409,12 @@ impl Sink for HttpSink {
     }
 
     async fn flush(&mut self) -> Result<()> {
-        self.flush_buffer().await
+        self.flush_buffer().await?;
+        // Attempt spool drain even when the buffer was empty, so that
+        // periodic health flushes act as a drain trigger when the
+        // endpoint recovers but no new events are flowing.
+        self.drain_spool().await;
+        Ok(())
     }
 
     fn dropped_events(&self) -> u64 {
@@ -1216,5 +1221,50 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".spool"))
             .collect();
         assert_eq!(remaining.len(), 2);
+    }
+
+    /// flush() with an empty buffer should still drain the spool.
+    /// This simulates a periodic health flush triggering drain when
+    /// no new events are flowing.
+    #[tokio::test]
+    async fn http_sink_flush_drains_spool_without_new_events() {
+        let dir = TempDir::new().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let mut server = mockito::Server::new_async().await;
+
+        // Phase 1: server down → spool 1 batch
+        let mock_fail = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = http_config_with_spool(
+            &format!("{}/events", server.url()),
+            1,
+            &spool_dir,
+        );
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        sink.send(&dummy_event()).await.unwrap();
+        assert_eq!(sink.spool_files(), 1);
+        mock_fail.assert_async().await;
+
+        // Phase 2: server recovers, no new events — just flush()
+        let mock_ok = server
+            .mock("POST", "/events")
+            .with_status(200)
+            .expect(1) // the spooled batch
+            .create_async()
+            .await;
+
+        // Empty buffer flush should still drain the spool
+        assert!(sink.buffer.is_empty());
+        sink.flush().await.unwrap();
+
+        mock_ok.assert_async().await;
+        assert_eq!(sink.spool_files(), 0);
+        assert_eq!(sink.spool_bytes(), 0);
     }
 }
