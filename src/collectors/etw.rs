@@ -1474,40 +1474,50 @@ mod platform {
             format!("{name}: PID {calling_pid}")
         };
 
-        // Remote operations (cross-process) are High severity;
-        // local operations (same process, often legitimate) are Medium.
-        let severity = if matches!(event_id, 6..=8) {
-            Severity::Medium
-        } else {
-            Severity::High
+        let source = EventSource::Etw {
+            provider: "Microsoft-Windows-Threat-Intelligence".into(),
+        };
+        let event_data = EventData::EvasionDetected {
+            technique: EvasionTechnique::Unknown,
+            pid: Some(calling_pid),
+            process_name: None,
+            details,
         };
 
-        ThreatEvent::with_rule(
-            hostname,
-            EventSource::Etw {
-                provider: "Microsoft-Windows-Threat-Intelligence".into(),
-            },
-            EventCategory::Evasion,
-            severity,
-            EventData::EvasionDetected {
-                technique: EvasionTechnique::Unknown,
-                pid: Some(calling_pid),
-                process_name: None,
-                details,
-            },
-            RuleMetadata {
-                id: rule_id.into(),
-                name: name.into(),
-                description: description.into(),
-                mitre: MitreRef {
-                    tactic: "Defense Evasion".into(),
-                    technique_id: technique_id.into(),
-                    technique_name: technique_name.into(),
+        // Local operations (IDs 6-8) are telemetry: the TI provider flagged
+        // them, but they are common in JIT, .NET, and DLL loaders, so we
+        // emit them without rule metadata for contextual analysis.
+        // Remote operations (IDs 1-5, 9-10) are detections: cross-process
+        // memory manipulation is inherently suspicious.
+        if matches!(event_id, 6..=8) {
+            ThreatEvent::new(
+                hostname,
+                source,
+                EventCategory::Evasion,
+                Severity::Medium,
+                event_data,
+            )
+        } else {
+            ThreatEvent::with_rule(
+                hostname,
+                source,
+                EventCategory::Evasion,
+                Severity::High,
+                event_data,
+                RuleMetadata {
+                    id: rule_id.into(),
+                    name: name.into(),
+                    description: description.into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: technique_id.into(),
+                        technique_name: technique_name.into(),
+                    },
+                    confidence: Confidence::Medium,
+                    evidence,
                 },
-                confidence: Confidence::Medium,
-                evidence,
-            },
-        )
+            )
+        }
     }
 }
 
