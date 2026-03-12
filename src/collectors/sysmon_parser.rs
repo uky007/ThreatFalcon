@@ -803,4 +803,106 @@ mod tests {
         let parsed = parse_sysmon_xml(xml).unwrap();
         assert!(map_to_threat_event(&parsed, "host").is_none());
     }
+
+    // --- Rule metadata consistency tests -------------------------------------
+
+    #[test]
+    fn sysmon_detection_severity_is_critical() {
+        // All Sysmon detection rules (Event 25) should be Critical severity
+        // because Sysmon directly observes the tampering at kernel level.
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">100</Data>
+    <Data Name="Image">C:\test.exe</Data>
+    <Data Name="Type">Image is replaced</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        assert_eq!(event.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn sysmon_detection_confidence_is_high() {
+        // Sysmon Event 25 is a direct kernel observation — High confidence.
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">100</Data>
+    <Data Name="Image">C:\test.exe</Data>
+    <Data Name="Type">Image is replaced</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let rule = event.rule.unwrap();
+        assert_eq!(rule.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn sysmon_all_rules_have_defense_evasion_tactic() {
+        for tampering_type in &["Image is replaced", "Image is locked for access", "Unknown type"] {
+            let xml = format!(
+                r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">1</Data>
+    <Data Name="Image">C:\test.exe</Data>
+    <Data Name="Type">{}</Data>
+  </EventData>
+</Event>"#,
+                tampering_type
+            );
+            let parsed = parse_sysmon_xml(&xml).unwrap();
+            let event = map_to_threat_event(&parsed, "host").unwrap();
+            let rule = event.rule.unwrap();
+            assert_eq!(
+                rule.mitre.tactic, "Defense Evasion",
+                "rule {} should have Defense Evasion tactic",
+                rule.id
+            );
+        }
+    }
+
+    #[test]
+    fn sysmon_evidence_includes_event_source() {
+        // All Sysmon detection rules should include the Sysmon event ID
+        // in evidence for traceability.
+        let xml = r#"<Event>
+  <System><EventID>25</EventID></System>
+  <EventData>
+    <Data Name="ProcessId">1</Data>
+    <Data Name="Image">C:\test.exe</Data>
+    <Data Name="Type">Image is replaced</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        let rule = event.rule.unwrap();
+        assert!(
+            rule.evidence.iter().any(|e| e.contains("Event ID 25")),
+            "evidence should include Sysmon event ID"
+        );
+    }
+
+    #[test]
+    fn sysmon_suspicious_telemetry_elevated_severity() {
+        // CreateRemoteThread (Event 8) is telemetry with elevated severity
+        // — it's a suspicious signal but not a detection.
+        let xml = r#"<Event>
+  <System><EventID>8</EventID></System>
+  <EventData>
+    <Data Name="SourceProcessId">100</Data>
+    <Data Name="TargetProcessId">200</Data>
+    <Data Name="StartAddress">0x7FFB00001000</Data>
+    <Data Name="SourceImage">C:\inject.exe</Data>
+    <Data Name="TargetImage">C:\victim.exe</Data>
+  </EventData>
+</Event>"#;
+        let parsed = parse_sysmon_xml(xml).unwrap();
+        let event = map_to_threat_event(&parsed, "host").unwrap();
+        assert!(event.rule.is_none(), "CreateRemoteThread is telemetry, not detection");
+        assert_eq!(event.severity, Severity::High, "suspicious telemetry has elevated severity");
+    }
 }

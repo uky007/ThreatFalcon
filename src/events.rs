@@ -352,4 +352,129 @@ mod tests {
         }
         assert!(deserialized.rule.is_none());
     }
+
+    // --- Rule metadata policy tests ------------------------------------------
+    // These tests codify the telemetry vs detection boundary and ensure
+    // consistency of rule properties across collectors.
+
+    #[test]
+    fn telemetry_event_has_no_rule() {
+        let event = ThreatEvent::new(
+            "HOST",
+            EventSource::Etw {
+                provider: "Microsoft-Windows-Kernel-Process".into(),
+            },
+            EventCategory::Process,
+            Severity::Info,
+            EventData::ProcessCreate {
+                pid: 1,
+                ppid: 0,
+                image_path: "cmd.exe".into(),
+                command_line: "cmd.exe".into(),
+                user: String::new(),
+                integrity_level: String::new(),
+                hashes: None,
+            },
+        );
+        assert!(event.rule.is_none(), "telemetry events must not carry rules");
+    }
+
+    #[test]
+    fn detection_event_has_rule() {
+        let event = ThreatEvent::with_rule(
+            "HOST",
+            EventSource::Etw {
+                provider: "Microsoft-Windows-Threat-Intelligence".into(),
+            },
+            EventCategory::Evasion,
+            Severity::High,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::Unknown,
+                pid: Some(1),
+                process_name: None,
+                details: "test".into(),
+            },
+            RuleMetadata {
+                id: "TF-TI-001".into(),
+                name: "test".into(),
+                description: "test".into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: "T1055".into(),
+                    technique_name: "Process Injection".into(),
+                },
+                confidence: Confidence::Medium,
+                evidence: vec!["test".into()],
+            },
+        );
+        assert!(event.rule.is_some(), "detection events must carry rules");
+    }
+
+    #[test]
+    fn rule_metadata_roundtrip() {
+        let event = ThreatEvent::with_rule(
+            "HOST",
+            EventSource::EvasionDetector,
+            EventCategory::Evasion,
+            Severity::Critical,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::EtwPatching,
+                pid: Some(100),
+                process_name: None,
+                details: "patched".into(),
+            },
+            RuleMetadata {
+                id: "TF-EVA-001".into(),
+                name: "ETW Event Write Patching".into(),
+                description: "desc".into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: "T1562.006".into(),
+                    technique_name: "Impair Defenses: Indicator Blocking".into(),
+                },
+                confidence: Confidence::High,
+                evidence: vec!["byte 0xC3".into()],
+            },
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let rt: ThreatEvent = serde_json::from_str(&json).unwrap();
+
+        let rule = rt.rule.unwrap();
+        assert_eq!(rule.id, "TF-EVA-001");
+        assert_eq!(rule.confidence, Confidence::High);
+        assert_eq!(rule.mitre.technique_id, "T1562.006");
+        assert_eq!(rule.evidence.len(), 1);
+    }
+
+    #[test]
+    fn severity_ordering() {
+        // Verify severity enum ordering: Info < Low < Medium < High < Critical
+        assert!(Severity::Info < Severity::Low);
+        assert!(Severity::Low < Severity::Medium);
+        assert!(Severity::Medium < Severity::High);
+        assert!(Severity::High < Severity::Critical);
+    }
+
+    #[test]
+    fn rule_metadata_json_excludes_null_rule() {
+        // ThreatEvent::new() produces rule: None which should be omitted
+        let event = ThreatEvent::new(
+            "H",
+            EventSource::Sensor,
+            EventCategory::Health,
+            Severity::Info,
+            EventData::SensorHealth {
+                uptime_secs: 0,
+                events_total: 0,
+                events_dropped: 0,
+                collectors: vec![],
+            },
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("rule"),
+            "rule:None must be omitted from JSON via skip_serializing_if"
+        );
+    }
 }

@@ -1387,25 +1387,27 @@ mod platform {
             6 => (
                 "TF-TI-006",
                 "Local Virtual Memory Allocation (TI)",
-                "TI provider reported a local memory allocation flagged \
-                 for monitoring. May indicate self-injection or \
-                 memory manipulation.",
+                "TI provider flagged a local executable memory allocation. \
+                 Common in legitimate JIT compilers and loaders; suspicious \
+                 when combined with other injection indicators.",
                 "T1055",
                 "Process Injection",
             ),
             7 => (
                 "TF-TI-007",
                 "Local Memory Protection Change (TI)",
-                "TI provider reported a local memory protection change. \
-                 May indicate code unpacking or self-modification.",
+                "TI provider flagged a local memory protection change to \
+                 executable. Common in code unpacking, JIT, and .NET; \
+                 suspicious when the process is not a known runtime.",
                 "T1027.002",
                 "Obfuscated Files or Information: Software Packing",
             ),
             8 => (
                 "TF-TI-008",
                 "Local Section Mapping (TI)",
-                "TI provider reported a local section mapping flagged \
-                 for monitoring.",
+                "TI provider flagged a local executable section mapping. \
+                 Common in normal DLL loading; suspicious when the mapped \
+                 section is not backed by a known image.",
                 "T1055",
                 "Process Injection",
             ),
@@ -1472,13 +1474,21 @@ mod platform {
             format!("{name}: PID {calling_pid}")
         };
 
+        // Remote operations (cross-process) are High severity;
+        // local operations (same process, often legitimate) are Medium.
+        let severity = if matches!(event_id, 6..=8) {
+            Severity::Medium
+        } else {
+            Severity::High
+        };
+
         ThreatEvent::with_rule(
             hostname,
             EventSource::Etw {
                 provider: "Microsoft-Windows-Threat-Intelligence".into(),
             },
             EventCategory::Evasion,
-            Severity::High,
+            severity,
             EventData::EvasionDetected {
                 technique: EvasionTechnique::Unknown,
                 pid: Some(calling_pid),
