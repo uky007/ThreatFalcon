@@ -247,10 +247,10 @@ pub struct CollectorStatus {
 pub struct SinkStatus {
     pub sink_type: String,
     pub events_dropped: u64,
-    /// Events currently held in disk spool awaiting re-delivery.
+    /// Number of spool files currently on disk awaiting re-delivery.
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub events_spooled: u64,
-    /// Total bytes of spooled data on disk.
+    pub spool_files: u64,
+    /// Total bytes of spooled data currently on disk.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spool_bytes: u64,
 }
