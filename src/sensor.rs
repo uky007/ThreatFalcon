@@ -130,11 +130,16 @@ impl Sensor {
                 }
                 _ = health_tick.tick() => {
                     let total_dropped = writer.dropped_events() + self.collector_drops();
+                    let sink_status = SinkStatus {
+                        sink_type: writer.name().to_string(),
+                        events_dropped: writer.dropped_events(),
+                    };
                     let health = self.build_health_event(
                         &collector_states,
                         &start_time,
                         event_count,
                         total_dropped,
+                        Some(sink_status),
                     );
                     if let Err(e) = writer.send(&health).await {
                         error!(error = %e, "Failed to write health event");
@@ -174,11 +179,16 @@ impl Sensor {
 
         // Final health event (includes any drops from flush above)
         let total_dropped = writer.dropped_events() + self.collector_drops();
+        let sink_status = SinkStatus {
+            sink_type: writer.name().to_string(),
+            events_dropped: writer.dropped_events(),
+        };
         let final_health = self.build_health_event(
             &collector_states,
             &start_time,
             event_count,
             total_dropped,
+            Some(sink_status),
         );
         if let Err(e) = writer.send(&final_health).await {
             error!(error = %e, "Failed to write final health event");
@@ -204,6 +214,7 @@ impl Sensor {
         start_time: &Instant,
         events_total: u64,
         events_dropped: u64,
+        sink_info: Option<SinkStatus>,
     ) -> ThreatEvent {
         let collectors = collector_states
             .iter()
@@ -223,6 +234,7 @@ impl Sensor {
                 events_total,
                 events_dropped,
                 collectors,
+                sink: sink_info,
             },
         )
     }

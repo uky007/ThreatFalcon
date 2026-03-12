@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -28,17 +29,7 @@ pub fn create_sink(config: &OutputConfig) -> Result<Box<dyn Sink>> {
     match config.sink_type {
         SinkType::File => Ok(Box::new(FileSink::new(config)?)),
         SinkType::Stdout => Ok(Box::new(StdoutSink::new(config.pretty))),
-        SinkType::Http => {
-            let url = config
-                .url
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("HTTP sink requires 'url' in [output] config"))?;
-            Ok(Box::new(HttpSink::new(
-                url,
-                config.batch_size,
-                config.timeout_secs,
-            )?))
-        }
+        SinkType::Http => Ok(Box::new(HttpSink::new(config)?))
     }
 }
 
@@ -189,19 +180,34 @@ pub struct HttpSink {
     batch_size: usize,
     buffer: Vec<String>,
     events_dropped: u64,
+    retry_count: u32,
+    retry_backoff_ms: u64,
+    gzip: bool,
+    bearer_token: Option<String>,
+    headers: HashMap<String, String>,
 }
 
 impl HttpSink {
-    pub fn new(url: &str, batch_size: usize, timeout_secs: u64) -> Result<Self> {
+    pub fn new(config: &OutputConfig) -> Result<Self> {
+        let url = config
+            .url
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HTTP sink requires 'url' in [output] config"))?;
+
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()?;
         Ok(Self {
             client,
-            url: url.to_string(),
-            batch_size: batch_size.max(1),
-            buffer: Vec::with_capacity(batch_size),
+            url: url.clone(),
+            batch_size: config.batch_size.max(1),
+            buffer: Vec::with_capacity(config.batch_size),
             events_dropped: 0,
+            retry_count: config.retry_count.max(1),
+            retry_backoff_ms: config.retry_backoff_ms,
+            gzip: config.gzip,
+            bearer_token: config.bearer_token.clone(),
+            headers: config.headers.clone(),
         })
     }
 
@@ -210,18 +216,39 @@ impl HttpSink {
             return Ok(());
         }
 
-        let body = format!("[{}]", self.buffer.join(","));
+        let payload = format!("[{}]", self.buffer.join(","));
+
+        // Optionally gzip-compress the body
+        let (body, content_encoding) = if self.gzip {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(payload.as_bytes())?;
+            (encoder.finish()?, Some("gzip"))
+        } else {
+            (payload.into_bytes(), None)
+        };
+
         let mut last_err = None;
 
-        for attempt in 0..3u64 {
-            match self
+        for attempt in 0..self.retry_count as u64 {
+            let mut req = self
                 .client
                 .post(&self.url)
                 .header("Content-Type", "application/json")
-                .body(body.clone())
-                .send()
-                .await
-            {
+                .body(body.clone());
+
+            if let Some(encoding) = content_encoding {
+                req = req.header("Content-Encoding", encoding);
+            }
+            if let Some(ref token) = self.bearer_token {
+                req = req.bearer_auth(token);
+            }
+            for (k, v) in &self.headers {
+                req = req.header(k, v);
+            }
+
+            match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     self.buffer.clear();
                     return Ok(());
@@ -237,9 +264,9 @@ impl HttpSink {
                     last_err = Some(e.into());
                 }
             }
-            if attempt < 2 {
+            if attempt < (self.retry_count as u64 - 1) {
                 tokio::time::sleep(std::time::Duration::from_millis(
-                    100 * (attempt + 1),
+                    self.retry_backoff_ms * (attempt + 1),
                 ))
                 .await;
             }
@@ -251,7 +278,8 @@ impl HttpSink {
         self.events_dropped += count;
         tracing::warn!(
             events_lost = count,
-            "HTTP sink discarded events after 3 failed attempts"
+            retry_count = self.retry_count,
+            "HTTP sink discarded events after failed attempts"
         );
         Err(last_err.unwrap())
     }
@@ -348,6 +376,7 @@ mod tests {
                 events_total: 0,
                 events_dropped: 0,
                 collectors: vec![],
+                sink: None,
             },
         )
     }
@@ -591,6 +620,16 @@ mod tests {
 
     // --- HttpSink tests ------------------------------------------------------
 
+    fn http_config(url: &str, batch_size: usize) -> OutputConfig {
+        OutputConfig {
+            sink_type: SinkType::Http,
+            url: Some(url.to_string()),
+            batch_size,
+            timeout_secs: 10,
+            ..OutputConfig::default()
+        }
+    }
+
     #[tokio::test]
     async fn http_sink_sends_batch() {
         let mut server = mockito::Server::new_async().await;
@@ -601,12 +640,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut sink = HttpSink::new(
-            &format!("{}/events", server.url()),
-            2, // batch_size
-            10,
-        )
-        .unwrap();
+        let config = http_config(&format!("{}/events", server.url()), 2);
+        let mut sink = HttpSink::new(&config).unwrap();
 
         let evt = dummy_event();
         sink.send(&evt).await.unwrap(); // buffered, no POST yet
@@ -628,12 +663,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut sink = HttpSink::new(
-            &format!("{}/events", server.url()),
-            100, // large batch
-            10,
-        )
-        .unwrap();
+        let config = http_config(&format!("{}/events", server.url()), 100);
+        let mut sink = HttpSink::new(&config).unwrap();
 
         sink.send(&dummy_event()).await.unwrap();
         assert_eq!(sink.buffer.len(), 1);
@@ -655,12 +686,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut sink = HttpSink::new(
-            &format!("{}/events", server.url()),
-            1,
-            10,
-        )
-        .unwrap();
+        let config = http_config(&format!("{}/events", server.url()), 1);
+        let mut sink = HttpSink::new(&config).unwrap();
 
         sink.send(&dummy_event()).await.unwrap();
         mock.assert_async().await;
@@ -683,12 +710,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut sink = HttpSink::new(
-            &format!("{}/events", server.url()),
-            1,
-            10,
-        )
-        .unwrap();
+        let config = http_config(&format!("{}/events", server.url()), 1);
+        let mut sink = HttpSink::new(&config).unwrap();
 
         sink.send(&dummy_event()).await.unwrap();
 
@@ -706,18 +729,12 @@ mod tests {
             .create_async()
             .await;
 
-        let mut sink = HttpSink::new(
-            &format!("{}/events", server.url()),
-            1,
-            10,
-        )
-        .unwrap();
+        let config = http_config(&format!("{}/events", server.url()), 1);
+        let mut sink = HttpSink::new(&config).unwrap();
 
         let result = sink.send(&dummy_event()).await;
         assert!(result.is_err());
-        // Buffer should be cleared even on failure
         assert_eq!(sink.buffer.len(), 0);
-        // dropped_events should reflect the discarded event
         assert_eq!(sink.dropped_events(), 1);
 
         mock.assert_async().await;
@@ -733,29 +750,106 @@ mod tests {
             .create_async()
             .await;
 
-        let mut sink = HttpSink::new(
-            &format!("{}/events", server.url()),
-            5, // batch_size = 5
-            1,
-        )
-        .unwrap();
+        let mut config = http_config(&format!("{}/events", server.url()), 5);
+        config.timeout_secs = 1;
+        let mut sink = HttpSink::new(&config).unwrap();
 
         assert_eq!(sink.dropped_events(), 0);
 
-        // Fill buffer to batch_size to trigger flush
         for _ in 0..5 {
             let _ = sink.send(&dummy_event()).await;
         }
 
-        // All 5 events in the failed batch should be counted
         assert_eq!(sink.dropped_events(), 5);
     }
 
     #[tokio::test]
     async fn http_sink_empty_flush_is_noop() {
-        let mut sink = HttpSink::new("http://unused.example.com/events", 10, 1).unwrap();
-        // Flushing empty buffer should succeed without making any HTTP call
+        let config = http_config("http://unused.example.com/events", 10);
+        let mut sink = HttpSink::new(&config).unwrap();
         sink.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_sink_bearer_token() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/events")
+            .match_header("Authorization", "Bearer test-token-123")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut config = http_config(&format!("{}/events", server.url()), 1);
+        config.bearer_token = Some("test-token-123".into());
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        sink.send(&dummy_event()).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn http_sink_custom_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/events")
+            .match_header("X-Sensor-Id", "sensor-001")
+            .match_header("X-Api-Key", "key-abc")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut config = http_config(&format!("{}/events", server.url()), 1);
+        config.headers.insert("X-Sensor-Id".into(), "sensor-001".into());
+        config.headers.insert("X-Api-Key".into(), "key-abc".into());
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        sink.send(&dummy_event()).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn http_sink_gzip_sends_compressed() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/events")
+            .match_header("Content-Encoding", "gzip")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut config = http_config(&format!("{}/events", server.url()), 1);
+        config.gzip = true;
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        sink.send(&dummy_event()).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn http_sink_configurable_retry_count() {
+        let mut server = mockito::Server::new_async().await;
+        // With retry_count=2, only 2 attempts (not the default 3)
+        let mock = server
+            .mock("POST", "/events")
+            .with_status(500)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let mut config = http_config(&format!("{}/events", server.url()), 1);
+        config.retry_count = 2;
+        config.retry_backoff_ms = 10; // fast for tests
+        let mut sink = HttpSink::new(&config).unwrap();
+
+        let result = sink.send(&dummy_event()).await;
+        assert!(result.is_err());
+        assert_eq!(sink.dropped_events(), 1);
+
+        mock.assert_async().await;
     }
 
     // --- create_sink factory tests -------------------------------------------

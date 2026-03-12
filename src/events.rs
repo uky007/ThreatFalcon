@@ -217,6 +217,8 @@ pub enum EventData {
         events_total: u64,
         events_dropped: u64,
         collectors: Vec<CollectorStatus>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sink: Option<SinkStatus>,
     },
 }
 
@@ -225,6 +227,13 @@ pub enum EventData {
 pub struct CollectorStatus {
     pub name: String,
     pub state: CollectorState,
+}
+
+/// Status of the output sink, included in health events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkStatus {
+    pub sink_type: String,
+    pub events_dropped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +303,7 @@ mod tests {
                 uptime_secs: 120,
                 events_total: 5000,
                 events_dropped: 3,
+                sink: None,
                 collectors: vec![
                     CollectorStatus {
                         name: "ETW".into(),
@@ -330,6 +340,7 @@ mod tests {
                 events_total: 100,
                 events_dropped: 0,
                 collectors: vec![],
+                sink: None,
             },
         );
 
@@ -342,6 +353,7 @@ mod tests {
                 events_total,
                 events_dropped,
                 collectors,
+                ..
             } => {
                 assert_eq!(uptime_secs, 60);
                 assert_eq!(events_total, 100);
@@ -469,6 +481,7 @@ mod tests {
                 events_total: 0,
                 events_dropped: 0,
                 collectors: vec![],
+                sink: None,
             },
         );
         let json = serde_json::to_string(&event).unwrap();
