@@ -18,6 +18,7 @@ ThreatFalcon is early-stage software.
 - Sensor health events are available for local runtime visibility
 - Configuration is loaded from `threatfalcon.toml` (TOML format), overridable via `--config`
 - Output supports file, stdout, and HTTP POST sinks
+- Windows service mode is supported (SCM start/stop via `--service` flag)
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -161,6 +162,41 @@ RUST_LOG=info cargo run --release
 
 On startup, the sensor initializes enabled collectors, writes newline-delimited JSON events, and stops on `Ctrl-C`.
 
+### Windows Service
+
+ThreatFalcon can run as a Windows service. The `--service` flag connects to the Service Control Manager (SCM) so the sensor starts at boot and stops cleanly on service stop commands.
+
+**Install the service:**
+
+```powershell
+sc.exe create ThreatFalcon binPath= "C:\path\to\threatfalcon.exe --service" start= auto
+```
+
+To use a custom config file:
+
+```powershell
+sc.exe create ThreatFalcon binPath= "C:\path\to\threatfalcon.exe --service --config C:\ProgramData\ThreatFalcon\threatfalcon.toml" start= auto
+```
+
+**Start / stop:**
+
+```powershell
+sc.exe start ThreatFalcon
+sc.exe stop ThreatFalcon
+```
+
+**Remove the service:**
+
+```powershell
+sc.exe delete ThreatFalcon
+```
+
+Notes:
+
+- Service mode refuses the `stdout` sink (there is no console) — use `file` or `http`
+- The `--service` flag is only available on Windows; on other platforms it exits with an error
+- No installer is included yet — use `sc.exe` for manual registration
+
 ## Configuration
 
 ThreatFalcon loads `threatfalcon.toml` from the current directory on startup. If the file is not found, built-in defaults are used. Use `--config <path>` to load from a different location, or `--stdout` / `--output <path>` to override the output destination from the command line.
@@ -257,7 +293,7 @@ Example event shape:
 
 ## Limitations
 
-- No installer, service wrapper, or packaging yet
+- No installer or packaging yet (service registration is manual via `sc.exe`)
 - Some ETW payload parsing is best-effort and should be validated on real Windows hosts
 - Sysmon support depends on Sysmon being installed and configured
 - Evasion-oriented checks are heuristic and should be treated as signal, not ground truth

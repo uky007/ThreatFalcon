@@ -3,6 +3,8 @@ mod config;
 mod events;
 mod output;
 mod sensor;
+#[cfg(target_os = "windows")]
+mod service;
 
 use std::path::PathBuf;
 
@@ -14,7 +16,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 use config::SensorConfig;
 
 /// Exit codes for structured process lifecycle management.
-/// A future Windows service wrapper can map these to service-specific status.
+/// Windows service mode maps these to `ServiceExitCode::Win32`.
 mod exit_code {
     pub const SUCCESS: i32 = 0;
     pub const CONFIG_ERROR: i32 = 1;
@@ -44,10 +46,13 @@ struct Cli {
     /// Dump default config as TOML and exit
     #[arg(long)]
     dump_default_config: bool,
+
+    /// Run as a Windows service (used by SCM, not for manual invocation)
+    #[arg(long, conflicts_with_all = ["stdout", "output"])]
+    service: bool,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
     // --dump-default-config: print and exit (no logging needed)
@@ -80,7 +85,19 @@ async fn main() {
         }
     }
 
-    match run_foreground(cli).await {
+    // --service: run as Windows service
+    if cli.service {
+        run_service_mode(cli.config);
+    }
+
+    // Foreground mode — create the async runtime explicitly so that
+    // service mode (above) can create its own runtime independently.
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("Failed to create async runtime: {e}");
+        std::process::exit(exit_code::RUNTIME_ERROR);
+    });
+
+    match rt.block_on(run_foreground(cli)) {
         Ok(()) => std::process::exit(exit_code::SUCCESS),
         Err(e) => {
             tracing::error!(error = %e, "Sensor exited with error");
@@ -89,9 +106,28 @@ async fn main() {
     }
 }
 
+/// Dispatch to the Windows service controller. Does not return.
+fn run_service_mode(config_path: Option<PathBuf>) -> ! {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = service::run(config_path) {
+            eprintln!("Service error: {e}");
+            std::process::exit(exit_code::RUNTIME_ERROR);
+        }
+        std::process::exit(exit_code::SUCCESS);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = config_path;
+        eprintln!("--service is only supported on Windows");
+        std::process::exit(exit_code::RUNTIME_ERROR);
+    }
+}
+
 /// Run the sensor as a foreground process with ctrl-c shutdown.
-/// Separated from main() so a future Windows service entrypoint can
-/// call `Sensor::run()` directly with its own shutdown signal.
+/// Separated from service mode so each entrypoint owns its own runtime
+/// and shutdown wiring.
 async fn run_foreground(cli: Cli) -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -119,8 +155,6 @@ async fn run_foreground(cli: Cli) -> Result<()> {
     }
 
     // Shutdown channel — ctrl_c triggers shutdown for foreground mode.
-    // A Windows service entrypoint would create its own channel and
-    // signal it from the service control handler instead.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(async move {

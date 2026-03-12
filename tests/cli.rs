@@ -97,3 +97,40 @@ fn stdout_and_output_conflict() {
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
 }
+
+#[test]
+fn service_flag_shown_in_help() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--service"));
+}
+
+#[test]
+fn service_and_stdout_conflict() {
+    cmd()
+        .args(["--service", "--stdout"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn service_and_output_conflict() {
+    cmd()
+        .args(["--service", "--output", "out.jsonl"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn service_flag_rejected_on_non_windows() {
+    cmd()
+        .arg("--service")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported on Windows"));
+}
