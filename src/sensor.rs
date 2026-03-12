@@ -144,6 +144,11 @@ impl Sensor {
                     if let Err(e) = writer.send(&health).await {
                         error!(error = %e, "Failed to write health event");
                     }
+                    // Flush immediately so health events are delivered on
+                    // schedule, even when the HTTP sink batch is not full.
+                    if let Err(e) = writer.flush().await {
+                        error!(error = %e, "Failed to flush health event");
+                    }
                     info!(
                         uptime_secs = start_time.elapsed().as_secs(),
                         events_total = event_count,
