@@ -6,14 +6,14 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::EtwConfig;
-use crate::events::ThreatEvent;
+use crate::events::{AgentInfo, ThreatEvent};
 
 use super::Collector;
 
 pub struct EtwCollector {
     config: EtwConfig,
     #[allow(dead_code)] // used on Windows only
-    hostname: String,
+    agent: AgentInfo,
     dropped: Arc<AtomicU64>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -22,10 +22,10 @@ pub struct EtwCollector {
 }
 
 impl EtwCollector {
-    pub fn new(config: EtwConfig, hostname: String) -> Self {
+    pub fn new(config: EtwConfig, agent: AgentInfo) -> Self {
         Self {
             config,
-            hostname,
+            agent,
             dropped: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
@@ -327,7 +327,7 @@ mod platform {
     }
 
     struct CallbackContext {
-        hostname: String,
+        agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         stop: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
@@ -341,7 +341,7 @@ mod platform {
     /// to `stop_session()` on shutdown.
     pub fn start_session(
         providers: &[crate::config::EtwProviderConfig],
-        hostname: String,
+        agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
     ) -> Result<(Arc<AtomicBool>, isize)> {
@@ -446,7 +446,7 @@ mod platform {
                 .collect();
 
             let ctx = Box::new(CallbackContext {
-                hostname,
+                agent,
                 tx,
                 stop: stop_clone,
                 dropped,
@@ -536,7 +536,7 @@ mod platform {
         let provider_name = provider_display_name(&provider);
 
         if let Some(event) =
-            unsafe { map_event(rec, provider_name, event_id, pid, &ctx.hostname) }
+            unsafe { map_event(rec, provider_name, event_id, pid, &ctx.agent) }
         {
             if let Err(_) = ctx.tx.try_send(event) {
                 let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -587,7 +587,7 @@ mod platform {
         provider: &str,
         event_id: u16,
         pid: u32,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
     ) -> Option<ThreatEvent> {
         let data = unsafe { user_data_slice(rec) };
         let ps = ptr_size(rec);
@@ -1220,14 +1220,14 @@ mod platform {
             //   Then event-specific fields (BaseAddress, RegionSize, etc.)
             // -----------------------------------------------------------
             "Microsoft-Windows-Threat-Intelligence" => {
-                return Some(map_ti_event(data, event_id, pid, hostname, ps));
+                return Some(map_ti_event(data, event_id, pid, agent, ps));
             }
 
             _ => return None,
         };
 
         Some(ThreatEvent::new(
-            hostname,
+            agent,
             EventSource::Etw {
                 provider: provider.to_string(),
             },
@@ -1246,7 +1246,7 @@ mod platform {
         data: Option<&[u8]>,
         event_id: u16,
         pid: u32,
-        hostname: &str,
+        agent: &crate::events::AgentInfo,
         ps: usize,
     ) -> ThreatEvent {
         // Try to parse the common TI header present in all events.
@@ -1491,7 +1491,7 @@ mod platform {
         // memory manipulation is inherently suspicious.
         if matches!(event_id, 6..=8) {
             ThreatEvent::new(
-                hostname,
+                agent,
                 source,
                 EventCategory::Evasion,
                 Severity::Medium,
@@ -1499,7 +1499,7 @@ mod platform {
             )
         } else {
             ThreatEvent::with_rule(
-                hostname,
+                agent,
                 source,
                 EventCategory::Evasion,
                 Severity::High,
@@ -1539,7 +1539,7 @@ impl Collector for EtwCollector {
         {
             let (flag, lock) = platform::start_session(
                 &self.config.providers,
-                self.hostname.clone(),
+                self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
             )?;

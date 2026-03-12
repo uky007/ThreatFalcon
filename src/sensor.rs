@@ -11,11 +11,13 @@ use crate::collectors::Collector;
 use crate::config::SensorConfig;
 use crate::events::*;
 use crate::output;
+use crate::state;
 
 const EVENT_CHANNEL_SIZE: usize = 10_000;
 
 pub struct Sensor {
     config: SensorConfig,
+    agent: AgentInfo,
     collectors: Vec<Box<dyn Collector>>,
 }
 
@@ -27,25 +29,32 @@ struct CollectorEntry {
 
 impl Sensor {
     pub fn new(config: SensorConfig) -> Result<Self> {
-        let hostname = config.hostname.clone();
+        let agent_id = state::load_or_create_agent_id(&config.state_path)?;
+        let agent = AgentInfo {
+            hostname: config.hostname.clone(),
+            agent_id,
+        };
 
         let collectors: Vec<Box<dyn Collector>> = vec![
             Box::new(EtwCollector::new(
                 config.collectors.etw.clone(),
-                hostname.clone(),
+                agent.clone(),
             )),
             Box::new(SysmonCollector::new(
                 config.collectors.sysmon.clone(),
-                hostname.clone(),
+                agent.clone(),
             )),
             Box::new(EvasionCollector::new(
                 config.collectors.evasion.clone(),
-                hostname,
+                agent.clone(),
             )),
         ];
 
+        info!(agent_id = %agent.agent_id, "Agent identity loaded");
+
         Ok(Self {
             config,
+            agent,
             collectors,
         })
     }
@@ -236,7 +245,7 @@ impl Sensor {
             .collect();
 
         ThreatEvent::new(
-            &self.config.hostname,
+            &self.agent,
             EventSource::Sensor,
             EventCategory::Health,
             Severity::Info,
@@ -274,6 +283,7 @@ mod tests {
             },
             collectors: CollectorConfig::default(),
             health_interval_secs: 60,
+            state_path: dir.path().join("test.state"),
         }
     }
 

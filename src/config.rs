@@ -15,6 +15,8 @@ pub struct SensorConfig {
     /// Interval in seconds between periodic health events (0 = periodic
     /// disabled; a final shutdown health event is always emitted).
     pub health_interval_secs: u64,
+    /// Path to the persistent agent state file (stores agent_id).
+    pub state_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,31 +164,65 @@ pub struct EvasionConfig {
 impl SensorConfig {
     /// Load config from the given path, or from the default `CONFIG_FILE` if
     /// `path` is `None`. Returns defaults when no file is found.
+    ///
+    /// Relative `state_path` values are resolved to an absolute path anchored
+    /// to the config file's directory (when a config file is loaded) or the
+    /// executable's directory (when using built-in defaults). This ensures the
+    /// same state file is found regardless of the process working directory
+    /// (important for Windows service mode where cwd is typically System32).
     pub fn load_from(path: Option<&std::path::Path>) -> Result<Self> {
-        let path = match path {
+        let (config, anchor) = match path {
             Some(p) => {
                 if !p.exists() {
                     anyhow::bail!("Config file not found: {}", p.display());
                 }
-                p.to_path_buf()
+                let content = std::fs::read_to_string(p)?;
+                let cfg: SensorConfig = toml::from_str(&content)?;
+                tracing::info!("Loaded config from {}", p.display());
+                // Anchor relative paths to the config file's directory.
+                let anchor = p
+                    .canonicalize()
+                    .unwrap_or_else(|_| p.to_path_buf())
+                    .parent()
+                    .map(|p| p.to_path_buf());
+                (cfg, anchor)
             }
             None => {
                 let default = PathBuf::from(CONFIG_FILE);
-                if !default.exists() {
+                if default.exists() {
+                    let content = std::fs::read_to_string(&default)?;
+                    let cfg: SensorConfig = toml::from_str(&content)?;
+                    tracing::info!("Loaded config from {}", default.display());
+                    let anchor = default
+                        .canonicalize()
+                        .unwrap_or_else(|_| default.clone())
+                        .parent()
+                        .map(|p| p.to_path_buf());
+                    (cfg, anchor)
+                } else {
                     tracing::info!(
                         "No config file found at {CONFIG_FILE} — using defaults"
                     );
-                    return Ok(Self::default());
+                    // Anchor to the executable's directory.
+                    let anchor = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+                    (Self::default(), anchor)
                 }
-                default
             }
         };
 
-        let content = std::fs::read_to_string(&path)?;
-        let config: SensorConfig = toml::from_str(&content)?;
+        Ok(config.resolve_state_path(anchor))
+    }
 
-        tracing::info!("Loaded config from {}", path.display());
-        Ok(config)
+    /// If `state_path` is relative, resolve it against `anchor`.
+    fn resolve_state_path(mut self, anchor: Option<PathBuf>) -> Self {
+        if self.state_path.is_relative() {
+            if let Some(base) = anchor {
+                self.state_path = base.join(&self.state_path);
+            }
+        }
+        self
     }
 }
 
@@ -197,6 +233,7 @@ impl Default for SensorConfig {
             output: OutputConfig::default(),
             collectors: CollectorConfig::default(),
             health_interval_secs: 60,
+            state_path: PathBuf::from("threatfalcon.state"),
         }
     }
 }
@@ -503,5 +540,32 @@ mod tests {
         // This may or may not find a file depending on the test runner's cwd,
         // but load_from(None) should never panic.
         let _ = SensorConfig::load_from(None);
+    }
+
+    #[test]
+    fn state_path_resolved_relative_to_config_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_dir = dir.path().join("conf");
+        let config_path = conf_dir.join("sensor.toml");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::write(
+            &config_path,
+            "state_path = \"my.state\"\n",
+        )
+        .unwrap();
+
+        let cfg = SensorConfig::load_from(Some(&config_path)).unwrap();
+        // state_path should be anchored to the config file's directory,
+        // not the process cwd.
+        assert!(cfg.state_path.is_absolute(), "state_path should be absolute: {:?}", cfg.state_path);
+        // Canonicalize the expected dir to handle platform symlinks (e.g.
+        // /var → /private/var on macOS).
+        let expected_dir = conf_dir.canonicalize().unwrap();
+        assert!(
+            cfg.state_path.starts_with(&expected_dir),
+            "state_path {:?} should be under config dir {:?}",
+            cfg.state_path,
+            expected_dir,
+        );
     }
 }
