@@ -5,11 +5,12 @@
 //! across restarts.
 //!
 //! Atomicity: the new state is written to a temp file in the same directory,
-//! then renamed into place. On Unix `rename(2)` is atomic; on Windows
-//! `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` is as close as we get.
-//! A concurrent reader will see either the old (non-existent) path or the
-//! fully-written file — never a partial write.
+//! then placed at the final path via `persist_noclobber()`.  This uses
+//! `link()`+`unlink()` on Unix and `CREATE_NEW` on Windows — both refuse
+//! to overwrite an existing file.  Only one process can win; the loser
+//! reads the winner's fully-written file.
 
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -23,9 +24,11 @@ struct StateFile {
 
 /// Load `agent_id` from `path`, or generate and persist a new one.
 ///
-/// Creation is atomic: content is written to a temporary file first, then
-/// renamed into the final path. A concurrent process that loses the rename
-/// race simply reads the winner's file.
+/// Creation is atomic and exclusive: content is written to a temp file,
+/// then `persist_noclobber()` attempts to place it at the final path.
+/// If the target already exists the call fails, and we read the existing
+/// file instead.  This guarantees that exactly one agent_id wins, even
+/// under concurrent first-run startup.
 pub fn load_or_create_agent_id(path: &Path) -> Result<Uuid> {
     // Ensure parent directories exist.
     if let Some(parent) = path.parent() {
@@ -36,50 +39,47 @@ pub fn load_or_create_agent_id(path: &Path) -> Result<Uuid> {
 
     // Fast path: file already exists — just read it.
     if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        let state: StateFile = toml::from_str(&content)?;
-        tracing::info!(agent_id = %state.agent_id, path = %path.display(), "Loaded agent state");
-        return Ok(state.agent_id);
+        return read_state(path);
     }
 
-    // Slow path: generate a new ID and write atomically via temp+rename.
+    // Slow path: generate a new ID and try to claim the file.
     let id = Uuid::new_v4();
     let state = StateFile { agent_id: id };
     let content = toml::to_string_pretty(&state)?;
 
     // Write to a temp file in the same directory (same filesystem) so
-    // rename is atomic and never crosses mount points.
+    // the subsequent rename never crosses mount points.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(parent)?;
-    std::fs::write(tmp.path(), content.as_bytes())?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.as_file().sync_all()?;
 
-    // persist() does rename on Unix, MoveFileEx on Windows.
-    // If the target already appeared between our exists() check and now,
-    // persist will overwrite on Unix (atomic) or fail on Windows —
-    // either way the final file is valid. On Windows rename failure,
-    // fall back to reading the winner's file.
-    match tmp.persist(path) {
+    // persist_noclobber() uses link()+unlink() on Unix and CREATE_NEW on
+    // Windows — it fails if the target already exists.  This is the
+    // single serialization point: exactly one process succeeds.
+    match tmp.persist_noclobber(path) {
         Ok(_) => {
             tracing::info!(agent_id = %id, path = %path.display(), "Created new agent state");
             Ok(id)
         }
         Err(e) => {
-            // Another process won the race and placed the file first.
-            // Read their ID instead of ours.
+            // Another process placed the file between our exists() check
+            // and persist_noclobber().  Read their (complete) file.
             if path.exists() {
-                let content = std::fs::read_to_string(path)?;
-                let state: StateFile = toml::from_str(&content)?;
-                tracing::info!(
-                    agent_id = %state.agent_id,
-                    path = %path.display(),
-                    "Lost rename race — loaded winner's agent state"
-                );
-                Ok(state.agent_id)
+                read_state(path)
             } else {
                 Err(e.error.into())
             }
         }
     }
+}
+
+/// Read and parse an existing state file.
+fn read_state(path: &Path) -> Result<Uuid> {
+    let content = std::fs::read_to_string(path)?;
+    let state: StateFile = toml::from_str(&content)?;
+    tracing::info!(agent_id = %state.agent_id, path = %path.display(), "Loaded agent state");
+    Ok(state.agent_id)
 }
 
 #[cfg(test)]
@@ -131,9 +131,7 @@ mod tests {
         assert!(load_or_create_agent_id(&path).is_err());
     }
 
-    /// Simulate the race: pre-create the file between "would create" and
-    /// "actually create" — `create_new` must fall back to the read path
-    /// and return the existing ID, not error.
+    /// Fast-path: file already present before load_or_create is called.
     #[test]
     fn concurrent_create_returns_existing_id() {
         let dir = TempDir::new().unwrap();
@@ -144,9 +142,42 @@ mod tests {
         let content = toml::to_string_pretty(&StateFile { agent_id: known_id }).unwrap();
         std::fs::write(&path, &content).unwrap();
 
-        // A "second process" calls load_or_create — create_new will fail
-        // with AlreadyExists and it should return the existing ID.
+        // A "second process" calls load_or_create — the exists() fast
+        // path returns the existing ID.
         let got = load_or_create_agent_id(&path).unwrap();
         assert_eq!(got, known_id);
+    }
+
+    /// Simulate the persist_noclobber race: two threads both pass the
+    /// exists() check, but only one wins the rename.  Both must end up
+    /// with the same agent_id — the winner's.
+    #[test]
+    fn concurrent_persist_noclobber_race() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.toml");
+        let path = Arc::new(path);
+        // Barrier so both threads call load_or_create at ~the same time.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let p = Arc::clone(&path);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    load_or_create_agent_id(&p).unwrap()
+                })
+            })
+            .collect();
+
+        let ids: Vec<Uuid> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Both threads must agree on the same agent_id.
+        assert_eq!(ids[0], ids[1], "concurrent first-run produced divergent agent_ids");
+
+        // The on-disk file must match.
+        let on_disk = load_or_create_agent_id(&path).unwrap();
+        assert_eq!(on_disk, ids[0]);
     }
 }
