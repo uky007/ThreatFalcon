@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 use crate::collectors::etw::EtwCollector;
@@ -50,7 +50,7 @@ impl Sensor {
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
         let start_time = Instant::now();
 
@@ -156,7 +156,7 @@ impl Sensor {
                         "Health check"
                     );
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = shutdown_rx.changed() => {
                     info!("Shutdown signal received");
                     break;
                 }
@@ -251,6 +251,14 @@ mod tests {
     use crate::config::*;
     use tempfile::TempDir;
 
+    /// Create a shutdown receiver for tests. The sensor will shut down
+    /// when all collectors finish (channel closes), so we don't need to
+    /// actually signal it — just provide a valid receiver.
+    fn test_shutdown_rx() -> watch::Receiver<bool> {
+        let (_tx, rx) = watch::channel(false);
+        rx
+    }
+
     fn test_config(dir: &TempDir) -> SensorConfig {
         SensorConfig {
             hostname: "TEST-HOST".into(),
@@ -274,7 +282,7 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run().await.unwrap();
+        sensor.run(test_shutdown_rx()).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -307,7 +315,7 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run().await.unwrap();
+        sensor.run(test_shutdown_rx()).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let last_line = content.lines().last().unwrap();
@@ -340,7 +348,7 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run().await.unwrap();
+        sensor.run(test_shutdown_rx()).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let last_line = content.lines().last().unwrap();
@@ -370,7 +378,7 @@ mod tests {
         let output_path = config.output.path.clone();
 
         let mut sensor = Sensor::new(config).unwrap();
-        sensor.run().await.unwrap();
+        sensor.run(test_shutdown_rx()).await.unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         // Final health event should still be emitted
