@@ -169,12 +169,12 @@ pub(crate) mod parser {
             self.data.len().saturating_sub(self.pos)
         }
 
-        /// Read exactly `n` bytes as UTF-16LE and decode (no null terminator).
+        /// Read exactly `n` bytes as UTF-16LE, decode, and strip trailing NULs.
         pub fn read_utf16_bytes(&mut self, n: usize) -> String {
             let end = (self.pos + n).min(self.data.len());
             let result = self.decode_utf16(self.pos, end);
             self.pos = end;
-            result
+            result.trim_end_matches('\0').to_string()
         }
 
         #[allow(dead_code)]
@@ -2530,7 +2530,7 @@ mod tests {
         assert_eq!(reg_type, 1); // REG_SZ
         assert_eq!(key, r"HKLM\SOFTWARE\Test");
         assert_eq!(value_name, "MyValue");
-        assert!(value_data.starts_with("hello"));
+        assert_eq!(value_data, "hello");
     }
 
     // --- DNS: QueryCompleted with response -----------------------------------
