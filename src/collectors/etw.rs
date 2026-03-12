@@ -2740,4 +2740,693 @@ mod tests {
         assert_eq!(s, "AB");
         assert_eq!(r.remaining(), 2);
     }
+
+    // =========================================================================
+    // Edge-case fixture tests: Unicode, long paths, boundary values, 32-bit
+    // =========================================================================
+
+    // --- ProcessCreate with CJK/Unicode command line -------------------------
+
+    #[test]
+    fn fixture_process_create_unicode_cmdline() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&42u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&utf16_nul(r"C:\Program Files\ツール\app.exe"));
+        data.extend_from_slice(&utf16_nul("app.exe --name=日本語テスト --flag=αβγ"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let pid = r.read_u32().unwrap();
+        let _ct = r.read_u64().unwrap();
+        let _ppid = r.read_u32().unwrap();
+        let _sid = r.read_u32().unwrap();
+        let _flags = r.read_u32().unwrap();
+        let image = r.read_utf16_nul();
+        let cmdline = r.read_utf16_nul();
+
+        assert_eq!(pid, 42);
+        assert!(image.contains("ツール"));
+        assert!(cmdline.contains("日本語テスト"));
+        assert!(cmdline.contains("αβγ"));
+    }
+
+    // --- ProcessCreate with very long path (> 260 chars) ---------------------
+
+    #[test]
+    fn fixture_process_create_long_path() {
+        let long_dir = "A".repeat(250);
+        let long_path = format!(r"C:\Users\Admin\{long_dir}\deeply\nested\app.exe");
+        assert!(long_path.len() > 260);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&99u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&utf16_nul(&long_path));
+        data.extend_from_slice(&utf16_nul("app.exe"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _ct = r.read_u64().unwrap();
+        let _ppid = r.read_u32().unwrap();
+        let _sid = r.read_u32().unwrap();
+        let _flags = r.read_u32().unwrap();
+        let image = r.read_utf16_nul();
+        let cmdline = r.read_utf16_nul();
+
+        assert_eq!(image, long_path);
+        assert_eq!(cmdline, "app.exe");
+    }
+
+    // --- ImageLoad on 32-bit with Unicode filename ---------------------------
+
+    #[test]
+    fn fixture_image_load_32bit_unicode() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&300u32.to_le_bytes());
+        data.extend_from_slice(&0x1000_0000u32.to_le_bytes()); // ImageBase (32-bit)
+        data.extend_from_slice(&0x0004_0000u32.to_le_bytes()); // ImageSize (32-bit)
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0x1000_0000u32.to_le_bytes()); // DefaultBase (32-bit)
+        data.push(4); // SignatureLevel (Authenticode)
+        data.push(1); // SignatureType (Embedded)
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&utf16_nul(r"C:\プログラム\テスト.dll"));
+
+        let mut r = UserDataReader::new(&data, 4);
+        let pid = r.read_u32().unwrap();
+        let _base = r.read_pointer().unwrap();
+        let _size = r.read_pointer().unwrap();
+        let _chk = r.read_u32().unwrap();
+        let _ts = r.read_u32().unwrap();
+        let _db = r.read_pointer().unwrap();
+        let sig_level = r.read_u8().unwrap();
+        let sig_type = r.read_u8().unwrap();
+        r.skip(2);
+        let file_name = r.read_utf16_nul();
+
+        assert_eq!(pid, 300);
+        assert!(sig_level >= 4, "signed");
+        assert_eq!(sig_type, 1);
+        let image_name = file_name.rsplit('\\').next().unwrap_or(&file_name);
+        assert_eq!(image_name, "テスト.dll");
+    }
+
+    // --- ImageLoad with no backslash (bare filename) -------------------------
+
+    #[test]
+    fn fixture_image_load_bare_filename() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0x0040_0000u64.to_le_bytes());
+        data.extend_from_slice(&0x1000u64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(0);
+        data.push(0);
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&utf16_nul("shellcode.bin"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _base = r.read_pointer().unwrap();
+        let _size = r.read_pointer().unwrap();
+        let _chk = r.read_u32().unwrap();
+        let _ts = r.read_u32().unwrap();
+        let _db = r.read_pointer().unwrap();
+        let sig_level = r.read_u8().unwrap();
+        let _sig_type = r.read_u8().unwrap();
+        r.skip(2);
+        let file_name = r.read_utf16_nul();
+
+        assert!(sig_level < 4, "unsigned");
+        // No backslash → image_name == full path
+        let image_name = file_name.rsplit('\\').next().unwrap_or(&file_name);
+        assert_eq!(image_name, "shellcode.bin");
+        assert_eq!(image_name, file_name);
+    }
+
+    // --- File NameCreate (ID 10) with long UNC path --------------------------
+
+    #[test]
+    fn fixture_file_name_create_unc_path() {
+        let unc_path = format!(r"\\?\UNC\server\share\{}\file.dat", "subdir\\".repeat(40));
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // FileObject
+        data.extend_from_slice(&utf16_nul(&unc_path));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _fobj = r.read_pointer().unwrap();
+        let path = r.read_utf16_nul();
+
+        assert!(path.starts_with(r"\\?\UNC\server\share\"));
+        assert!(path.ends_with("file.dat"));
+        assert!(path.len() > 260);
+    }
+
+    // --- File Rename (ID 14) 32-bit pointers ---------------------------------
+
+    #[test]
+    fn fixture_file_rename_32bit() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xAAAA_0000u32.to_le_bytes()); // IrpPtr (32-bit)
+        data.extend_from_slice(&0xBBBB_0000u32.to_le_bytes()); // FileObject (32-bit)
+        data.extend_from_slice(&500u32.to_le_bytes());
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&utf16_nul(r"D:\Data\old_name.log"));
+
+        let mut r = UserDataReader::new(&data, 4);
+        let _irp = r.read_pointer().unwrap();
+        let _fobj = r.read_pointer().unwrap();
+        let _ttid = r.read_u32().unwrap();
+        let _info_class = r.read_u32().unwrap();
+        let path = r.read_utf16_nul();
+
+        assert_eq!(path, r"D:\Data\old_name.log");
+    }
+
+    // --- Registry OpenKey (ID 2): no Disposition field -----------------------
+
+    #[test]
+    fn fixture_registry_open_key_payload() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xF000u64.to_le_bytes()); // BaseObject
+        data.extend_from_slice(&0xF001u64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        // No Disposition for OpenKey (ID 2) — unlike CreateKey (ID 1)
+        data.extend_from_slice(&utf16_nul(r"\REGISTRY\MACHINE\SYSTEM"));
+        data.extend_from_slice(&utf16_nul(r"CurrentControlSet\Services\LanmanServer"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _base = r.read_pointer().unwrap();
+        let _key = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let base_name = r.read_utf16_nul();
+        let rel_name = r.read_utf16_nul();
+
+        let key = format!("{base_name}\\{rel_name}");
+        assert_eq!(
+            key,
+            r"\REGISTRY\MACHINE\SYSTEM\CurrentControlSet\Services\LanmanServer"
+        );
+    }
+
+    // --- Registry SetValue with REG_DWORD (no captured string data) ----------
+
+    #[test]
+    fn fixture_registry_set_value_dword_no_capture() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x5678u64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&4u32.to_le_bytes()); // Type (REG_DWORD)
+        data.extend_from_slice(&4u32.to_le_bytes()); // DataSize
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\App"));
+        data.extend_from_slice(&utf16_nul("EnableFeature"));
+        // CapturedDataSize present but type is DWORD → parser should skip
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // raw DWORD value
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let reg_type = r.read_u32().unwrap();
+        let _data_size = r.read_u32().unwrap();
+        let key = r.read_utf16_nul();
+        let value_name = r.read_utf16_nul();
+
+        // For REG_DWORD (type=4), the parser should NOT attempt UTF-16 decode
+        let vd = if matches!(reg_type, 1 | 2) {
+            if let Some(cap_size) = r.read_u16() {
+                let cap = cap_size as usize;
+                if cap > 0 && r.remaining() >= cap {
+                    Some(r.read_utf16_bytes(cap))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        assert_eq!(reg_type, 4);
+        assert_eq!(key, r"HKLM\SOFTWARE\App");
+        assert_eq!(value_name, "EnableFeature");
+        assert!(vd.is_none(), "REG_DWORD should not produce string value_data");
+    }
+
+    // --- Registry SetValue with empty CapturedData ---------------------------
+
+    #[test]
+    fn fixture_registry_set_value_empty_captured_data() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x9999u64.to_le_bytes()); // KeyObject
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&1u32.to_le_bytes()); // REG_SZ
+        data.extend_from_slice(&0u32.to_le_bytes()); // DataSize=0
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\Empty"));
+        data.extend_from_slice(&utf16_nul("EmptyVal"));
+        // CapturedDataSize=0
+        data.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let reg_type = r.read_u32().unwrap();
+        let _data_size = r.read_u32().unwrap();
+        let _key = r.read_utf16_nul();
+        let _value_name = r.read_utf16_nul();
+
+        let vd = if matches!(reg_type, 1 | 2) {
+            if let Some(cap_size) = r.read_u16() {
+                let cap = cap_size as usize;
+                if cap > 0 && r.remaining() >= cap {
+                    Some(r.read_utf16_bytes(cap))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        assert!(vd.is_none(), "empty CapturedData should yield None");
+    }
+
+    // --- Registry SetValue with Unicode value data ---------------------------
+
+    #[test]
+    fn fixture_registry_set_value_unicode_data() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1111u64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // REG_SZ
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\Intl"));
+        data.extend_from_slice(&utf16_nul("DisplayName"));
+        let captured = utf16_nul("日本語の値データ");
+        data.extend_from_slice(&(captured.len() as u16).to_le_bytes());
+        data.extend_from_slice(&captured);
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _key_obj = r.read_pointer().unwrap();
+        let _status = r.read_u32().unwrap();
+        let reg_type = r.read_u32().unwrap();
+        let _data_size = r.read_u32().unwrap();
+        let _key = r.read_utf16_nul();
+        let _value_name = r.read_utf16_nul();
+        let cap_size = r.read_u16().unwrap() as usize;
+        let vd = r.read_utf16_bytes(cap_size);
+
+        assert_eq!(reg_type, 1);
+        assert_eq!(vd, "日本語の値データ");
+    }
+
+    // --- DNS QueryCompleted with AAAA record type ----------------------------
+
+    #[test]
+    fn fixture_dns_query_completed_aaaa() {
+        let mut data = utf16_nul("ipv6.example.com");
+        data.extend_from_slice(&28u16.to_le_bytes()); // AAAA
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // SUCCESS
+        data.extend_from_slice(&utf16_nul("2001:db8::1"));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let name = r.read_utf16_nul();
+        let qtype = r.read_u16().unwrap();
+        let _opts = r.read_u32().unwrap();
+        let status = r.read_u32().unwrap();
+        let resp = if status == 0 && r.remaining() > 0 {
+            let s = r.read_utf16_nul();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+
+        assert_eq!(name, "ipv6.example.com");
+        assert_eq!(dns_query_type_name(qtype), "AAAA");
+        assert_eq!(resp, Some("2001:db8::1".into()));
+    }
+
+    // --- DNS QueryCompleted with multi-answer response -----------------------
+
+    #[test]
+    fn fixture_dns_query_completed_multi_answer() {
+        // Windows DNS-Client separates multiple answers with semicolons
+        let mut data = utf16_nul("cdn.example.com");
+        data.extend_from_slice(&1u16.to_le_bytes()); // A
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&utf16_nul(
+            "10.0.0.1;10.0.0.2;10.0.0.3;10.0.0.4",
+        ));
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _name = r.read_utf16_nul();
+        let _qtype = r.read_u16().unwrap();
+        let _opts = r.read_u32().unwrap();
+        let status = r.read_u32().unwrap();
+        let resp = if status == 0 && r.remaining() > 0 {
+            let s = r.read_utf16_nul();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+
+        let resp = resp.unwrap();
+        let answers: Vec<&str> = resp.split(';').collect();
+        assert_eq!(answers.len(), 4);
+        assert_eq!(answers[0], "10.0.0.1");
+        assert_eq!(answers[3], "10.0.0.4");
+    }
+
+    // --- DNS QueryCompleted with empty result string -------------------------
+
+    #[test]
+    fn fixture_dns_query_completed_empty_result() {
+        // Status=0 but QueryResults is an empty string
+        let mut data = utf16_nul("empty.example.com");
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // SUCCESS
+        data.extend_from_slice(&utf16_nul("")); // empty result string
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _name = r.read_utf16_nul();
+        let _qtype = r.read_u16().unwrap();
+        let _opts = r.read_u32().unwrap();
+        let status = r.read_u32().unwrap();
+        let resp = if status == 0 && r.remaining() > 0 {
+            let s = r.read_utf16_nul();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+
+        assert_eq!(status, 0);
+        assert!(resp.is_none(), "empty result string should be None");
+    }
+
+    // --- DNS QueryInitiated with IDN/Unicode domain --------------------------
+
+    #[test]
+    fn fixture_dns_query_unicode_domain() {
+        let mut data = utf16_nul("例え.jp");
+        data.extend_from_slice(&1u16.to_le_bytes()); // A
+
+        let mut r = UserDataReader::new(&data, 8);
+        let name = r.read_utf16_nul();
+        let qtype = r.read_u16().unwrap();
+
+        assert_eq!(name, "例え.jp");
+        assert_eq!(dns_query_type_name(qtype), "A");
+    }
+
+    // --- TI ALLOCVM_REMOTE 32-bit (ptr_size=4) -------------------------------
+
+    fn build_ti_common_header_32(calling_pid: u32, calling_tid: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // CallingProcessId is win:Pointer (4 bytes on 32-bit)
+        buf.extend_from_slice(&calling_pid.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.push(6);
+        buf.push(6);
+        buf.push(0x31);
+        buf.extend_from_slice(&calling_tid.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf
+    }
+
+    fn build_ti_target_header_32(target_pid: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&target_pid.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.push(0);
+        buf.push(0);
+        buf.push(0);
+        buf
+    }
+
+    #[test]
+    fn fixture_ti_allocvm_remote_32bit() {
+        let mut data = build_ti_common_header_32(100, 200);
+        data.extend(build_ti_target_header_32(999));
+        data.extend_from_slice(&0x1000_0000u32.to_le_bytes()); // BaseAddress (32-bit)
+        data.extend_from_slice(&0x2000u32.to_le_bytes()); // RegionSize (32-bit)
+        data.extend_from_slice(&0x3000u32.to_le_bytes()); // AllocationType
+        data.extend_from_slice(&0x40u32.to_le_bytes()); // Protection
+
+        let mut r = UserDataReader::new(&data, 4);
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let _alloc = r.read_u32().unwrap();
+        let prot = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 100);
+        assert_eq!(target_pid, 999);
+        assert_eq!(base, 0x1000_0000);
+        assert_eq!(size, 0x2000);
+        assert_eq!(prot, 0x40);
+    }
+
+    // --- TI MAPVIEW_REMOTE (ID 3) --------------------------------------------
+
+    #[test]
+    fn fixture_ti_mapview_remote() {
+        let mut data = build_ti_common_header(200, 201);
+        data.extend(build_ti_target_header(300));
+        data.extend_from_slice(&0x7FFE_0000_0000u64.to_le_bytes()); // BaseAddress
+        data.extend_from_slice(&0x0010_0000u64.to_le_bytes()); // ViewSize
+        data.extend_from_slice(&0x08000000u32.to_le_bytes()); // AllocationType (SEC_IMAGE)
+        data.extend_from_slice(&0x02u32.to_le_bytes()); // Protection (PAGE_READONLY)
+
+        let mut r = UserDataReader::new(&data, 8);
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
+        let _tc = r.read_u64().unwrap();
+        let _tk = r.read_u64().unwrap();
+        let _tsl = r.read_u8().unwrap();
+        let _tssl = r.read_u8().unwrap();
+        let _tp = r.read_u8().unwrap();
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let alloc_type = r.read_u32().unwrap();
+        let prot = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 200);
+        assert_eq!(target_pid, 300);
+        assert_eq!(base, 0x7FFE_0000_0000);
+        assert_eq!(size, 0x0010_0000);
+        assert_eq!(alloc_type, 0x08000000); // SEC_IMAGE
+        assert_eq!(prot, 0x02);
+    }
+
+    // --- TI PROTECTVM_LOCAL (ID 7) -------------------------------------------
+
+    #[test]
+    fn fixture_ti_protectvm_local() {
+        let mut data = build_ti_common_header(4000, 4001);
+        // No target header for local events
+        data.extend_from_slice(&0x0040_0000u64.to_le_bytes()); // BaseAddress
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // RegionSize
+        data.extend_from_slice(&0x20u32.to_le_bytes()); // PAGE_EXECUTE_READ
+        data.extend_from_slice(&0x04u32.to_le_bytes()); // Old: PAGE_READWRITE
+
+        let mut r = UserDataReader::new(&data, 8);
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        // No target header — go straight to event-specific
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let new_prot = r.read_u32().unwrap();
+        let old_prot = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 4000);
+        assert_eq!(base, 0x0040_0000);
+        assert_eq!(size, 0x1000);
+        assert_eq!(new_prot, 0x20); // PAGE_EXECUTE_READ
+        assert_eq!(old_prot, 0x04); // PAGE_READWRITE
+    }
+
+    // --- TI MAPVIEW_LOCAL (ID 8) ---------------------------------------------
+
+    #[test]
+    fn fixture_ti_mapview_local() {
+        let mut data = build_ti_common_header(5000, 5001);
+        data.extend_from_slice(&0x7FF8_0000_0000u64.to_le_bytes());
+        data.extend_from_slice(&0x0020_0000u64.to_le_bytes());
+        data.extend_from_slice(&0x08000000u32.to_le_bytes()); // SEC_IMAGE
+        data.extend_from_slice(&0x20u32.to_le_bytes()); // PAGE_EXECUTE_READ
+
+        let mut r = UserDataReader::new(&data, 8);
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let _tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        let base = r.read_pointer().unwrap();
+        let size = r.read_pointer().unwrap();
+        let alloc_type = r.read_u32().unwrap();
+        let prot = r.read_u32().unwrap();
+
+        assert_eq!(calling_pid, 5000);
+        assert_eq!(base, 0x7FF8_0000_0000);
+        assert_eq!(size, 0x0020_0000);
+        assert_eq!(alloc_type, 0x08000000);
+        assert_eq!(prot, 0x20);
+    }
+
+    // --- TI with max PID values (boundary) -----------------------------------
+
+    #[test]
+    fn fixture_ti_max_pid_boundary() {
+        // PID values near u32::MAX edge — verify no truncation issues
+        let mut data = build_ti_common_header(u32::MAX - 1, u32::MAX);
+        data.extend(build_ti_target_header(u32::MAX));
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // BaseAddress
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // RegionSize
+        data.extend_from_slice(&0x3000u32.to_le_bytes()); // AllocationType
+        data.extend_from_slice(&0x40u32.to_le_bytes()); // Protection
+
+        let mut r = UserDataReader::new(&data, 8);
+        let calling_pid = r.read_pointer().unwrap() as u32;
+        let _ct = r.read_u64().unwrap();
+        let _sk = r.read_u64().unwrap();
+        let _sl = r.read_u8().unwrap();
+        let _ssl = r.read_u8().unwrap();
+        let _p = r.read_u8().unwrap();
+        let calling_tid = r.read_u32().unwrap();
+        let _tct = r.read_u64().unwrap();
+        let target_pid = r.read_pointer().unwrap() as u32;
+
+        assert_eq!(calling_pid, u32::MAX - 1);
+        assert_eq!(calling_tid, u32::MAX);
+        assert_eq!(target_pid, u32::MAX);
+    }
+
+    // --- Empty UserData graceful handling ------------------------------------
+
+    #[test]
+    fn empty_user_data_reader() {
+        let data: &[u8] = &[];
+        let mut r = UserDataReader::new(data, 8);
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(r.read_u8(), None);
+        assert_eq!(r.read_u16(), None);
+        assert_eq!(r.read_u32(), None);
+        assert_eq!(r.read_u64(), None);
+        assert_eq!(r.read_pointer(), None);
+        assert_eq!(r.read_ipv4(), None);
+        assert_eq!(r.read_ipv6(), None);
+        assert_eq!(r.read_utf16_nul(), "");
+        assert_eq!(r.read_utf16_bytes(0), "");
+    }
+
+    // --- read_utf16_bytes with odd byte count --------------------------------
+
+    #[test]
+    fn read_utf16_bytes_odd_count() {
+        // 5 bytes: "A\0B\0" + trailing 0x43 (odd, not a full u16)
+        let data = [0x41, 0x00, 0x42, 0x00, 0x43];
+        let mut r = UserDataReader::new(&data, 8);
+        // Reading 5 bytes: chunks_exact(2) will produce "AB", dropping byte 0x43
+        let s = r.read_utf16_bytes(5);
+        assert_eq!(s, "AB");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    // --- Network: all-zeros IP address (0.0.0.0) -----------------------------
+
+    #[test]
+    fn fixture_tcp_ipv4_zero_addr() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes()); // PID=0 (System)
+        data.extend_from_slice(&0u32.to_le_bytes()); // Size
+        data.extend_from_slice(&[0, 0, 0, 0]); // DstAddr: 0.0.0.0
+        data.extend_from_slice(&[0, 0, 0, 0]); // SrcAddr: 0.0.0.0
+        data.extend_from_slice(&0u16.to_be_bytes()); // DstPort=0
+        data.extend_from_slice(&0u16.to_be_bytes()); // SrcPort=0
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _size = r.read_u32().unwrap();
+        let dst = r.read_ipv4().unwrap();
+        let src = r.read_ipv4().unwrap();
+        let dp = r.read_u16_be().unwrap();
+        let sp = r.read_u16_be().unwrap();
+
+        assert_eq!(dst, "0.0.0.0");
+        assert_eq!(src, "0.0.0.0");
+        assert_eq!(dp, 0);
+        assert_eq!(sp, 0);
+    }
+
+    // --- Network: max port numbers (65535) -----------------------------------
+
+    #[test]
+    fn fixture_tcp_ipv4_max_ports() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&[255, 255, 255, 255]); // 255.255.255.255
+        data.extend_from_slice(&[127, 0, 0, 1]); // 127.0.0.1
+        data.extend_from_slice(&65535u16.to_be_bytes());
+        data.extend_from_slice(&65535u16.to_be_bytes());
+
+        let mut r = UserDataReader::new(&data, 8);
+        let _pid = r.read_u32().unwrap();
+        let _size = r.read_u32().unwrap();
+        let dst = r.read_ipv4().unwrap();
+        let src = r.read_ipv4().unwrap();
+        let dp = r.read_u16_be().unwrap();
+        let sp = r.read_u16_be().unwrap();
+
+        assert_eq!(dst, "255.255.255.255");
+        assert_eq!(src, "127.0.0.1");
+        assert_eq!(dp, 65535);
+        assert_eq!(sp, 65535);
+    }
 }
