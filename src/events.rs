@@ -247,6 +247,16 @@ pub struct CollectorStatus {
 pub struct SinkStatus {
     pub sink_type: String,
     pub events_dropped: u64,
+    /// Events currently held in disk spool awaiting re-delivery.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub events_spooled: u64,
+    /// Total bytes of spooled data on disk.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spool_bytes: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
