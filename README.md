@@ -20,6 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
+- Local investigation CLI (`query`, `explain`, `bundle`) reads JSONL output directly
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -108,6 +109,7 @@ ThreatFalcon is split into a small number of clear components:
 - `src/collectors/etw.rs`: ETW real-time session and event mapping
 - `src/collectors/sysmon.rs`: Sysmon Event Log subscription
 - `src/collectors/sysmon_parser.rs`: Sysmon XML parsing and mapping
+- `src/investigate.rs`: local investigation CLI (query, explain, bundle)
 - `src/collectors/evasion.rs`: evasion-oriented process inspection
 
 ## Build
@@ -146,7 +148,12 @@ cargo run --release
 ### CLI Options
 
 ```
-threatfalcon [OPTIONS]
+threatfalcon [OPTIONS] [COMMAND]
+
+Commands:
+  query    Query events from a JSONL telemetry file
+  explain  Explain an event with its process context timeline
+  bundle   Bundle an event and related context into a single JSON document
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -411,6 +418,78 @@ Example enriched NetworkConnect event:
   }
 }
 ```
+
+## Local Investigation CLI
+
+ThreatFalcon includes built-in investigation commands that read JSONL telemetry output directly — no external SIEM or database required.
+
+### Query
+
+Filter and search events from a JSONL file:
+
+```bash
+# All events for a specific PID
+threatfalcon query --input events.jsonl --pid 1234
+
+# Events by stable process identity
+threatfalcon query --input events.jsonl --process-key "1234:133579284000000000"
+
+# Network events only
+threatfalcon query --input events.jsonl --category network
+
+# Detection events by rule ID
+threatfalcon query --input events.jsonl --rule-id TF-EVA-001
+
+# Events after a timestamp
+threatfalcon query --input events.jsonl --since "2026-03-13T00:00:00Z"
+
+# Combine filters with a result limit
+threatfalcon query --input events.jsonl --pid 1234 --category network --limit 50
+```
+
+Output is JSONL (one event per line) for easy piping to `jq`, `grep`, or other tools. The match count is printed to stderr.
+
+### Explain
+
+Show detailed context for a single event, including a process timeline of related activity within a time window:
+
+```bash
+# Full event detail + process timeline (±5 minutes by default)
+threatfalcon explain --event <UUID> --input events.jsonl
+
+# UUID prefix matching is supported
+threatfalcon explain --event a1b2c3d4 --input events.jsonl
+
+# Custom time window
+threatfalcon explain --event <UUID> --input events.jsonl --window 10
+```
+
+The output includes:
+- Target event details (ID, timestamp, category, severity, source, process context)
+- Process timeline showing all events from the same `process_key` within the window
+- Detection rule details (if the event is a detection)
+
+### Bundle
+
+Package an event and its related context into a single JSON document for sharing or archiving:
+
+```bash
+# Bundle to stdout
+threatfalcon bundle --event <UUID> --input events.jsonl
+
+# Bundle to a file
+threatfalcon bundle --event <UUID> --input events.jsonl --output bundle.json
+
+# Custom time window
+threatfalcon bundle --event <UUID> --input events.jsonl --window 10 --output bundle.json
+```
+
+The bundle includes:
+- `bundle_version`: schema version (currently 1)
+- `target_event`: the event being investigated
+- `related_events`: all events sharing the same `process_key` within the time window
+- `event_count`: total number of events in the bundle
+- Metadata: `created_at`, `process_key`, `window_minutes`
 
 ## Evasion Detection Rules
 

@@ -7,6 +7,20 @@ fn cmd() -> Command {
     Command::cargo_bin("threatfalcon").unwrap()
 }
 
+/// Minimal valid JSONL event for investigation CLI tests.
+/// Fields are hand-crafted to avoid pulling in the library crate.
+fn sample_event(id: &str, pid: u32, process_key: &str, category: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"2026-03-13T10:00:00Z","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Network"}}}},"category":"{category}","severity":"Info","data":{{"type":"NetworkConnect","pid":{pid},"image_path":"","protocol":"TCP","src_addr":"10.0.0.1","src_port":12345,"dst_addr":"93.184.216.34","dst_port":443,"direction":"Outbound"}},"process_context":{{"process_key":"{process_key}"}}}}"#
+    )
+}
+
+fn sample_detection_event(id: &str, rule_id: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"2026-03-13T10:00:00Z","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":"EvasionDetector","category":"Evasion","severity":"High","data":{{"type":"EvasionDetected","technique":"EtwPatching","pid":100,"process_name":"malware.exe","details":"patched"}},"rule":{{"id":"{rule_id}","name":"Test","description":"test","mitre":{{"tactic":"Defense Evasion","technique_id":"T1562.006","technique_name":"Indicator Blocking"}},"confidence":"High","evidence":["byte 0xC3"]}}}}"#
+    )
+}
+
 #[test]
 fn help_flag() {
     cmd().arg("--help").assert().success().stdout(
@@ -175,4 +189,272 @@ fn uninstall_service_conflicts_with_service() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+// ---- Investigation CLI tests ------------------------------------------------
+
+#[test]
+fn help_shows_subcommands() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("query")
+            .and(predicate::str::contains("explain"))
+            .and(predicate::str::contains("bundle")),
+    );
+}
+
+#[test]
+fn query_help() {
+    cmd().args(["query", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--pid"))
+            .and(predicate::str::contains("--process-key"))
+            .and(predicate::str::contains("--category"))
+            .and(predicate::str::contains("--rule-id"))
+            .and(predicate::str::contains("--since"))
+            .and(predicate::str::contains("--limit")),
+    );
+}
+
+#[test]
+fn explain_help() {
+    cmd().args(["explain", "--help"]).assert().success().stdout(
+        predicate::str::contains("--event")
+            .and(predicate::str::contains("--input"))
+            .and(predicate::str::contains("--window")),
+    );
+}
+
+#[test]
+fn bundle_help() {
+    cmd().args(["bundle", "--help"]).assert().success().stdout(
+        predicate::str::contains("--event")
+            .and(predicate::str::contains("--input"))
+            .and(predicate::str::contains("--window"))
+            .and(predicate::str::contains("--output")),
+    );
+}
+
+#[test]
+fn query_returns_matching_events() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network"),
+        sample_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network"),
+        sample_event("cccccccc-cccc-cccc-cccc-cccccccccccc", 100, "100:42", "Network"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--pid", "100"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("aaaaaaaa")
+                .and(predicate::str::contains("cccccccc"))
+                .and(predicate::str::contains("bbbbbbbb").not()),
+        )
+        .stderr(predicate::str::contains("2 event(s) matched"));
+}
+
+#[test]
+fn query_filter_by_category() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network"),
+        sample_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "File"),
+    ];
+    // Fix File category event to have FileCreate data
+    let file_event = r#"{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","timestamp":"2026-03-13T10:00:00Z","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{"Etw":{"provider":"Microsoft-Windows-Kernel-File"}},"category":"File","severity":"Info","data":{"type":"FileCreate","pid":200,"path":"C:\\test.txt","operation":"Create"},"process_context":{"process_key":"200:43"}}"#;
+    fs::write(&path, format!("{}\n{file_event}\n", lines[0])).unwrap();
+
+    cmd()
+        .args([
+            "query",
+            "--input",
+            path.to_str().unwrap(),
+            "--category",
+            "network",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aaaaaaaa"))
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_filter_by_rule_id() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network"),
+        sample_detection_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "TF-EVA-001"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args([
+            "query",
+            "--input",
+            path.to_str().unwrap(),
+            "--rule-id",
+            "TF-EVA-001",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bbbbbbbb"))
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("empty.jsonl");
+    fs::write(&path, "").unwrap();
+
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("0 event(s) matched"));
+}
+
+#[test]
+fn query_missing_file() {
+    cmd()
+        .args(["query", "--input", "/nonexistent/file.jsonl"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn explain_shows_event_detail() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let event_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let lines = [
+        sample_event(event_id, 100, "100:42", "Network"),
+        sample_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, "100:42", "Network"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args([
+            "explain",
+            "--event",
+            event_id,
+            "--input",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("=== Target Event ===")
+                .and(predicate::str::contains(event_id))
+                .and(predicate::str::contains("=== Process Timeline")),
+        );
+}
+
+#[test]
+fn explain_prefix_match() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let event = sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    cmd()
+        .args([
+            "explain",
+            "--event",
+            "aaaaaaaa", // prefix
+            "--input",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+}
+
+#[test]
+fn explain_event_not_found() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let event = sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    cmd()
+        .args([
+            "explain",
+            "--event",
+            "nonexistent",
+            "--input",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn bundle_to_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let output = dir.path().join("bundle.json");
+
+    let event_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let lines = [
+        sample_event(event_id, 100, "100:42", "Network"),
+        sample_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, "100:42", "Network"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args([
+            "bundle",
+            "--event",
+            event_id,
+            "--input",
+            path.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Bundle written to"));
+
+    let content = fs::read_to_string(&output).unwrap();
+    assert!(content.contains("\"bundle_version\""));
+    assert!(content.contains(event_id));
+    assert!(content.contains("\"related_events\""));
+}
+
+#[test]
+fn bundle_to_stdout() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let event_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let event = sample_event(event_id, 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    cmd()
+        .args([
+            "bundle",
+            "--event",
+            event_id,
+            "--input",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"bundle_version\"")
+                .and(predicate::str::contains(event_id)),
+        );
 }
