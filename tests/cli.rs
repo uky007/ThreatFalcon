@@ -709,3 +709,164 @@ fn explain_help_shows_json_flag() {
         predicate::str::contains("--json"),
     );
 }
+
+// ---- Index subcommand tests -------------------------------------------------
+
+#[test]
+fn index_help() {
+    cmd().args(["index", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--rebuild"))
+            .and(predicate::str::contains("--status")),
+    );
+}
+
+#[test]
+fn help_shows_index_subcommand() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("index"),
+    );
+}
+
+#[test]
+fn index_build_creates_index_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let event = sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Indexed")
+                .and(predicate::str::contains("1 new event(s)"))
+                .and(predicate::str::contains("1 total")),
+        );
+
+    // Verify index file was created
+    let idx_path = format!("{}.idx.sqlite", path.display());
+    assert!(std::path::Path::new(&idx_path).exists(), "index file should be created");
+}
+
+#[test]
+fn index_status_shows_health() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network"),
+        sample_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build first
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Check status
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap(), "--status"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Events:")
+                .and(predicate::str::contains("2"))
+                .and(predicate::str::contains("current")),
+        );
+}
+
+#[test]
+fn index_rebuild_reindexes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let event = sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    // Build
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Rebuild
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap(), "--rebuild"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("1 new event(s)"));
+}
+
+#[test]
+fn query_with_index_returns_same_results() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build index
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Query with index (--severity high should return only the evasion event)
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--severity", "high"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bbbbbbbb")
+                .and(predicate::str::contains("aaaaaaaa").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched (indexed)"));
+}
+
+#[test]
+fn query_no_index_forces_scan() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build index
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Query with --no-index should use full scan (no "(indexed)" in output)
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--severity", "high", "--no-index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bbbbbbbb"))
+        .stderr(
+            predicate::str::contains("1 event(s) matched")
+                .and(predicate::str::contains("indexed").not()),
+        );
+}
+
+#[test]
+fn query_no_index_flag_shown_in_help() {
+    cmd().args(["query", "--help"]).assert().success().stdout(
+        predicate::str::contains("--no-index"),
+    );
+    cmd().args(["explain", "--help"]).assert().success().stdout(
+        predicate::str::contains("--no-index"),
+    );
+    cmd().args(["bundle", "--help"]).assert().success().stdout(
+        predicate::str::contains("--no-index"),
+    );
+}

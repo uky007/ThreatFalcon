@@ -11,7 +11,8 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
-use crate::events::{EventCategory, EventData, ThreatEvent};
+use crate::events::{EventCategory, EventData, Severity, ThreatEvent};
+use crate::index;
 
 /// Investigation subcommands for local JSONL analysis.
 #[derive(Subcommand)]
@@ -61,6 +62,10 @@ pub enum Command {
         /// Maximum number of results (default: 100)
         #[arg(long, default_value = "100")]
         limit: usize,
+
+        /// Skip the SQLite index and force a full JSONL scan
+        #[arg(long)]
+        no_index: bool,
     },
 
     /// Explain an event with its process context timeline
@@ -80,6 +85,10 @@ pub enum Command {
         /// Output as structured JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+
+        /// Skip the SQLite index and force a full JSONL scan
+        #[arg(long)]
+        no_index: bool,
     },
 
     /// Bundle an event and related context into a single JSON document
@@ -99,6 +108,25 @@ pub enum Command {
         /// Output file path (default: stdout)
         #[arg(long, value_name = "PATH")]
         output: Option<PathBuf>,
+
+        /// Skip the SQLite index and force a full JSONL scan
+        #[arg(long)]
+        no_index: bool,
+    },
+
+    /// Build or manage the SQLite index for fast event lookups
+    Index {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Force a full rebuild (drop and recreate)
+        #[arg(long)]
+        rebuild: bool,
+
+        /// Show index health and coverage status
+        #[arg(long)]
+        status: bool,
     },
 }
 
@@ -117,6 +145,7 @@ pub fn run(command: Command) -> Result<()> {
             from,
             to,
             limit,
+            no_index,
         } => {
             let from = from
                 .map(|s| parse_datetime(&s))
@@ -143,7 +172,7 @@ pub fn run(command: Command) -> Result<()> {
                 to,
             };
 
-            run_query(&input, &filter, limit)
+            run_query(&input, &filter, limit, no_index)
         }
 
         Command::Explain {
@@ -151,14 +180,22 @@ pub fn run(command: Command) -> Result<()> {
             input,
             window,
             json,
-        } => run_explain(&input, &event, window, json),
+            no_index,
+        } => run_explain(&input, &event, window, json, no_index),
 
         Command::Bundle {
             event,
             input,
             window,
             output,
-        } => run_bundle(&input, &event, window, output.as_deref()),
+            no_index,
+        } => run_bundle(&input, &event, window, output.as_deref(), no_index),
+
+        Command::Index {
+            input,
+            rebuild,
+            status,
+        } => run_index(&input, rebuild, status),
     }
 }
 
@@ -179,6 +216,21 @@ struct QueryFilter {
 }
 
 impl QueryFilter {
+    /// Convert CLI filter to an index-compatible filter for SQL queries.
+    fn to_index_filter(&self, limit: Option<usize>) -> index::IndexFilter {
+        index::IndexFilter {
+            pid: self.pid,
+            process_key: self.process_key.clone(),
+            category: self.category.clone(),
+            rule_id: self.rule_id.clone(),
+            source_type: self.source.clone(),
+            min_severity_ord: self.severity.map(severity_ord),
+            from: self.from.map(|dt| dt.to_rfc3339()),
+            to: self.to.map(|dt| dt.to_rfc3339()),
+            limit,
+        }
+    }
+
     fn matches(&self, event: &ThreatEvent) -> bool {
         if let Some(ref from) = self.from {
             if event.timestamp < *from {
@@ -243,10 +295,30 @@ impl QueryFilter {
     }
 }
 
-fn run_query(input: &Path, filter: &QueryFilter, limit: usize) -> Result<()> {
+fn run_query(input: &Path, filter: &QueryFilter, limit: usize, no_index: bool) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let mut count = 0;
 
+    // Try index-accelerated query if applicable
+    if !no_index && filter.contains.is_none() {
+        if let Some(idx) = index::try_open_and_update(input)? {
+            let idx_filter = filter.to_index_filter(Some(limit));
+            let locations = idx.query_locations(&idx_filter)?;
+            let events = index::fetch_events(input, &locations)?;
+            for event in &events {
+                if filter.matches(event) {
+                    if let Ok(json) = serde_json::to_string(event) {
+                        let _ = writeln!(stdout, "{json}");
+                    }
+                    count += 1;
+                }
+            }
+            eprintln!("{count} event(s) matched (indexed)");
+            return Ok(());
+        }
+    }
+
+    // Fallback: full JSONL scan
     for_each_event(input, |event| {
         if count >= limit {
             return false; // stop iteration
@@ -283,7 +355,15 @@ struct ExplainOutput {
     rule: Option<crate::events::RuleMetadata>,
 }
 
-fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool) -> Result<()> {
+fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_index: bool) -> Result<()> {
+    // Try index-accelerated lookup
+    if !no_index {
+        if let Some(idx) = index::try_open_and_update(input)? {
+            return run_explain_indexed(input, &idx, event_id, window_mins, json);
+        }
+    }
+
+    // Fallback: full JSONL scan
     let events = read_all_events(input)?;
     let target = find_event(&events, event_id)?;
 
@@ -461,7 +541,16 @@ fn run_bundle(
     event_id: &str,
     window_mins: u64,
     output: Option<&Path>,
+    no_index: bool,
 ) -> Result<()> {
+    // Try index-accelerated lookup
+    if !no_index {
+        if let Some(idx) = index::try_open_and_update(input)? {
+            return run_bundle_indexed(input, &idx, event_id, window_mins, output);
+        }
+    }
+
+    // Fallback: full JSONL scan
     let events = read_all_events(input)?;
     let target = find_event(&events, event_id)?.clone();
 
@@ -629,8 +718,301 @@ fn write_bundle_zip(path: &Path, bundle: &EvidenceBundle) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Index subcommand
+// ---------------------------------------------------------------------------
+
+fn run_index(input: &Path, rebuild: bool, status: bool) -> Result<()> {
+    let idx = index::EventIndex::open(input)?;
+
+    if status {
+        let st = idx.status(input)?;
+        eprintln!("Index:      {}", index::index_path_for(input).display());
+        eprintln!("Events:     {}", st.event_count);
+        eprintln!("Indexed to: {} / {} bytes", st.indexed_up_to, st.jsonl_size);
+        eprintln!(
+            "Status:     {}",
+            if st.is_current { "current" } else { "stale" }
+        );
+        return Ok(());
+    }
+
+    let stats = if rebuild {
+        idx.rebuild(input)?
+    } else {
+        idx.build(input)?
+    };
+
+    eprintln!(
+        "Indexed {} new event(s), {} total in {}",
+        stats.new_events,
+        stats.total_events,
+        index::index_path_for(input).display()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Index-accelerated explain
+// ---------------------------------------------------------------------------
+
+fn run_explain_indexed(
+    input: &Path,
+    idx: &index::EventIndex,
+    event_id: &str,
+    window_mins: u64,
+    json: bool,
+) -> Result<()> {
+    // Find target event by ID
+    let target_locs = idx.find_by_id(event_id)?;
+    let target = match target_locs.len() {
+        0 => return Err(anyhow::anyhow!("event not found: {event_id}")),
+        1 => {
+            let events = index::fetch_events(input, &target_locs)?;
+            events.into_iter().next().unwrap()
+        }
+        n => {
+            return Err(anyhow::anyhow!(
+                "ambiguous event ID prefix '{event_id}' matches {n} events"
+            ))
+        }
+    };
+
+    // Find related events by process_key within window
+    let process_key = target
+        .process_context
+        .as_ref()
+        .map(|c| c.process_key.as_str());
+    let window = chrono::Duration::minutes(window_mins as i64);
+    let t_start = target.timestamp - window;
+    let t_end = target.timestamp + window;
+
+    let mut timeline = if let Some(key) = process_key {
+        let locs = idx.find_by_process_key(
+            key,
+            &t_start.to_rfc3339(),
+            &t_end.to_rfc3339(),
+        )?;
+        index::fetch_events(input, &locs)?
+    } else {
+        vec![]
+    };
+    timeline.sort_by_key(|e| e.timestamp);
+
+    if json {
+        let script_activity = build_script_activity_from(&target, &timeline, window_mins);
+        let output = ExplainOutput {
+            target_event: target.clone(),
+            window_minutes: window_mins,
+            process_key: process_key.map(|s| s.to_string()),
+            timeline,
+            script_amsi_activity: script_activity,
+            rule: target.rule.clone(),
+        };
+        let json_str = serde_json::to_string_pretty(&output)?;
+        println!("{json_str}");
+        return Ok(());
+    }
+
+    // Human-readable output (reuse existing formatting)
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "=== Target Event ===")?;
+    print_event_detail(&mut stdout, &target)?;
+
+    if let Some(key) = process_key {
+        writeln!(
+            stdout,
+            "\n=== Process Timeline (process_key: {key}, ±{window_mins} min, {} events) ===",
+            timeline.len()
+        )?;
+        for evt in &timeline {
+            let marker = if evt.id == target.id { ">" } else { " " };
+            writeln!(
+                stdout,
+                "{marker} {}  {:9} {}",
+                evt.timestamp.format("%H:%M:%S%.3fZ"),
+                category_short(&evt.category),
+                event_summary(&evt.data),
+            )?;
+        }
+    } else {
+        writeln!(stdout, "\nNo process_context — cannot build timeline.")?;
+    }
+
+    // Script / AMSI correlation
+    if is_script_related(&target.data) {
+        let activity = build_script_activity_from(&target, &timeline, window_mins);
+        if !activity.is_empty() {
+            let amsi_count = activity
+                .iter()
+                .filter(|e| matches!(e.data, EventData::AmsiScan { .. }))
+                .count();
+            let script_count = activity
+                .iter()
+                .filter(|e| matches!(e.data, EventData::ScriptBlock { .. }))
+                .count();
+            let detected_count = activity
+                .iter()
+                .filter(|e| matches!(&e.data, EventData::AmsiScan { scan_result, .. } if *scan_result >= 32768))
+                .count();
+
+            writeln!(
+                stdout,
+                "\n=== Script / AMSI Activity ({script_count} script block(s), \
+                 {amsi_count} scan(s), {detected_count} detected) ==="
+            )?;
+
+            for evt in &activity {
+                let marker = if evt.id == target.id { ">" } else { " " };
+                writeln!(
+                    stdout,
+                    "{marker} {}  {}",
+                    evt.timestamp.format("%H:%M:%S%.3fZ"),
+                    event_summary(&evt.data),
+                )?;
+            }
+        }
+    }
+
+    // Rule
+    if let Some(ref rule) = target.rule {
+        writeln!(stdout, "\n=== Detection Rule ===")?;
+        writeln!(stdout, "  ID:          {}", rule.id)?;
+        writeln!(stdout, "  Name:        {}", rule.name)?;
+        writeln!(stdout, "  Description: {}", rule.description)?;
+        writeln!(
+            stdout,
+            "  MITRE:       {} / {} ({})",
+            rule.mitre.tactic, rule.mitre.technique_id, rule.mitre.technique_name
+        )?;
+        writeln!(stdout, "  Confidence:  {:?}", rule.confidence)?;
+        for e in &rule.evidence {
+            writeln!(stdout, "  Evidence:    {e}")?;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Index-accelerated bundle
+// ---------------------------------------------------------------------------
+
+fn run_bundle_indexed(
+    input: &Path,
+    idx: &index::EventIndex,
+    event_id: &str,
+    window_mins: u64,
+    output: Option<&Path>,
+) -> Result<()> {
+    // Find target event by ID
+    let target_locs = idx.find_by_id(event_id)?;
+    let target = match target_locs.len() {
+        0 => return Err(anyhow::anyhow!("event not found: {event_id}")),
+        1 => {
+            let events = index::fetch_events(input, &target_locs)?;
+            events.into_iter().next().unwrap()
+        }
+        n => {
+            return Err(anyhow::anyhow!(
+                "ambiguous event ID prefix '{event_id}' matches {n} events"
+            ))
+        }
+    };
+
+    let process_key = target
+        .process_context
+        .as_ref()
+        .map(|c| c.process_key.clone());
+
+    let mut related = if let Some(ref key) = process_key {
+        let window = chrono::Duration::minutes(window_mins as i64);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
+        let locs = idx.find_by_process_key(
+            key,
+            &t_start.to_rfc3339(),
+            &t_end.to_rfc3339(),
+        )?;
+        let mut events = index::fetch_events(input, &locs)?;
+        events.retain(|e| e.id != target.id);
+        events
+    } else {
+        vec![]
+    };
+    related.sort_by_key(|e| e.timestamp);
+
+    let bundle = EvidenceBundle {
+        bundle_version: 1,
+        created_at: Utc::now(),
+        target_event_id: target.id.to_string(),
+        event_count: 1 + related.len(),
+        process_key,
+        window_minutes: window_mins,
+        target_event: target,
+        related_events: related,
+    };
+
+    match output {
+        Some(path) if is_zip_extension(path) => {
+            write_bundle_zip(path, &bundle)?;
+            eprintln!(
+                "Bundle written to {} ({} events, zip)",
+                path.display(),
+                bundle.event_count
+            );
+        }
+        Some(path) => {
+            let json = serde_json::to_string_pretty(&bundle)?;
+            std::fs::write(path, &json)
+                .with_context(|| format!("failed to write bundle to {}", path.display()))?;
+            eprintln!(
+                "Bundle written to {} ({} events)",
+                path.display(),
+                bundle.event_count
+            );
+        }
+        None => {
+            let json = serde_json::to_string_pretty(&bundle)?;
+            println!("{json}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Build script/AMSI activity from an already-fetched timeline slice
+/// (used by index-accelerated explain).
+fn build_script_activity_from(
+    target: &ThreatEvent,
+    timeline: &[ThreatEvent],
+    _window_mins: u64,
+) -> Vec<ThreatEvent> {
+    if !is_script_related(&target.data) {
+        return vec![];
+    }
+    let mut result: Vec<ThreatEvent> = timeline
+        .iter()
+        .filter(|e| is_script_or_amsi(&e.data))
+        .cloned()
+        .collect();
+    result.sort_by_key(|e| e.timestamp);
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Map severity to a numeric ordering for index queries.
+fn severity_ord(sev: Severity) -> i32 {
+    match sev {
+        Severity::Info => 0,
+        Severity::Low => 1,
+        Severity::Medium => 2,
+        Severity::High => 3,
+        Severity::Critical => 4,
+    }
+}
 
 /// Parse a severity level string (case-insensitive).
 fn parse_severity(s: &str) -> Result<crate::events::Severity> {
@@ -1492,7 +1874,7 @@ mod tests {
         let output_path = dir.path().join("bundle.json");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&output_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&output_path), false).unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
@@ -1515,7 +1897,7 @@ mod tests {
         let output_path = dir.path().join("bundle.json");
 
         let event_id = events[0].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&output_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&output_path), false).unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
@@ -1720,7 +2102,7 @@ mod tests {
         let path = write_events(&dir, &[evt_b.clone(), evt_a.clone(), evt_c.clone()]);
         let output_path = dir.path().join("bundle.json");
 
-        run_bundle(&path, &evt_b.id.to_string(), 5, Some(&output_path)).unwrap();
+        run_bundle(&path, &evt_b.id.to_string(), 5, Some(&output_path), false).unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
@@ -2117,7 +2499,7 @@ mod tests {
         let zip_path = dir.path().join("bundle.zip");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
 
         // Open and verify the zip
         let file = std::fs::File::open(&zip_path).unwrap();
@@ -2150,7 +2532,7 @@ mod tests {
         let zip_path = dir.path().join("out.zip");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -2176,7 +2558,7 @@ mod tests {
         let zip_path = dir.path().join("target.zip");
 
         let event_id = events[0].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -2202,7 +2584,7 @@ mod tests {
 
         // Target is events[1]; related should be events[0] and events[2]
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -2235,8 +2617,8 @@ mod tests {
         let json_path = dir.path().join("full.json");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&json_path)).unwrap();
-        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&json_path), false).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
 
         // Read bundle.json from the zip
         let file = std::fs::File::open(&zip_path).unwrap();
@@ -2271,7 +2653,7 @@ mod tests {
         let out_path = dir.path().join("bundle.json");
 
         let event_id = events[0].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&out_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&out_path), false).unwrap();
 
         // Should be plain JSON, not a zip
         let content = std::fs::read_to_string(&out_path).unwrap();
@@ -2660,7 +3042,7 @@ mod tests {
         let path = write_events(&dir, &[evt_a, evt_b.clone()]);
         let zip_path = dir.path().join("range.zip");
 
-        run_bundle(&path, &evt_b.id.to_string(), 10, Some(&zip_path)).unwrap();
+        run_bundle(&path, &evt_b.id.to_string(), 10, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
