@@ -760,10 +760,10 @@ mod platform {
             .unwrap_or_else(|_| r"C:\Windows".to_string())
             .to_ascii_lowercase();
 
-        path_lower.starts_with(&format!(r"{}\system32\", sys_root))
-            || path_lower.starts_with(
-                &format!(r"{}\syswow64\", sys_root),
-            )
+        let basename_lower = basename.to_ascii_lowercase();
+        path_lower == format!(r"{}\system32\{}", sys_root, basename_lower)
+            || path_lower
+                == format!(r"{}\syswow64\{}", sys_root, basename_lower)
     }
 
     /// Maximum bytes to read from a remote module's .text section.
@@ -886,30 +886,110 @@ mod platform {
 
     /// Read the .text section of a remote module by parsing its PE
     /// headers from the target process's memory.  Returns `(bytes, rva)`.
+    ///
+    /// Uses a two-pass approach: first reads the DOS header to locate
+    /// the PE signature (e_lfanew), then computes the exact header size
+    /// needed for COFF + optional header + all section headers, and
+    /// reads that amount.  This handles PEs with large DOS stubs or
+    /// many sections that would exceed a fixed 4 KB buffer.
     fn read_remote_text_section(
         handle: HANDLE,
         module_base: usize,
     ) -> Option<(Vec<u8>, u32)> {
-        // Read the first 4096 bytes — enough for DOS + PE + COFF +
-        // optional header + section headers in all practical cases.
-        const HEADER_READ: usize = 4096;
-        let mut header_buf = [0u8; HEADER_READ];
+        // Pass 1: read the DOS header (64 bytes) to learn e_lfanew.
+        const DOS_HEADER_SIZE: usize = 64;
+        let mut dos_buf = [0u8; DOS_HEADER_SIZE];
         let mut read = 0usize;
         unsafe {
             ReadProcessMemory(
                 handle,
                 module_base as *const std::ffi::c_void,
-                header_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                HEADER_READ,
+                dos_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                DOS_HEADER_SIZE,
                 Some(&mut read),
             )
             .ok()?;
         }
-        if read < 64 {
+        if read < DOS_HEADER_SIZE {
+            return None;
+        }
+        // Validate MZ signature
+        if dos_buf[0] != b'M' || dos_buf[1] != b'Z' {
+            return None;
+        }
+        let e_lfanew =
+            u32::from_le_bytes(dos_buf[60..64].try_into().ok()?) as usize;
+        if e_lfanew < 4 {
             return None;
         }
 
-        let pe = crate::pe::PeHeaders::parse(&header_buf[..read])?;
+        // Pass 2: read enough to parse COFF header (to learn
+        // num_sections and optional-header size), then compute the
+        // full header extent.
+        //
+        // PE sig (4) + COFF (20) = 24 bytes after e_lfanew gives us
+        // NumberOfSections and SizeOfOptionalHeader.
+        const PE_SIG_COFF: usize = 4 + 20; // PE\0\0 + COFF header
+        let coff_end = e_lfanew + PE_SIG_COFF;
+        // Read from start through the COFF header (so offsets remain
+        // consistent with the full header buffer we'll build).
+        let mut probe_buf = vec![0u8; coff_end];
+        let mut probe_read = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                module_base as *const std::ffi::c_void,
+                probe_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                coff_end,
+                Some(&mut probe_read),
+            )
+            .ok()?;
+        }
+        if probe_read < coff_end {
+            return None;
+        }
+
+        // NumberOfSections: COFF offset 2..4
+        let num_sections = u16::from_le_bytes(
+            probe_buf[e_lfanew + 6..e_lfanew + 8].try_into().ok()?,
+        ) as usize;
+        // SizeOfOptionalHeader: COFF offset 16..18
+        let opt_header_size = u16::from_le_bytes(
+            probe_buf[e_lfanew + 20..e_lfanew + 22].try_into().ok()?,
+        ) as usize;
+
+        // Full headers = everything up to the end of the section table.
+        // Section table starts right after the optional header.
+        const SECTION_ENTRY_SIZE: usize = 40;
+        let headers_needed = e_lfanew
+            + PE_SIG_COFF
+            + opt_header_size
+            + num_sections * SECTION_ENTRY_SIZE;
+
+        // Sanity cap: PE headers shouldn't exceed ~1 MB in practice.
+        if headers_needed > 1024 * 1024 {
+            return None;
+        }
+
+        // Pass 3: read the complete headers.
+        let mut header_buf = vec![0u8; headers_needed];
+        let mut header_read = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                module_base as *const std::ffi::c_void,
+                header_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                headers_needed,
+                Some(&mut header_read),
+            )
+            .ok()?;
+        }
+        if header_read < headers_needed {
+            return None;
+        }
+
+        let pe =
+            crate::pe::PeHeaders::parse(&header_buf[..header_read])?;
         let text = pe.text_section()?;
 
         // Validate: only read sections that are actually code
