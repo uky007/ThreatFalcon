@@ -1,0 +1,1236 @@
+//! Local investigation CLI: query, explain, and bundle events from JSONL files.
+//!
+//! These commands read existing JSONL telemetry output and provide quick
+//! investigation workflows without requiring an external SIEM or database.
+
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use clap::Subcommand;
+use serde::{Deserialize, Serialize};
+
+use crate::events::{EventCategory, EventData, ThreatEvent};
+
+/// Investigation subcommands for local JSONL analysis.
+#[derive(Subcommand)]
+pub enum Command {
+    /// Query events from a JSONL telemetry file
+    Query {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Filter by process ID
+        #[arg(long)]
+        pid: Option<u32>,
+
+        /// Filter by process_key (e.g., "1234:133579284000000000")
+        #[arg(long)]
+        process_key: Option<String>,
+
+        /// Filter by event category (Process, Network, File, Registry, Dns, etc.)
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Filter by detection rule ID (e.g., "TF-EVA-001")
+        #[arg(long)]
+        rule_id: Option<String>,
+
+        /// Only events after this timestamp (RFC 3339, e.g., "2026-03-13T00:00:00Z")
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Maximum number of results (default: 100)
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+
+    /// Explain an event with its process context timeline
+    Explain {
+        /// Event ID (UUID) to investigate
+        #[arg(long, value_name = "ID")]
+        event: String,
+
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Time window in minutes around the target event (default: 5)
+        #[arg(long, default_value = "5")]
+        window: u64,
+    },
+
+    /// Bundle an event and related context into a single JSON document
+    Bundle {
+        /// Event ID (UUID) to investigate
+        #[arg(long, value_name = "ID")]
+        event: String,
+
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Time window in minutes around the target event (default: 5)
+        #[arg(long, default_value = "5")]
+        window: u64,
+
+        /// Output file path (default: stdout)
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+}
+
+/// Run an investigation subcommand.
+pub fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Query {
+            input,
+            pid,
+            process_key,
+            category,
+            rule_id,
+            since,
+            limit,
+        } => {
+            let since = since
+                .map(|s| parse_datetime(&s))
+                .transpose()
+                .context("invalid --since value")?;
+
+            let filter = QueryFilter {
+                pid,
+                process_key,
+                category,
+                rule_id,
+                since,
+            };
+
+            run_query(&input, &filter, limit)
+        }
+
+        Command::Explain {
+            event,
+            input,
+            window,
+        } => run_explain(&input, &event, window),
+
+        Command::Bundle {
+            event,
+            input,
+            window,
+            output,
+        } => run_bundle(&input, &event, window, output.as_deref()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query
+// ---------------------------------------------------------------------------
+
+struct QueryFilter {
+    pid: Option<u32>,
+    process_key: Option<String>,
+    category: Option<String>,
+    rule_id: Option<String>,
+    since: Option<DateTime<Utc>>,
+}
+
+impl QueryFilter {
+    fn matches(&self, event: &ThreatEvent) -> bool {
+        if let Some(since) = &self.since {
+            if event.timestamp < *since {
+                return false;
+            }
+        }
+
+        if let Some(pid) = self.pid {
+            if event_pid(&event.data) != Some(pid) {
+                return false;
+            }
+        }
+
+        if let Some(ref key) = self.process_key {
+            let event_key = event
+                .process_context
+                .as_ref()
+                .map(|c| c.process_key.as_str());
+            if event_key != Some(key.as_str()) {
+                return false;
+            }
+        }
+
+        if let Some(ref cat) = self.category {
+            if !category_matches(&event.category, cat) {
+                return false;
+            }
+        }
+
+        if let Some(ref rule_id) = self.rule_id {
+            let has_rule = event.rule.as_ref().map(|r| r.id.as_str()) == Some(rule_id.as_str());
+            if !has_rule {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn run_query(input: &Path, filter: &QueryFilter, limit: usize) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    let mut count = 0;
+
+    for_each_event(input, |event| {
+        if count >= limit {
+            return false; // stop iteration
+        }
+        if filter.matches(&event) {
+            // Output as JSONL for pipeability
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = writeln!(stdout, "{json}");
+            }
+            count += 1;
+        }
+        true // continue
+    })?;
+
+    eprintln!("{count} event(s) matched");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Explain
+// ---------------------------------------------------------------------------
+
+fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
+    let events = read_all_events(input)?;
+    let target = find_event(&events, event_id)?;
+
+    let mut stdout = std::io::stdout().lock();
+
+    // --- Target event ---
+    writeln!(stdout, "=== Target Event ===")?;
+    print_event_detail(&mut stdout, target)?;
+
+    // --- Process timeline ---
+    let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
+
+    if let Some(key) = process_key {
+        let window = chrono::Duration::minutes(window_mins as i64);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
+
+        let related: Vec<&ThreatEvent> = events
+            .iter()
+            .filter(|e| {
+                e.process_context
+                    .as_ref()
+                    .map(|c| c.process_key.as_str())
+                    == Some(key)
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
+            })
+            .collect();
+
+        writeln!(
+            stdout,
+            "\n=== Process Timeline (process_key: {key}, ±{window_mins} min, {} events) ===",
+            related.len()
+        )?;
+
+        for evt in &related {
+            let marker = if evt.id == target.id { ">" } else { " " };
+            writeln!(
+                stdout,
+                "{marker} {}  {:9} {}",
+                evt.timestamp.format("%H:%M:%S%.3fZ"),
+                category_short(&evt.category),
+                event_summary(&evt.data),
+            )?;
+        }
+    } else {
+        writeln!(stdout, "\nNo process_context — cannot build timeline.")?;
+    }
+
+    // --- Rule ---
+    if let Some(ref rule) = target.rule {
+        writeln!(stdout, "\n=== Detection Rule ===")?;
+        writeln!(stdout, "  ID:          {}", rule.id)?;
+        writeln!(stdout, "  Name:        {}", rule.name)?;
+        writeln!(stdout, "  Description: {}", rule.description)?;
+        writeln!(
+            stdout,
+            "  MITRE:       {} / {} ({})",
+            rule.mitre.tactic, rule.mitre.technique_id, rule.mitre.technique_name
+        )?;
+        writeln!(stdout, "  Confidence:  {:?}", rule.confidence)?;
+        for e in &rule.evidence {
+            writeln!(stdout, "  Evidence:    {e}")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn print_event_detail(w: &mut impl Write, event: &ThreatEvent) -> Result<()> {
+    writeln!(w, "  ID:       {}", event.id)?;
+    writeln!(w, "  Time:     {}", event.timestamp.to_rfc3339())?;
+    writeln!(w, "  Category: {}", category_short(&event.category))?;
+    writeln!(w, "  Severity: {:?}", event.severity)?;
+    writeln!(w, "  Source:   {}", source_display(&event.source))?;
+    writeln!(w, "  Host:     {}", event.hostname)?;
+
+    if let Some(ref ctx) = event.process_context {
+        writeln!(w, "  Process:")?;
+        writeln!(w, "    key:        {}", ctx.process_key)?;
+        if let Some(ref p) = ctx.image_path {
+            writeln!(w, "    image:      {p}")?;
+        }
+        if let Some(ref c) = ctx.command_line {
+            writeln!(w, "    cmdline:    {c}")?;
+        }
+        if let Some(ref u) = ctx.user {
+            writeln!(w, "    user:       {u}")?;
+        }
+        if let Some(ref il) = ctx.integrity_level {
+            writeln!(w, "    integrity:  {il}")?;
+        }
+        if let Some(ppid) = ctx.ppid {
+            writeln!(w, "    ppid:       {ppid}")?;
+        }
+    }
+
+    writeln!(w, "  Data:     {}", event_summary(&event.data))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bundle
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+struct EvidenceBundle {
+    bundle_version: u32,
+    created_at: DateTime<Utc>,
+    target_event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_key: Option<String>,
+    window_minutes: u64,
+    event_count: usize,
+    target_event: ThreatEvent,
+    related_events: Vec<ThreatEvent>,
+}
+
+fn run_bundle(
+    input: &Path,
+    event_id: &str,
+    window_mins: u64,
+    output: Option<&Path>,
+) -> Result<()> {
+    let events = read_all_events(input)?;
+    let target = find_event(&events, event_id)?.clone();
+
+    let process_key = target
+        .process_context
+        .as_ref()
+        .map(|c| c.process_key.clone());
+
+    let related: Vec<ThreatEvent> = if let Some(ref key) = process_key {
+        let window = chrono::Duration::minutes(window_mins as i64);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
+
+        events
+            .into_iter()
+            .filter(|e| {
+                e.id != target.id
+                    && e.process_context
+                        .as_ref()
+                        .map(|c| c.process_key.as_str())
+                        == Some(key.as_str())
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let bundle = EvidenceBundle {
+        bundle_version: 1,
+        created_at: Utc::now(),
+        target_event_id: target.id.to_string(),
+        event_count: 1 + related.len(),
+        process_key,
+        window_minutes: window_mins,
+        target_event: target,
+        related_events: related,
+    };
+
+    let json = serde_json::to_string_pretty(&bundle)?;
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &json)
+                .with_context(|| format!("failed to write bundle to {}", path.display()))?;
+            eprintln!(
+                "Bundle written to {} ({} events)",
+                path.display(),
+                bundle.event_count
+            );
+        }
+        None => {
+            println!("{json}");
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Parse an RFC 3339 datetime string.
+fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| anyhow::anyhow!("expected RFC 3339 datetime (e.g., 2026-03-13T00:00:00Z): {e}"))
+}
+
+/// Iterate over events in a JSONL file. The callback returns `true` to
+/// continue or `false` to stop early.
+fn for_each_event(path: &Path, mut f: impl FnMut(ThreatEvent) -> bool) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Skip lines that don't parse — JSONL files may have partial writes
+        if let Ok(event) = serde_json::from_str::<ThreatEvent>(&line) {
+            if !f(event) {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Read all events from a JSONL file into memory.
+fn read_all_events(path: &Path) -> Result<Vec<ThreatEvent>> {
+    let mut events = Vec::new();
+    for_each_event(path, |event| {
+        events.push(event);
+        true
+    })?;
+    Ok(events)
+}
+
+/// Find an event by ID (prefix match supported).
+fn find_event<'a>(events: &'a [ThreatEvent], id: &str) -> Result<&'a ThreatEvent> {
+    // Try exact match first
+    if let Some(event) = events.iter().find(|e| e.id.to_string() == id) {
+        return Ok(event);
+    }
+
+    // Try prefix match (e.g., "a1b2c3d4" matches "a1b2c3d4-e5f6-...")
+    let matches: Vec<&ThreatEvent> = events
+        .iter()
+        .filter(|e| e.id.to_string().starts_with(id))
+        .collect();
+
+    match matches.len() {
+        0 => Err(anyhow::anyhow!("event not found: {id}")),
+        1 => Ok(matches[0]),
+        n => Err(anyhow::anyhow!(
+            "ambiguous event ID prefix '{id}' matches {n} events"
+        )),
+    }
+}
+
+/// Extract PID from any EventData variant.
+fn event_pid(data: &EventData) -> Option<u32> {
+    match data {
+        EventData::ProcessCreate { pid, .. }
+        | EventData::ProcessTerminate { pid, .. }
+        | EventData::FileCreate { pid, .. }
+        | EventData::FileDelete { pid, .. }
+        | EventData::NetworkConnect { pid, .. }
+        | EventData::RegistryEvent { pid, .. }
+        | EventData::ImageLoad { pid, .. }
+        | EventData::DnsQuery { pid, .. }
+        | EventData::ScriptBlock { pid, .. }
+        | EventData::AmsiScan { pid, .. }
+        | EventData::PipeEvent { pid, .. } => Some(*pid),
+        EventData::EvasionDetected { pid, .. } => *pid,
+        EventData::CreateRemoteThread { source_pid, .. } => Some(*source_pid),
+        EventData::ProcessAccess { source_pid, .. } => Some(*source_pid),
+        EventData::SensorHealth { .. } => None,
+    }
+}
+
+/// Case-insensitive category match.
+fn category_matches(category: &EventCategory, filter: &str) -> bool {
+    category_short(category).eq_ignore_ascii_case(filter)
+}
+
+/// Short display string for EventCategory.
+fn category_short(cat: &EventCategory) -> &'static str {
+    match cat {
+        EventCategory::Process => "Process",
+        EventCategory::File => "File",
+        EventCategory::Network => "Network",
+        EventCategory::Registry => "Registry",
+        EventCategory::ImageLoad => "ImageLoad",
+        EventCategory::Dns => "Dns",
+        EventCategory::Evasion => "Evasion",
+        EventCategory::Script => "Script",
+        EventCategory::Health => "Health",
+    }
+}
+
+/// Display string for EventSource.
+fn source_display(source: &crate::events::EventSource) -> String {
+    match source {
+        crate::events::EventSource::Etw { provider } => format!("ETW / {provider}"),
+        crate::events::EventSource::Sysmon { event_id } => format!("Sysmon / event {event_id}"),
+        crate::events::EventSource::EvasionDetector => "EvasionDetector".into(),
+        crate::events::EventSource::Sensor => "Sensor".into(),
+    }
+}
+
+/// One-line summary of an EventData variant for timeline display.
+fn event_summary(data: &EventData) -> String {
+    match data {
+        EventData::ProcessCreate {
+            pid,
+            image_path,
+            command_line,
+            ..
+        } => {
+            let cmd = truncate(command_line, 80);
+            format!("ProcessCreate     pid:{pid} {image_path} {cmd}")
+        }
+        EventData::ProcessTerminate {
+            pid, image_path, ..
+        } => {
+            format!("ProcessTerminate  pid:{pid} {image_path}")
+        }
+        EventData::FileCreate {
+            pid,
+            path,
+            operation,
+            ..
+        } => {
+            format!("FileCreate        pid:{pid} {operation:?} {path}")
+        }
+        EventData::FileDelete { pid, path, .. } => {
+            format!("FileDelete        pid:{pid} {path}")
+        }
+        EventData::NetworkConnect {
+            pid,
+            protocol,
+            dst_addr,
+            dst_port,
+            ..
+        } => {
+            format!("NetworkConnect    pid:{pid} {protocol} -> {dst_addr}:{dst_port}")
+        }
+        EventData::RegistryEvent {
+            pid,
+            operation,
+            key,
+            ..
+        } => {
+            let k = truncate(key, 60);
+            format!("RegistryEvent     pid:{pid} {operation:?} {k}")
+        }
+        EventData::ImageLoad {
+            pid,
+            image_name,
+            signed,
+            ..
+        } => {
+            let sig = if *signed { "signed" } else { "unsigned" };
+            format!("ImageLoad         pid:{pid} {image_name} ({sig})")
+        }
+        EventData::DnsQuery {
+            pid,
+            query_name,
+            query_type,
+            ..
+        } => {
+            format!("DnsQuery          pid:{pid} {query_name} ({query_type})")
+        }
+        EventData::ScriptBlock {
+            pid,
+            script_engine,
+            ..
+        } => {
+            format!("ScriptBlock       pid:{pid} {script_engine}")
+        }
+        EventData::AmsiScan {
+            pid,
+            app_name,
+            scan_result,
+            ..
+        } => {
+            format!("AmsiScan          pid:{pid} {app_name} result:{scan_result}")
+        }
+        EventData::EvasionDetected {
+            technique,
+            pid,
+            details,
+            ..
+        } => {
+            let p = pid.map(|p| format!("pid:{p} ")).unwrap_or_default();
+            let d = truncate(details, 60);
+            format!("EvasionDetected   {p}{technique:?} {d}")
+        }
+        EventData::CreateRemoteThread {
+            source_pid,
+            target_pid,
+            ..
+        } => {
+            format!("CreateRemoteThread {source_pid} -> {target_pid}")
+        }
+        EventData::ProcessAccess {
+            source_pid,
+            target_pid,
+            granted_access,
+            ..
+        } => {
+            format!("ProcessAccess     {source_pid} -> {target_pid} (0x{granted_access:X})")
+        }
+        EventData::PipeEvent {
+            pid,
+            pipe_name,
+            operation,
+            ..
+        } => {
+            format!("PipeEvent         pid:{pid} {operation:?} {pipe_name}")
+        }
+        EventData::SensorHealth {
+            uptime_secs,
+            events_total,
+            ..
+        } => {
+            format!("SensorHealth      uptime:{uptime_secs}s events:{events_total}")
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::*;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn test_agent() -> AgentInfo {
+        AgentInfo {
+            hostname: "TEST".into(),
+            agent_id: Uuid::nil(),
+        }
+    }
+
+    /// Write events as JSONL to a temp file, return the path.
+    fn write_events(dir: &TempDir, events: &[ThreatEvent]) -> PathBuf {
+        let path = dir.path().join("events.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for event in events {
+            let json = serde_json::to_string(event).unwrap();
+            writeln!(f, "{json}").unwrap();
+        }
+        path
+    }
+
+    fn make_process_create(pid: u32, key: &str) -> ThreatEvent {
+        let mut evt = ThreatEvent::new(
+            &test_agent(),
+            EventSource::Etw {
+                provider: "Microsoft-Windows-Kernel-Process".into(),
+            },
+            EventCategory::Process,
+            Severity::Info,
+            EventData::ProcessCreate {
+                pid,
+                ppid: 1,
+                image_path: "cmd.exe".into(),
+                command_line: "cmd.exe /c test".into(),
+                user: String::new(),
+                integrity_level: String::new(),
+                hashes: None,
+                create_time: Some(42),
+            },
+        );
+        evt.process_context = Some(ProcessContext {
+            process_key: key.into(),
+            image_path: None,
+            command_line: None,
+            user: None,
+            integrity_level: None,
+            ppid: None,
+        });
+        evt
+    }
+
+    fn make_network_event(pid: u32, key: &str) -> ThreatEvent {
+        let mut evt = ThreatEvent::new(
+            &test_agent(),
+            EventSource::Etw {
+                provider: "Microsoft-Windows-Kernel-Network".into(),
+            },
+            EventCategory::Network,
+            Severity::Info,
+            EventData::NetworkConnect {
+                pid,
+                image_path: String::new(),
+                protocol: "TCP".into(),
+                src_addr: "10.0.0.1".into(),
+                src_port: 12345,
+                dst_addr: "93.184.216.34".into(),
+                dst_port: 443,
+                direction: NetworkDirection::Outbound,
+            },
+        );
+        evt.process_context = Some(ProcessContext {
+            process_key: key.into(),
+            image_path: Some("cmd.exe".into()),
+            command_line: Some("cmd.exe /c test".into()),
+            user: None,
+            integrity_level: None,
+            ppid: Some(1),
+        });
+        evt
+    }
+
+    fn make_dns_event(pid: u32, key: &str) -> ThreatEvent {
+        let mut evt = ThreatEvent::new(
+            &test_agent(),
+            EventSource::Etw {
+                provider: "Microsoft-Windows-DNS-Client".into(),
+            },
+            EventCategory::Dns,
+            Severity::Info,
+            EventData::DnsQuery {
+                pid,
+                query_name: "example.com".into(),
+                query_type: "A".into(),
+                response: None,
+            },
+        );
+        evt.process_context = Some(ProcessContext {
+            process_key: key.into(),
+            image_path: Some("cmd.exe".into()),
+            command_line: None,
+            user: None,
+            integrity_level: None,
+            ppid: None,
+        });
+        evt
+    }
+
+    fn make_health_event() -> ThreatEvent {
+        ThreatEvent::new(
+            &test_agent(),
+            EventSource::Sensor,
+            EventCategory::Health,
+            Severity::Info,
+            EventData::SensorHealth {
+                uptime_secs: 60,
+                events_total: 100,
+                events_dropped: 0,
+                collectors: vec![],
+                sink: None,
+            },
+        )
+    }
+
+    fn make_detection_event(pid: u32, rule_id: &str) -> ThreatEvent {
+        ThreatEvent::with_rule(
+            &test_agent(),
+            EventSource::EvasionDetector,
+            EventCategory::Evasion,
+            Severity::High,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::EtwPatching,
+                pid: Some(pid),
+                process_name: Some("malware.exe".into()),
+                details: "patched".into(),
+            },
+            RuleMetadata {
+                id: rule_id.into(),
+                name: "Test Rule".into(),
+                description: "test".into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: "T1562.006".into(),
+                    technique_name: "Indicator Blocking".into(),
+                },
+                confidence: Confidence::High,
+                evidence: vec!["test evidence".into()],
+            },
+        )
+    }
+
+    // ---- Query tests ---------------------------------------------------------
+
+    #[test]
+    fn query_filter_by_pid() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_network_event(200, "200:43"),
+            make_network_event(100, "100:42"),
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: Some(100),
+            process_key: None,
+            category: None,
+            rule_id: None,
+            since: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn query_filter_by_process_key() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_network_event(200, "200:43"),
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: Some("200:43".into()),
+            category: None,
+            rule_id: None,
+            since: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn query_filter_by_category() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_dns_event(100, "100:42"),
+            make_health_event(),
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: Some("dns".into()), // case-insensitive
+            rule_id: None,
+            since: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert!(matches!(matched[0].category, EventCategory::Dns));
+    }
+
+    #[test]
+    fn query_filter_by_rule_id() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_detection_event(200, "TF-EVA-001"),
+            make_detection_event(300, "TF-EVA-002"),
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: Some("TF-EVA-001".into()),
+            since: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].rule.as_ref().unwrap().id, "TF-EVA-001");
+    }
+
+    #[test]
+    fn query_filter_by_since() {
+        let dir = TempDir::new().unwrap();
+
+        let mut old_event = make_network_event(100, "100:42");
+        old_event.timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+
+        let mut new_event = make_network_event(200, "200:43");
+        new_event.timestamp = "2026-06-01T00:00:00Z".parse().unwrap();
+
+        let path = write_events(&dir, &[old_event, new_event]);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            since: Some("2026-03-01T00:00:00Z".parse().unwrap()),
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn query_combined_filters() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_dns_event(100, "100:42"),
+            make_network_event(200, "200:43"),
+        ];
+        let path = write_events(&dir, &events);
+
+        // pid=100 AND category=Network
+        let filter = QueryFilter {
+            pid: Some(100),
+            process_key: None,
+            category: Some("Network".into()),
+            rule_id: None,
+            since: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn query_limit_applied() {
+        let dir = TempDir::new().unwrap();
+        let events: Vec<_> = (0..10)
+            .map(|i| make_network_event(100 + i, &format!("{}:42", 100 + i)))
+            .collect();
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            since: None,
+        };
+
+        let mut count = 0;
+        for_each_event(&path, |event| {
+            if count >= 3 {
+                return false;
+            }
+            if filter.matches(&event) {
+                count += 1;
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(count, 3);
+    }
+
+    // ---- Explain tests -------------------------------------------------------
+
+    #[test]
+    fn find_event_exact_match() {
+        let events = vec![make_network_event(100, "100:42")];
+        let id = events[0].id.to_string();
+        let found = find_event(&events, &id).unwrap();
+        assert_eq!(found.id, events[0].id);
+    }
+
+    #[test]
+    fn find_event_prefix_match() {
+        let events = vec![make_network_event(100, "100:42")];
+        let id = events[0].id.to_string();
+        let prefix = &id[..8]; // first 8 chars of UUID
+        let found = find_event(&events, prefix).unwrap();
+        assert_eq!(found.id, events[0].id);
+    }
+
+    #[test]
+    fn find_event_not_found() {
+        let events = vec![make_network_event(100, "100:42")];
+        let result = find_event(&events, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn explain_builds_timeline() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let mut events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+            make_dns_event(100, key),
+            make_network_event(200, "200:99"), // different process
+        ];
+
+        // Stagger timestamps slightly
+        events[0].timestamp = "2026-03-13T10:00:00Z".parse().unwrap();
+        events[1].timestamp = "2026-03-13T10:00:01Z".parse().unwrap();
+        events[2].timestamp = "2026-03-13T10:00:02Z".parse().unwrap();
+        events[3].timestamp = "2026-03-13T10:00:03Z".parse().unwrap();
+
+        let path = write_events(&dir, &events);
+
+        // Load and find
+        let all = read_all_events(&path).unwrap();
+        let target = find_event(&all, &events[1].id.to_string()).unwrap();
+
+        assert_eq!(target.process_context.as_ref().unwrap().process_key, key);
+
+        // Check that the timeline includes only events with the same key
+        let window = chrono::Duration::minutes(5);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
+
+        let related: Vec<_> = all
+            .iter()
+            .filter(|e| {
+                e.process_context.as_ref().map(|c| c.process_key.as_str()) == Some(key)
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
+            })
+            .collect();
+
+        assert_eq!(related.len(), 3); // ProcessCreate + 2 activity events (same key)
+    }
+
+    // ---- Bundle tests --------------------------------------------------------
+
+    #[test]
+    fn bundle_creates_valid_json() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+            make_dns_event(100, key),
+        ];
+        let path = write_events(&dir, &events);
+        let output_path = dir.path().join("bundle.json");
+
+        let event_id = events[1].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&output_path)).unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(bundle.bundle_version, 1);
+        assert_eq!(bundle.target_event_id, event_id);
+        assert_eq!(bundle.process_key.as_deref(), Some(key));
+        assert_eq!(bundle.event_count, 3); // target + 2 related
+        assert_eq!(bundle.related_events.len(), 2);
+    }
+
+    #[test]
+    fn bundle_excludes_different_process_key() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_network_event(200, "200:99"), // different key
+        ];
+        let path = write_events(&dir, &events);
+        let output_path = dir.path().join("bundle.json");
+
+        let event_id = events[0].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&output_path)).unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(bundle.event_count, 1); // only the target
+        assert!(bundle.related_events.is_empty());
+    }
+
+    // ---- Helper tests --------------------------------------------------------
+
+    #[test]
+    fn parse_datetime_valid() {
+        let dt = parse_datetime("2026-03-13T10:00:00Z").unwrap();
+        assert_eq!(chrono::Datelike::year(&dt), 2026);
+    }
+
+    #[test]
+    fn parse_datetime_invalid() {
+        assert!(parse_datetime("not-a-date").is_err());
+    }
+
+    #[test]
+    fn category_match_case_insensitive() {
+        assert!(category_matches(&EventCategory::Network, "network"));
+        assert!(category_matches(&EventCategory::Network, "Network"));
+        assert!(category_matches(&EventCategory::Network, "NETWORK"));
+        assert!(!category_matches(&EventCategory::Network, "Process"));
+    }
+
+    #[test]
+    fn event_summary_covers_all_variants() {
+        // Smoke test — just ensure event_summary doesn't panic
+        let summaries = vec![
+            event_summary(&EventData::ProcessCreate {
+                pid: 1,
+                ppid: 0,
+                image_path: "test.exe".into(),
+                command_line: "test".into(),
+                user: String::new(),
+                integrity_level: String::new(),
+                hashes: None,
+                create_time: None,
+            }),
+            event_summary(&EventData::ProcessTerminate {
+                pid: 1,
+                image_path: "test.exe".into(),
+                create_time: None,
+            }),
+            event_summary(&EventData::NetworkConnect {
+                pid: 1,
+                image_path: String::new(),
+                protocol: "TCP".into(),
+                src_addr: "0.0.0.0".into(),
+                src_port: 0,
+                dst_addr: "0.0.0.0".into(),
+                dst_port: 80,
+                direction: NetworkDirection::Outbound,
+            }),
+            event_summary(&EventData::DnsQuery {
+                pid: 1,
+                query_name: "example.com".into(),
+                query_type: "A".into(),
+                response: None,
+            }),
+            event_summary(&EventData::SensorHealth {
+                uptime_secs: 60,
+                events_total: 100,
+                events_dropped: 0,
+                collectors: vec![],
+                sink: None,
+            }),
+        ];
+
+        for s in &summaries {
+            assert!(!s.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_jsonl_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let events = read_all_events(&path).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn malformed_lines_skipped() {
+        let dir = TempDir::new().unwrap();
+        let event = make_network_event(100, "100:42");
+        let json = serde_json::to_string(&event).unwrap();
+
+        let path = dir.path().join("mixed.jsonl");
+        std::fs::write(&path, format!("not json\n{json}\nalso bad\n")).unwrap();
+
+        let events = read_all_events(&path).unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn missing_file_errors() {
+        let result = read_all_events(Path::new("/nonexistent/file.jsonl"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        assert_eq!(truncate("hello world", 5), "hello");
+    }
+}

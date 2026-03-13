@@ -1,6 +1,7 @@
 mod collectors;
 mod config;
 mod events;
+mod investigate;
 mod output;
 mod process_cache;
 mod sensor;
@@ -61,10 +62,25 @@ struct Cli {
     /// Uninstall the ThreatFalcon Windows service and exit
     #[arg(long, conflicts_with_all = ["stdout", "output", "service", "validate_config", "dump_default_config", "config"])]
     uninstall_service: bool,
+
+    /// Investigation subcommand (query, explain, bundle)
+    #[command(subcommand)]
+    command: Option<investigate::Command>,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // Subcommands (query, explain, bundle) take priority over sensor mode.
+    if let Some(command) = cli.command {
+        match investigate::run(command) {
+            Ok(()) => std::process::exit(exit_code::SUCCESS),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(exit_code::RUNTIME_ERROR);
+            }
+        }
+    }
 
     // --dump-default-config: print and exit (no logging needed)
     if cli.dump_default_config {
