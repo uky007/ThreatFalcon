@@ -38,9 +38,25 @@ pub enum Command {
         #[arg(long)]
         rule_id: Option<String>,
 
-        /// Only events after this timestamp (RFC 3339, e.g., "2026-03-13T00:00:00Z")
+        /// Filter by event source type (etw, sysmon, evasion, sensor)
         #[arg(long)]
-        since: Option<String>,
+        source: Option<String>,
+
+        /// Filter by minimum severity (Info, Low, Medium, High, Critical)
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Case-insensitive text search across serialized event data
+        #[arg(long, value_name = "TEXT")]
+        contains: Option<String>,
+
+        /// Only events after this timestamp (RFC 3339). Alias: --since
+        #[arg(long, alias = "since")]
+        from: Option<String>,
+
+        /// Only events before this timestamp (RFC 3339)
+        #[arg(long)]
+        to: Option<String>,
 
         /// Maximum number of results (default: 100)
         #[arg(long, default_value = "100")]
@@ -60,6 +76,10 @@ pub enum Command {
         /// Time window in minutes around the target event (default: 5)
         #[arg(long, default_value = "5")]
         window: u64,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Bundle an event and related context into a single JSON document
@@ -91,20 +111,36 @@ pub fn run(command: Command) -> Result<()> {
             process_key,
             category,
             rule_id,
-            since,
+            source,
+            severity,
+            contains,
+            from,
+            to,
             limit,
         } => {
-            let since = since
+            let from = from
                 .map(|s| parse_datetime(&s))
                 .transpose()
-                .context("invalid --since value")?;
+                .context("invalid --from value")?;
+            let to = to
+                .map(|s| parse_datetime(&s))
+                .transpose()
+                .context("invalid --to value")?;
+            let severity = severity
+                .map(|s| parse_severity(&s))
+                .transpose()
+                .context("invalid --severity value")?;
 
             let filter = QueryFilter {
                 pid,
                 process_key,
                 category,
                 rule_id,
-                since,
+                source,
+                severity,
+                contains,
+                from,
+                to,
             };
 
             run_query(&input, &filter, limit)
@@ -114,7 +150,8 @@ pub fn run(command: Command) -> Result<()> {
             event,
             input,
             window,
-        } => run_explain(&input, &event, window),
+            json,
+        } => run_explain(&input, &event, window, json),
 
         Command::Bundle {
             event,
@@ -134,13 +171,23 @@ struct QueryFilter {
     process_key: Option<String>,
     category: Option<String>,
     rule_id: Option<String>,
-    since: Option<DateTime<Utc>>,
+    source: Option<String>,
+    severity: Option<crate::events::Severity>,
+    contains: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
 }
 
 impl QueryFilter {
     fn matches(&self, event: &ThreatEvent) -> bool {
-        if let Some(since) = &self.since {
-            if event.timestamp < *since {
+        if let Some(ref from) = self.from {
+            if event.timestamp < *from {
+                return false;
+            }
+        }
+
+        if let Some(ref to) = self.to {
+            if event.timestamp > *to {
                 return false;
             }
         }
@@ -170,6 +217,24 @@ impl QueryFilter {
         if let Some(ref rule_id) = self.rule_id {
             let has_rule = event.rule.as_ref().map(|r| r.id.as_str()) == Some(rule_id.as_str());
             if !has_rule {
+                return false;
+            }
+        }
+
+        if let Some(ref src) = self.source {
+            if !source_matches(&event.source, src) {
+                return false;
+            }
+        }
+
+        if let Some(min_sev) = self.severity {
+            if event.severity < min_sev {
+                return false;
+            }
+        }
+
+        if let Some(ref text) = self.contains {
+            if !event_contains(event, text) {
                 return false;
             }
         }
@@ -204,25 +269,32 @@ fn run_query(input: &Path, filter: &QueryFilter, limit: usize) -> Result<()> {
 // Explain
 // ---------------------------------------------------------------------------
 
-fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
+/// Structured explain output for `--json` mode.
+#[derive(Serialize)]
+struct ExplainOutput {
+    target_event: ThreatEvent,
+    window_minutes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_key: Option<String>,
+    timeline: Vec<ThreatEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    script_amsi_activity: Vec<ThreatEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<crate::events::RuleMetadata>,
+}
+
+fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool) -> Result<()> {
     let events = read_all_events(input)?;
     let target = find_event(&events, event_id)?;
 
-    let mut stdout = std::io::stdout().lock();
-
-    // --- Target event ---
-    writeln!(stdout, "=== Target Event ===")?;
-    print_event_detail(&mut stdout, target)?;
-
-    // --- Process timeline ---
+    // --- Build timeline ---
     let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
+    let window = chrono::Duration::minutes(window_mins as i64);
+    let t_start = target.timestamp - window;
+    let t_end = target.timestamp + window;
 
-    if let Some(key) = process_key {
-        let window = chrono::Duration::minutes(window_mins as i64);
-        let t_start = target.timestamp - window;
-        let t_end = target.timestamp + window;
-
-        let mut related: Vec<&ThreatEvent> = events
+    let mut timeline: Vec<&ThreatEvent> = if let Some(key) = process_key {
+        events
             .iter()
             .filter(|e| {
                 e.process_context
@@ -232,16 +304,41 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
                     && e.timestamp >= t_start
                     && e.timestamp <= t_end
             })
-            .collect();
-        related.sort_by_key(|e| e.timestamp);
+            .collect()
+    } else {
+        vec![]
+    };
+    timeline.sort_by_key(|e| e.timestamp);
 
+    // --- JSON output ---
+    if json {
+        let script_activity = build_script_activity(target, &events, window_mins);
+        let output = ExplainOutput {
+            target_event: target.clone(),
+            window_minutes: window_mins,
+            process_key: process_key.map(|s| s.to_string()),
+            timeline: timeline.into_iter().cloned().collect(),
+            script_amsi_activity: script_activity,
+            rule: target.rule.clone(),
+        };
+        let json_str = serde_json::to_string_pretty(&output)?;
+        println!("{json_str}");
+        return Ok(());
+    }
+
+    // --- Human-readable output ---
+    let mut stdout = std::io::stdout().lock();
+
+    writeln!(stdout, "=== Target Event ===")?;
+    print_event_detail(&mut stdout, target)?;
+
+    if let Some(key) = process_key {
         writeln!(
             stdout,
             "\n=== Process Timeline (process_key: {key}, ±{window_mins} min, {} events) ===",
-            related.len()
+            timeline.len()
         )?;
-
-        for evt in &related {
+        for evt in &timeline {
             let marker = if evt.id == target.id { ">" } else { " " };
             writeln!(
                 stdout,
@@ -256,55 +353,18 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
     }
 
     // --- Script / AMSI correlation ---
-    // When the target is a script-related event (ScriptBlock, AmsiScan) or
-    // an AMSI bypass detection, show correlated script activity from the
-    // same process to make the execution → scan → bypass chain visible.
     if is_script_related(&target.data) {
-        let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
-        let target_pid = target.data.acting_pid();
-        let window = chrono::Duration::minutes(window_mins as i64);
-        let t_start = target.timestamp - window;
-        let t_end = target.timestamp + window;
-
-        // Collect script events (ScriptBlock + AmsiScan) from the same
-        // process within the time window, using process_key when
-        // available, falling back to PID.
-        let script_events: Vec<&ThreatEvent> = events
-            .iter()
-            .filter(|e| {
-                if !is_script_or_amsi(&e.data) {
-                    return false;
-                }
-                if e.timestamp < t_start || e.timestamp > t_end {
-                    return false;
-                }
-                // Match by process_key (preferred) or PID
-                if let Some(key) = process_key {
-                    e.process_context
-                        .as_ref()
-                        .map(|c| c.process_key.as_str())
-                        == Some(key)
-                } else if let Some(pid) = target_pid {
-                    e.data.acting_pid() == Some(pid)
-                } else {
-                    false
-                }
-            })
-            .collect();
-
-        if !script_events.is_empty() {
-            let mut sorted = script_events;
-            sorted.sort_by_key(|e| e.timestamp);
-
-            let amsi_count = sorted
+        let activity = build_script_activity(target, &events, window_mins);
+        if !activity.is_empty() {
+            let amsi_count = activity
                 .iter()
                 .filter(|e| matches!(e.data, EventData::AmsiScan { .. }))
                 .count();
-            let script_count = sorted
+            let script_count = activity
                 .iter()
                 .filter(|e| matches!(e.data, EventData::ScriptBlock { .. }))
                 .count();
-            let detected_count = sorted
+            let detected_count = activity
                 .iter()
                 .filter(|e| matches!(&e.data, EventData::AmsiScan { scan_result, .. } if *scan_result >= 32768))
                 .count();
@@ -315,7 +375,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
                  {amsi_count} scan(s), {detected_count} detected) ==="
             )?;
 
-            for evt in &sorted {
+            for evt in &activity {
                 let marker = if evt.id == target.id { ">" } else { " " };
                 writeln!(
                     stdout,
@@ -491,7 +551,16 @@ struct BundleManifest {
     process_key: Option<String>,
     window_minutes: u64,
     event_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_range: Option<TimeRange>,
     files: Vec<&'static str>,
+}
+
+/// Time range of events included in a bundle.
+#[derive(Serialize, Deserialize, Debug)]
+struct TimeRange {
+    earliest: DateTime<Utc>,
+    latest: DateTime<Utc>,
 }
 
 /// Write an evidence bundle as a zip archive containing:
@@ -508,6 +577,14 @@ fn write_bundle_zip(path: &Path, bundle: &EvidenceBundle) -> Result<()> {
         .compression_method(zip::CompressionMethod::Deflated);
 
     // manifest.json
+    let time_range = {
+        let mut all_ts: Vec<DateTime<Utc>> =
+            vec![bundle.target_event.timestamp];
+        all_ts.extend(bundle.related_events.iter().map(|e| e.timestamp));
+        let earliest = *all_ts.iter().min().unwrap();
+        let latest = *all_ts.iter().max().unwrap();
+        Some(TimeRange { earliest, latest })
+    };
     let manifest = BundleManifest {
         format: "threatfalcon-evidence-bundle",
         format_version: 1,
@@ -517,6 +594,7 @@ fn write_bundle_zip(path: &Path, bundle: &EvidenceBundle) -> Result<()> {
         process_key: bundle.process_key.clone(),
         window_minutes: bundle.window_minutes,
         event_count: bundle.event_count,
+        time_range,
         files: vec![
             "manifest.json",
             "target_event.json",
@@ -553,6 +631,57 @@ fn write_bundle_zip(path: &Path, bundle: &EvidenceBundle) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Parse a severity level string (case-insensitive).
+fn parse_severity(s: &str) -> Result<crate::events::Severity> {
+    match s.to_ascii_lowercase().as_str() {
+        "info" => Ok(crate::events::Severity::Info),
+        "low" => Ok(crate::events::Severity::Low),
+        "medium" | "med" => Ok(crate::events::Severity::Medium),
+        "high" => Ok(crate::events::Severity::High),
+        "critical" | "crit" => Ok(crate::events::Severity::Critical),
+        _ => anyhow::bail!(
+            "unknown severity: {s} (expected: info, low, medium, high, critical)"
+        ),
+    }
+}
+
+/// Check if an event's source matches a source type string (case-insensitive).
+fn source_matches(source: &crate::events::EventSource, filter: &str) -> bool {
+    let filter_lower = filter.to_ascii_lowercase();
+    match source {
+        crate::events::EventSource::Etw { provider } => {
+            filter_lower == "etw"
+                || provider.to_ascii_lowercase().contains(&filter_lower)
+        }
+        crate::events::EventSource::Sysmon { .. } => filter_lower == "sysmon",
+        crate::events::EventSource::EvasionDetector => {
+            filter_lower == "evasion" || filter_lower == "evasiondetector"
+        }
+        crate::events::EventSource::Sensor => filter_lower == "sensor",
+    }
+}
+
+/// Case-insensitive text search across the serialized event JSON.
+///
+/// Searches both the raw JSON (which has escaped backslashes like `C:\\Temp`)
+/// and an unescaped version (where `\\` is collapsed to `\`), so that a user
+/// query for `C:\Temp\evil.exe` matches the JSON-escaped form.
+fn event_contains(event: &ThreatEvent, text: &str) -> bool {
+    if let Ok(json) = serde_json::to_string(event) {
+        let lower_json = json.to_ascii_lowercase();
+        let lower_text = text.to_ascii_lowercase();
+        if lower_json.contains(&lower_text) {
+            return true;
+        }
+        // Also search an unescaped copy so that Windows paths typed naturally
+        // (C:\Temp\evil.exe) match their JSON-escaped form (C:\\Temp\\evil.exe).
+        let unescaped = lower_json.replace("\\\\", "\\");
+        unescaped.contains(&lower_text)
+    } else {
+        false
+    }
+}
 
 /// Parse an RFC 3339 datetime string.
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
@@ -799,6 +928,49 @@ fn event_summary(data: &EventData) -> String {
     }
 }
 
+/// Collect ScriptBlock + AmsiScan events correlated with the target,
+/// within the time window. Used by both human-readable and JSON explain.
+fn build_script_activity(
+    target: &ThreatEvent,
+    events: &[ThreatEvent],
+    window_mins: u64,
+) -> Vec<ThreatEvent> {
+    if !is_script_related(&target.data) {
+        return vec![];
+    }
+    let process_key =
+        target.process_context.as_ref().map(|c| c.process_key.as_str());
+    let target_pid = target.data.acting_pid();
+    let window = chrono::Duration::minutes(window_mins as i64);
+    let t_start = target.timestamp - window;
+    let t_end = target.timestamp + window;
+
+    let mut result: Vec<ThreatEvent> = events
+        .iter()
+        .filter(|e| {
+            if !is_script_or_amsi(&e.data) {
+                return false;
+            }
+            if e.timestamp < t_start || e.timestamp > t_end {
+                return false;
+            }
+            if let Some(key) = process_key {
+                e.process_context
+                    .as_ref()
+                    .map(|c| c.process_key.as_str())
+                    == Some(key)
+            } else if let Some(pid) = target_pid {
+                e.data.acting_pid() == Some(pid)
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect();
+    result.sort_by_key(|e| e.timestamp);
+    result
+}
+
 /// True if the event is a script-related type that benefits from
 /// Script / AMSI correlation display in explain output.
 fn is_script_related(data: &EventData) -> bool {
@@ -1009,7 +1181,11 @@ mod tests {
             process_key: None,
             category: None,
             rule_id: None,
-            since: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
         };
 
         let mut matched = Vec::new();
@@ -1038,7 +1214,11 @@ mod tests {
             process_key: Some("200:43".into()),
             category: None,
             rule_id: None,
-            since: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
         };
 
         let mut matched = Vec::new();
@@ -1068,7 +1248,11 @@ mod tests {
             process_key: None,
             category: Some("dns".into()), // case-insensitive
             rule_id: None,
-            since: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
         };
 
         let mut matched = Vec::new();
@@ -1099,7 +1283,11 @@ mod tests {
             process_key: None,
             category: None,
             rule_id: Some("TF-EVA-001".into()),
-            since: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
         };
 
         let mut matched = Vec::new();
@@ -1132,7 +1320,11 @@ mod tests {
             process_key: None,
             category: None,
             rule_id: None,
-            since: Some("2026-03-01T00:00:00Z".parse().unwrap()),
+            source: None,
+            severity: None,
+            contains: None,
+            from: Some("2026-03-01T00:00:00Z".parse().unwrap()),
+            to: None,
         };
 
         let mut matched = Vec::new();
@@ -1163,7 +1355,11 @@ mod tests {
             process_key: None,
             category: Some("Network".into()),
             rule_id: None,
-            since: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
         };
 
         let mut matched = Vec::new();
@@ -1191,7 +1387,11 @@ mod tests {
             process_key: None,
             category: None,
             rule_id: None,
-            since: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
         };
 
         let mut count = 0;
@@ -2086,5 +2286,392 @@ mod tests {
         assert!(!is_zip_extension(Path::new("bundle.json")));
         assert!(!is_zip_extension(Path::new("bundle")));
         assert!(!is_zip_extension(Path::new("zipfile.tar")));
+    }
+
+    // ---- New filter tests ---------------------------------------------------
+
+    #[test]
+    fn query_filter_by_source_etw() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),      // ETW
+            make_detection_event(200, "TF-EVA-001"), // EvasionDetector
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: Some("etw".into()),
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert!(matches!(
+            matched[0].source,
+            crate::events::EventSource::Etw { .. }
+        ));
+    }
+
+    #[test]
+    fn query_filter_by_source_evasion() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_detection_event(200, "TF-EVA-001"),
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: Some("evasion".into()),
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert!(matches!(
+            matched[0].source,
+            crate::events::EventSource::EvasionDetector
+        ));
+    }
+
+    #[test]
+    fn query_filter_by_source_provider_name() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"), // Kernel-Network
+            make_dns_event(100, "100:42"),      // DNS-Client
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: Some("DNS-Client".into()),
+            severity: None,
+            contains: None,
+            from: None,
+            to: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert!(matches!(matched[0].category, EventCategory::Dns));
+    }
+
+    #[test]
+    fn query_filter_by_severity() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"), // Info
+            make_detection_event(200, "TF-EVA-001"), // High
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: None,
+            severity: Some(crate::events::Severity::High),
+            contains: None,
+            from: None,
+            to: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+        assert!(matched[0].severity >= crate::events::Severity::High);
+    }
+
+    #[test]
+    fn query_filter_by_contains() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![
+            make_network_event(100, "100:42"),
+            make_dns_event(100, "100:42"), // contains "example.com"
+        ];
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: None,
+            severity: None,
+            contains: Some("example.com".into()),
+            from: None,
+            to: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn query_filter_contains_case_insensitive() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![make_dns_event(100, "100:42")]; // "example.com"
+        let path = write_events(&dir, &events);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: None,
+            severity: None,
+            contains: Some("EXAMPLE.COM".into()),
+            from: None,
+            to: None,
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn contains_matches_windows_path_with_backslashes() {
+        // The JSON serializer escapes backslashes (C:\Temp → C:\\Temp).
+        // A user searching for "C:\Temp\evil.exe" should still match.
+        let mut evt = make_process_create(100, "100:42");
+        evt.data = EventData::ProcessCreate {
+            pid: 100,
+            ppid: 1,
+            image_path: r"C:\Temp\evil.exe".into(),
+            command_line: r"C:\Temp\evil.exe --payload".into(),
+            user: String::new(),
+            integrity_level: String::new(),
+            hashes: None,
+            create_time: Some(42),
+        };
+        assert!(
+            event_contains(&evt, r"C:\Temp\evil.exe"),
+            "natural Windows path should match JSON-escaped backslashes"
+        );
+        // Also verify the escaped form still matches
+        assert!(
+            event_contains(&evt, r"C:\\Temp\\evil.exe"),
+            "escaped path should also match directly"
+        );
+    }
+
+    #[test]
+    fn query_filter_by_from_and_to() {
+        let dir = TempDir::new().unwrap();
+
+        let mut old = make_network_event(100, "100:42");
+        old.timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+
+        let mut mid = make_network_event(100, "100:42");
+        mid.timestamp = "2026-06-01T00:00:00Z".parse().unwrap();
+
+        let mut new = make_network_event(100, "100:42");
+        new.timestamp = "2026-12-01T00:00:00Z".parse().unwrap();
+
+        let path = write_events(&dir, &[old, mid, new]);
+
+        let filter = QueryFilter {
+            pid: None,
+            process_key: None,
+            category: None,
+            rule_id: None,
+            source: None,
+            severity: None,
+            contains: None,
+            from: Some("2026-03-01T00:00:00Z".parse().unwrap()),
+            to: Some("2026-09-01T00:00:00Z".parse().unwrap()),
+        };
+
+        let mut matched = Vec::new();
+        for_each_event(&path, |event| {
+            if filter.matches(&event) {
+                matched.push(event);
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(matched.len(), 1); // only mid
+    }
+
+    #[test]
+    fn parse_severity_variants() {
+        assert_eq!(
+            parse_severity("info").unwrap(),
+            crate::events::Severity::Info
+        );
+        assert_eq!(
+            parse_severity("HIGH").unwrap(),
+            crate::events::Severity::High
+        );
+        assert_eq!(
+            parse_severity("crit").unwrap(),
+            crate::events::Severity::Critical
+        );
+        assert_eq!(
+            parse_severity("med").unwrap(),
+            crate::events::Severity::Medium
+        );
+        assert!(parse_severity("bogus").is_err());
+    }
+
+    #[test]
+    fn source_matches_variants() {
+        use crate::events::EventSource;
+
+        assert!(source_matches(
+            &EventSource::Etw {
+                provider: "Microsoft-Windows-Kernel-Network".into()
+            },
+            "etw"
+        ));
+        assert!(source_matches(
+            &EventSource::Etw {
+                provider: "Microsoft-Windows-DNS-Client".into()
+            },
+            "dns-client"
+        ));
+        assert!(!source_matches(
+            &EventSource::Etw {
+                provider: "Microsoft-Windows-Kernel-Network".into()
+            },
+            "sysmon"
+        ));
+        assert!(source_matches(&EventSource::EvasionDetector, "evasion"));
+        assert!(source_matches(
+            &EventSource::Sysmon { event_id: 1 },
+            "sysmon"
+        ));
+        assert!(source_matches(&EventSource::Sensor, "sensor"));
+    }
+
+    #[test]
+    fn explain_json_output() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+        ];
+        let path = write_events(&dir, &events);
+
+        // Capture JSON output by calling run_explain with json=true
+        // through run_bundle (we can't easily capture stdout, so we
+        // verify the ExplainOutput struct serializes correctly)
+        let all = read_all_events(&path).unwrap();
+        let target = find_event(&all, &events[1].id.to_string()).unwrap();
+
+        let output = ExplainOutput {
+            target_event: target.clone(),
+            window_minutes: 5,
+            process_key: target
+                .process_context
+                .as_ref()
+                .map(|c| c.process_key.clone()),
+            timeline: all.clone(),
+            script_amsi_activity: vec![],
+            rule: target.rule.clone(),
+        };
+
+        let json = serde_json::to_string_pretty(&output).unwrap();
+        assert!(json.contains("\"target_event\""));
+        assert!(json.contains("\"timeline\""));
+        assert!(json.contains("\"window_minutes\""));
+        // script_amsi_activity should be omitted when empty
+        assert!(!json.contains("\"script_amsi_activity\""));
+    }
+
+    #[test]
+    fn bundle_manifest_has_time_range() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+
+        let mut evt_a = make_process_create(100, key);
+        evt_a.timestamp = "2026-03-13T10:00:00Z".parse().unwrap();
+        let mut evt_b = make_network_event(100, key);
+        evt_b.timestamp = "2026-03-13T10:05:00Z".parse().unwrap();
+
+        let path = write_events(&dir, &[evt_a, evt_b.clone()]);
+        let zip_path = dir.path().join("range.zip");
+
+        run_bundle(&path, &evt_b.id.to_string(), 10, Some(&zip_path)).unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        let manifest_entry = archive.by_name("manifest.json").unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_reader(manifest_entry).unwrap();
+
+        let time_range = &manifest["time_range"];
+        assert!(time_range.is_object());
+        assert!(time_range["earliest"].is_string());
+        assert!(time_range["latest"].is_string());
     }
 }
