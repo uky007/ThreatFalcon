@@ -227,7 +227,7 @@ sc.exe stop ThreatFalcon
 .\threatfalcon.exe --uninstall-service
 ```
 
-`--uninstall-service` stops the service if it is running, then removes it from SCM.
+`--uninstall-service` stops the service if it is running, polls SCM until the service reaches `Stopped` state (up to 30 seconds), then removes it from SCM.
 
 **Service state transitions:**
 
@@ -237,7 +237,7 @@ StartPending → Running → StopPending → Stopped
 
 - `StartPending` (wait_hint: 10s): config loading, logging init, sensor creation
 - `Running`: event loop active, accepting `Stop` control
-- `StopPending` (wait_hint: 15s): flushing sinks, writing final health event
+- `StopPending` (wait_hint: 15s): reported when SCM sends Stop, before sensor begins flushing sinks and writing final health event
 - `Stopped`: exit code distinguishes success (0), config error (1), runtime error (2)
 
 Notes:

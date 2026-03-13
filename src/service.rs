@@ -11,7 +11,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::watch;
@@ -102,12 +102,11 @@ pub fn uninstall() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("failed to open service '{}': {e}", SERVICE_NAME))?;
 
-    // Stop the service if it's not already stopped.
+    // Stop the service if it's not already stopped, then poll until Stopped.
     if let Ok(status) = service.query_status() {
         if status.current_state != ServiceState::Stopped {
             let _ = service.stop();
-            // Give SCM a moment to process the stop.
-            std::thread::sleep(Duration::from_secs(2));
+            wait_for_stopped(&service)?;
         }
     }
 
@@ -116,6 +115,27 @@ pub fn uninstall() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to delete service: {e}"))?;
 
     Ok(())
+}
+
+/// Poll SCM until the service reaches `Stopped` state, or timeout after 30 seconds.
+fn wait_for_stopped(service: &windows_service::service::Service) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(500);
+
+    loop {
+        match service.query_status() {
+            Ok(status) if status.current_state == ServiceState::Stopped => return Ok(()),
+            Ok(_) if Instant::now() >= deadline => {
+                return Err(anyhow::anyhow!(
+                    "timed out waiting for service to stop (30s)"
+                ));
+            }
+            Ok(_) => std::thread::sleep(poll_interval),
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to query service status: {e}"));
+            }
+        }
+    }
 }
 
 // ---- Service runtime -------------------------------------------------------
@@ -140,11 +160,33 @@ fn run_service() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_tx = Mutex::new(Some(shutdown_tx));
 
+    // Shared status handle so the control handler can report StopPending
+    // at the moment SCM sends Stop, before the sensor begins its shutdown.
+    let shared_handle: std::sync::Arc<Mutex<Option<service_control_handler::ServiceStatusHandle>>> =
+        std::sync::Arc::new(Mutex::new(None));
+    let handler_handle = shared_handle.clone();
+
     // Register the service control handler with SCM.
     let status_handle = service_control_handler::register(SERVICE_NAME, move |control| {
         match control {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             ServiceControl::Stop => {
+                // Report StopPending immediately so SCM sees the transition
+                // *before* the sensor starts flushing sinks and writing the
+                // final health event.
+                if let Ok(guard) = handler_handle.lock() {
+                    if let Some(ref h) = *guard {
+                        let _ = h.set_service_status(ServiceStatus {
+                            service_type: SERVICE_TYPE,
+                            current_state: ServiceState::StopPending,
+                            controls_accepted: ServiceControlAccept::empty(),
+                            exit_code: ServiceExitCode::Win32(svc_exit::SUCCESS),
+                            checkpoint: 0,
+                            wait_hint: Duration::from_secs(15),
+                            process_id: None,
+                        });
+                    }
+                }
                 if let Ok(mut guard) = shutdown_tx.lock() {
                     if let Some(tx) = guard.take() {
                         let _ = tx.send(true);
@@ -155,6 +197,11 @@ fn run_service() -> Result<()> {
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     })?;
+
+    // Store the handle so the control handler closure can report StopPending.
+    if let Ok(mut guard) = shared_handle.lock() {
+        *guard = Some(status_handle.clone());
+    }
 
     // Report StartPending while we initialise.
     report_state(&status_handle, ServiceState::StartPending, svc_exit::SUCCESS)?;
@@ -211,10 +258,8 @@ fn run_service() -> Result<()> {
         sensor.run(shutdown_rx).await
     });
 
-    // Sensor has finished its internal shutdown (flush, final health event).
-    // Report StopPending briefly to signal we are cleaning up.
-    let _ = report_state(&status_handle, ServiceState::StopPending, svc_exit::SUCCESS);
-
+    // StopPending was already reported by the control handler when SCM sent
+    // Stop — the sensor has now finished its shutdown (flush, final health).
     // Report Stopped with the appropriate exit code.
     let exit = match &result {
         Ok(()) => svc_exit::SUCCESS,
