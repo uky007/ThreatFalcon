@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -576,6 +576,53 @@ The index stores `event_id`, `timestamp`, `pid`, `process_key`, `category`, `sou
 - Use `--no-index` on any command to force a full scan (useful for debugging)
 
 The index file is stored alongside the JSONL file as `<filename>.idx.sqlite` (e.g., `events.jsonl.idx.sqlite`).
+
+### Stats
+
+Show summary statistics for a JSONL telemetry file — event counts by category, severity, source, top processes, and detection rule hits:
+
+```bash
+# Human-readable summary
+threatfalcon stats --input events.jsonl
+
+# Structured JSON output
+threatfalcon stats --input events.jsonl --json
+```
+
+Example output:
+
+```
+=== Event Statistics ===
+Total events: 12847
+Time range:   2026-03-13 08:00:00 UTC → 2026-03-13 18:30:00 UTC
+Duration:     10h 30m
+
+--- By Category ---
+  Network          5230
+  Process          3412
+  File             2108
+  Registry          980
+  Evasion           117
+
+--- By Severity ---
+  Critical            3
+  High               42
+  Medium            117
+  Info            12685
+
+--- By Source ---
+  ETW/Microsoft-Windows-Kernel-Network       5230
+  ETW/Microsoft-Windows-Kernel-Process       3412
+  EvasionDetector                             117
+
+--- Top Processes (by event count) ---
+  PID    892    3210 events  C:\Windows\System32\svchost.exe
+  PID   4120    1845 events  C:\Program Files\app.exe
+
+--- Detection Rules ---
+  TF-EVA-001                42
+  TF-EVA-004                 3
+```
 
 ## Evasion Detection Rules
 

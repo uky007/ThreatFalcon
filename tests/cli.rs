@@ -945,3 +945,135 @@ fn explain_no_index_pid_fallback_no_process_context() {
                 .and(predicate::str::contains("2 events")),
         );
 }
+
+// ---- Stats subcommand tests -------------------------------------------------
+
+#[test]
+fn stats_help() {
+    cmd().args(["stats", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_stats_subcommand() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("stats"),
+    );
+}
+
+#[test]
+fn stats_shows_summary() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_etw_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network", "Info", "2026-03-13T10:05:00Z"),
+        sample_evasion_event("cccccccc-cccc-cccc-cccc-cccccccccccc", "High", "2026-03-13T10:10:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["stats", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Total events: 3")
+                .and(predicate::str::contains("By Category"))
+                .and(predicate::str::contains("Network"))
+                .and(predicate::str::contains("Evasion"))
+                .and(predicate::str::contains("By Severity"))
+                .and(predicate::str::contains("Info"))
+                .and(predicate::str::contains("High"))
+                .and(predicate::str::contains("By Source"))
+                .and(predicate::str::contains("Top Processes")),
+        );
+}
+
+#[test]
+fn stats_shows_time_range() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_etw_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network", "Info", "2026-03-13T12:30:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["stats", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Time range:")
+                .and(predicate::str::contains("Duration:"))
+                .and(predicate::str::contains("2h 30m")),
+        );
+}
+
+#[test]
+fn stats_shows_detection_rules() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_detection_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "TF-EVA-001"),
+        sample_detection_event("cccccccc-cccc-cccc-cccc-cccccccccccc", "TF-EVA-001"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["stats", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Detection Rules")
+                .and(predicate::str::contains("TF-EVA-001"))
+                .and(predicate::str::contains("2")),
+        );
+}
+
+#[test]
+fn stats_json_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["stats", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stats --json should output valid JSON");
+    assert_eq!(json["total_events"], 2);
+    assert!(json["by_category"].is_array());
+    assert!(json["by_severity"].is_array());
+    assert!(json["by_source"].is_array());
+    assert!(json["top_processes"].is_array());
+    assert!(json["time_range"].is_object());
+}
+
+#[test]
+fn stats_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("empty.jsonl");
+    fs::write(&path, "").unwrap();
+
+    cmd()
+        .args(["stats", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total events: 0"));
+}
