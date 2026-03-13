@@ -339,6 +339,32 @@ Example event shape:
 }
 ```
 
+## Evasion Detection Rules
+
+The evasion collector periodically scans running processes for EDR evasion techniques. Each detection emits a structured `RuleMetadata` with evidence.
+
+| Rule ID | Name | Technique | MITRE | Confidence |
+|---------|------|-----------|-------|------------|
+| TF-EVA-001 | ETW Event Write Patching | `ntdll!EtwEventWrite` patched to `ret` | T1562.006 | High |
+| TF-EVA-002 | AMSI Scan Buffer Bypass | `amsi!AmsiScanBuffer` patched to return clean | T1562.001 | High |
+| TF-EVA-003 | ntdll User-Mode Hook Removal | ntdll `.text` replaced with clean on-disk copy | T1562.001 | Medium |
+| TF-EVA-004 | Suspicious Direct Syscall Stub | `syscall`/`int 0x2e` stubs in non-system module | T1562.001 | Medium |
+
+### TF-EVA-004: Direct Syscall Detection
+
+Tools like SysWhispers embed syscall stubs directly in malware modules to bypass ntdll user-mode hooks. TF-EVA-004 detects the canonical stub pattern:
+
+```
+mov r10, rcx        ; 4C 8B D1 or 49 89 CA
+mov eax, <SSN>      ; B8 xx xx xx xx
+[optional gap]      ; up to 12 bytes (Wow64 compat check)
+syscall / int 0x2e  ; 0F 05 or CD 2E
+```
+
+The scanner enumerates loaded modules per process, skips system DLLs that legitimately contain syscall stubs (ntdll.dll, win32u.dll — verified by full path to `System32`/`SysWOW64`, not just basename), reads the `.text` section of remaining modules, and matches the stub pattern. Evidence includes the module name, stub offset, SSN value, and raw bytes.
+
+Note: TF-EVA-004 detects the **presence** of syscall stubs in non-system modules. It does not confirm that the stubs were executed or that ntdll hooks were actively bypassed. Confidence is Medium to reflect this distinction.
+
 ## Limitations
 
 - No installer or packaging yet (service registration is manual via `sc.exe`)
