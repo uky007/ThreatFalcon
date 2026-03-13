@@ -369,6 +369,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
 
     // --- Build timeline ---
     let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
+    let target_pid = target.data.acting_pid();
     let window = chrono::Duration::minutes(window_mins as i64);
     let t_start = target.timestamp - window;
     let t_end = target.timestamp + window;
@@ -381,6 +382,16 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
                     .as_ref()
                     .map(|c| c.process_key.as_str())
                     == Some(key)
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
+            })
+            .collect()
+    } else if let Some(pid) = target_pid {
+        // PID-based fallback when process_context is unavailable
+        events
+            .iter()
+            .filter(|e| {
+                e.data.acting_pid() == Some(pid)
                     && e.timestamp >= t_start
                     && e.timestamp <= t_end
             })
@@ -412,10 +423,13 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
     writeln!(stdout, "=== Target Event ===")?;
     print_event_detail(&mut stdout, target)?;
 
-    if let Some(key) = process_key {
+    if process_key.is_some() || target_pid.is_some() {
+        let key_display = process_key
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| format!("pid:{}", target_pid.unwrap()));
         writeln!(
             stdout,
-            "\n=== Process Timeline (process_key: {key}, ±{window_mins} min, {} events) ===",
+            "\n=== Process Timeline ({key_display}, ±{window_mins} min, {} events) ===",
             timeline.len()
         )?;
         for evt in &timeline {
@@ -777,29 +791,35 @@ fn run_explain_indexed(
         }
     };
 
-    // Find related events by process_key within window
+    // Find related events by process_key (or PID fallback) within window
     let process_key = target
         .process_context
         .as_ref()
         .map(|c| c.process_key.as_str());
+    let target_pid = target.data.acting_pid();
     let window = chrono::Duration::minutes(window_mins as i64);
     let t_start = target.timestamp - window;
     let t_end = target.timestamp + window;
+    let from_str = t_start.to_rfc3339();
+    let to_str = t_end.to_rfc3339();
 
     let mut timeline = if let Some(key) = process_key {
-        let locs = idx.find_by_process_key(
-            key,
-            &t_start.to_rfc3339(),
-            &t_end.to_rfc3339(),
-        )?;
+        let locs = idx.find_by_process_key(key, &from_str, &to_str)?;
+        index::fetch_events(input, &locs)?
+    } else if let Some(pid) = target_pid {
+        // PID-based fallback — same semantics as the full-scan path
+        let locs = idx.find_by_pid(pid, &from_str, &to_str)?;
         index::fetch_events(input, &locs)?
     } else {
         vec![]
     };
     timeline.sort_by_key(|e| e.timestamp);
 
+    // Script / AMSI correlation — use the same build_script_activity()
+    // function as the full-scan path so PID-based fallback is preserved.
+    let script_activity = build_script_activity(&target, &timeline, window_mins);
+
     if json {
-        let script_activity = build_script_activity_from(&target, &timeline, window_mins);
         let output = ExplainOutput {
             target_event: target.clone(),
             window_minutes: window_mins,
@@ -818,10 +838,13 @@ fn run_explain_indexed(
     writeln!(stdout, "=== Target Event ===")?;
     print_event_detail(&mut stdout, &target)?;
 
-    if let Some(key) = process_key {
+    if process_key.is_some() || target_pid.is_some() {
+        let key_display = process_key
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| format!("pid:{}", target_pid.unwrap()));
         writeln!(
             stdout,
-            "\n=== Process Timeline (process_key: {key}, ±{window_mins} min, {} events) ===",
+            "\n=== Process Timeline ({key_display}, ±{window_mins} min, {} events) ===",
             timeline.len()
         )?;
         for evt in &timeline {
@@ -839,37 +862,34 @@ fn run_explain_indexed(
     }
 
     // Script / AMSI correlation
-    if is_script_related(&target.data) {
-        let activity = build_script_activity_from(&target, &timeline, window_mins);
-        if !activity.is_empty() {
-            let amsi_count = activity
-                .iter()
-                .filter(|e| matches!(e.data, EventData::AmsiScan { .. }))
-                .count();
-            let script_count = activity
-                .iter()
-                .filter(|e| matches!(e.data, EventData::ScriptBlock { .. }))
-                .count();
-            let detected_count = activity
-                .iter()
-                .filter(|e| matches!(&e.data, EventData::AmsiScan { scan_result, .. } if *scan_result >= 32768))
-                .count();
+    if !script_activity.is_empty() {
+        let amsi_count = script_activity
+            .iter()
+            .filter(|e| matches!(e.data, EventData::AmsiScan { .. }))
+            .count();
+        let script_count = script_activity
+            .iter()
+            .filter(|e| matches!(e.data, EventData::ScriptBlock { .. }))
+            .count();
+        let detected_count = script_activity
+            .iter()
+            .filter(|e| matches!(&e.data, EventData::AmsiScan { scan_result, .. } if *scan_result >= 32768))
+            .count();
 
+        writeln!(
+            stdout,
+            "\n=== Script / AMSI Activity ({script_count} script block(s), \
+             {amsi_count} scan(s), {detected_count} detected) ==="
+        )?;
+
+        for evt in &script_activity {
+            let marker = if evt.id == target.id { ">" } else { " " };
             writeln!(
                 stdout,
-                "\n=== Script / AMSI Activity ({script_count} script block(s), \
-                 {amsi_count} scan(s), {detected_count} detected) ==="
+                "{marker} {}  {}",
+                evt.timestamp.format("%H:%M:%S%.3fZ"),
+                event_summary(&evt.data),
             )?;
-
-            for evt in &activity {
-                let marker = if evt.id == target.id { ">" } else { " " };
-                writeln!(
-                    stdout,
-                    "{marker} {}  {}",
-                    evt.timestamp.format("%H:%M:%S%.3fZ"),
-                    event_summary(&evt.data),
-                )?;
-            }
         }
     }
 
@@ -978,25 +998,6 @@ fn run_bundle_indexed(
     }
 
     Ok(())
-}
-
-/// Build script/AMSI activity from an already-fetched timeline slice
-/// (used by index-accelerated explain).
-fn build_script_activity_from(
-    target: &ThreatEvent,
-    timeline: &[ThreatEvent],
-    _window_mins: u64,
-) -> Vec<ThreatEvent> {
-    if !is_script_related(&target.data) {
-        return vec![];
-    }
-    let mut result: Vec<ThreatEvent> = timeline
-        .iter()
-        .filter(|e| is_script_or_amsi(&e.data))
-        .cloned()
-        .collect();
-    result.sort_by_key(|e| e.timestamp);
-    result
 }
 
 // ---------------------------------------------------------------------------

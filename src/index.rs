@@ -219,6 +219,33 @@ impl EventIndex {
         Ok(locations)
     }
 
+    /// Find events by PID within a time window (fallback when process_key is
+    /// unavailable, e.g. unenriched events).
+    pub fn find_by_pid(
+        &self,
+        pid: u32,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<EventLocation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT byte_offset, line_length FROM events \
+             WHERE pid = ?1 AND timestamp >= ?2 AND timestamp <= ?3 \
+             ORDER BY timestamp",
+        )?;
+        let rows = stmt.query_map(params![pid as i64, from, to], |row| {
+            Ok(EventLocation {
+                byte_offset: row.get::<_, i64>(0)? as u64,
+                line_length: row.get::<_, i64>(1)? as u64,
+            })
+        })?;
+
+        let mut locations = Vec::new();
+        for row in rows {
+            locations.push(row?);
+        }
+        Ok(locations)
+    }
+
     /// Find events by process_key within a time window.
     pub fn find_by_process_key(
         &self,
