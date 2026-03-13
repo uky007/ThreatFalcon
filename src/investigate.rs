@@ -1154,7 +1154,7 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
                         continue;
                     }
                     if json {
-                        let _ = writeln!(stdout, "{line}");
+                        writeln!(stdout, "{line}")?;
                     } else {
                         let sev = format!("{:?}", event.severity);
                         let pid_str = event_pid(&event.data)
@@ -1170,6 +1170,7 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
                             event_summary(&event.data),
                         )?;
                     }
+                    stdout.flush()?;
                 }
             }
             Err(e) => return Err(e.into()),
