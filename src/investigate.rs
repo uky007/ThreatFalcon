@@ -222,7 +222,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
         let t_start = target.timestamp - window;
         let t_end = target.timestamp + window;
 
-        let related: Vec<&ThreatEvent> = events
+        let mut related: Vec<&ThreatEvent> = events
             .iter()
             .filter(|e| {
                 e.process_context
@@ -233,6 +233,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
                     && e.timestamp <= t_end
             })
             .collect();
+        related.sort_by_key(|e| e.timestamp);
 
         writeln!(
             stdout,
@@ -337,7 +338,7 @@ fn run_bundle(
         .as_ref()
         .map(|c| c.process_key.clone());
 
-    let related: Vec<ThreatEvent> = if let Some(ref key) = process_key {
+    let mut related: Vec<ThreatEvent> = if let Some(ref key) = process_key {
         let window = chrono::Duration::minutes(window_mins as i64);
         let t_start = target.timestamp - window;
         let t_end = target.timestamp + window;
@@ -357,6 +358,7 @@ fn run_bundle(
     } else {
         vec![]
     };
+    related.sort_by_key(|e| e.timestamp);
 
     let bundle = EvidenceBundle {
         bundle_version: 1,
@@ -629,10 +631,15 @@ fn event_summary(data: &EventData) -> String {
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
-        s
-    } else {
-        &s[..max]
+        return s;
     }
+    // Find the last char boundary at or before `max` to avoid panicking
+    // on multibyte UTF-8 sequences (CJK paths, script content, etc.).
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,5 +1239,103 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_multibyte_cjk() {
+        // Each CJK character is 3 bytes in UTF-8.
+        // "日本語パス" = 15 bytes. Truncating at 7 bytes must not
+        // split a 3-byte char — should back up to byte 6.
+        let s = "日本語パス";
+        assert_eq!(s.len(), 15);
+        let result = truncate(s, 7);
+        assert_eq!(result, "日本"); // 6 bytes, not 7
+    }
+
+    #[test]
+    fn truncate_multibyte_boundary_exact() {
+        // Truncate exactly at a char boundary (6 bytes = 2 CJK chars)
+        let s = "日本語パス";
+        let result = truncate(s, 6);
+        assert_eq!(result, "日本");
+    }
+
+    #[test]
+    fn truncate_emoji() {
+        // 🔥 is 4 bytes. Truncating "🔥abc" at 2 must not split the emoji.
+        let s = "🔥abc";
+        let result = truncate(s, 2);
+        assert_eq!(result, ""); // no complete char fits in 2 bytes from a 4-byte start
+    }
+
+    #[test]
+    fn explain_timeline_is_chronological() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+
+        // Create events out of timestamp order in the file
+        let mut evt_c = make_dns_event(100, key);
+        evt_c.timestamp = "2026-03-13T10:00:03Z".parse().unwrap();
+
+        let mut evt_a = make_process_create(100, key);
+        evt_a.timestamp = "2026-03-13T10:00:01Z".parse().unwrap();
+
+        let mut evt_b = make_network_event(100, key);
+        evt_b.timestamp = "2026-03-13T10:00:02Z".parse().unwrap();
+
+        // Write in non-chronological order: C, A, B
+        let path = write_events(&dir, &[evt_c.clone(), evt_a.clone(), evt_b.clone()]);
+
+        let all = read_all_events(&path).unwrap();
+        let target = find_event(&all, &evt_b.id.to_string()).unwrap();
+
+        let window = chrono::Duration::minutes(5);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
+
+        let mut related: Vec<&ThreatEvent> = all
+            .iter()
+            .filter(|e| {
+                e.process_context.as_ref().map(|c| c.process_key.as_str()) == Some(key)
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
+            })
+            .collect();
+        related.sort_by_key(|e| e.timestamp);
+
+        // Must be in chronological order: A, B, C
+        assert_eq!(related.len(), 3);
+        assert_eq!(related[0].id, evt_a.id);
+        assert_eq!(related[1].id, evt_b.id);
+        assert_eq!(related[2].id, evt_c.id);
+    }
+
+    #[test]
+    fn bundle_related_events_are_chronological() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+
+        let mut evt_b = make_network_event(100, key);
+        evt_b.timestamp = "2026-03-13T10:00:02Z".parse().unwrap();
+
+        let mut evt_a = make_process_create(100, key);
+        evt_a.timestamp = "2026-03-13T10:00:01Z".parse().unwrap();
+
+        let mut evt_c = make_dns_event(100, key);
+        evt_c.timestamp = "2026-03-13T10:00:03Z".parse().unwrap();
+
+        // Write out of order: B, A, C — target is B
+        let path = write_events(&dir, &[evt_b.clone(), evt_a.clone(), evt_c.clone()]);
+        let output_path = dir.path().join("bundle.json");
+
+        run_bundle(&path, &evt_b.id.to_string(), 5, Some(&output_path)).unwrap();
+
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
+
+        // related_events (excluding target) must be sorted: A then C
+        assert_eq!(bundle.related_events.len(), 2);
+        assert_eq!(bundle.related_events[0].id, evt_a.id);
+        assert_eq!(bundle.related_events[1].id, evt_c.id);
     }
 }
