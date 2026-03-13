@@ -262,13 +262,20 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
     if is_script_related(&target.data) {
         let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
         let target_pid = target.data.acting_pid();
+        let window = chrono::Duration::minutes(window_mins as i64);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
 
         // Collect script events (ScriptBlock + AmsiScan) from the same
-        // process, using process_key when available, falling back to PID.
+        // process within the time window, using process_key when
+        // available, falling back to PID.
         let script_events: Vec<&ThreatEvent> = events
             .iter()
             .filter(|e| {
                 if !is_script_or_amsi(&e.data) {
+                    return false;
+                }
+                if e.timestamp < t_start || e.timestamp > t_end {
                     return false;
                 }
                 // Match by process_key (preferred) or PID
@@ -1573,7 +1580,7 @@ mod tests {
 
         // When we explain a ScriptBlock event, the script/AMSI section
         // should include the 2 AMSI scans + 1 ScriptBlock from the same
-        // process.
+        // process within the time window.
         let all = read_all_events(&path).unwrap();
         let target = find_event(&all, &evt_script.id.to_string()).unwrap();
 
@@ -1583,11 +1590,16 @@ mod tests {
             .process_context
             .as_ref()
             .map(|c| c.process_key.as_str());
+        let window = chrono::Duration::minutes(5);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
 
         let script_events: Vec<&ThreatEvent> = all
             .iter()
             .filter(|e| {
                 is_script_or_amsi(&e.data)
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
                     && e.process_context
                         .as_ref()
                         .map(|c| c.process_key.as_str())
@@ -1609,6 +1621,57 @@ mod tests {
 
         assert_eq!(amsi_count, 2);
         assert_eq!(detected_count, 1);
+    }
+
+    #[test]
+    fn explain_script_correlation_respects_window() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+
+        // Target event at 10:00:00
+        let mut evt_script = make_script_block(100, key, "Get-Process");
+        evt_script.timestamp = "2026-03-13T10:00:00Z".parse().unwrap();
+
+        // AMSI scan within 5-min window (10:04:00)
+        let mut evt_amsi_near = make_amsi_scan(100, key, "near.ps1", 0);
+        evt_amsi_near.timestamp = "2026-03-13T10:04:00Z".parse().unwrap();
+
+        // AMSI scan outside 5-min window (11:00:00 — 1 hour later)
+        let mut evt_amsi_stale = make_amsi_scan(100, key, "stale.ps1", 32768);
+        evt_amsi_stale.timestamp = "2026-03-13T11:00:00Z".parse().unwrap();
+
+        let path = write_events(
+            &dir,
+            &[evt_script.clone(), evt_amsi_near.clone(), evt_amsi_stale.clone()],
+        );
+
+        let all = read_all_events(&path).unwrap();
+        let target = find_event(&all, &evt_script.id.to_string()).unwrap();
+        let pk = target
+            .process_context
+            .as_ref()
+            .map(|c| c.process_key.as_str());
+
+        // With a 5-min window, the stale event should be excluded
+        let window = chrono::Duration::minutes(5);
+        let t_start = target.timestamp - window;
+        let t_end = target.timestamp + window;
+
+        let script_events: Vec<&ThreatEvent> = all
+            .iter()
+            .filter(|e| {
+                is_script_or_amsi(&e.data)
+                    && e.timestamp >= t_start
+                    && e.timestamp <= t_end
+                    && e.process_context
+                        .as_ref()
+                        .map(|c| c.process_key.as_str())
+                        == pk
+            })
+            .collect();
+
+        // Only the target ScriptBlock + the near AMSI scan; stale excluded
+        assert_eq!(script_events.len(), 2);
     }
 
     #[test]
