@@ -1110,3 +1110,227 @@ fn stats_pid_reuse_separates_by_process_key() {
     assert_eq!(procs[1]["count"], 1);
     assert_eq!(procs[1]["process_key"], "100:2000");
 }
+
+// ---- Tail subcommand tests --------------------------------------------------
+
+#[test]
+fn tail_help() {
+    cmd().args(["tail", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--pid"))
+            .and(predicate::str::contains("--category"))
+            .and(predicate::str::contains("--severity"))
+            .and(predicate::str::contains("--source"))
+            .and(predicate::str::contains("--contains"))
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_tail_subcommand() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("tail"),
+    );
+}
+
+#[test]
+fn tail_picks_up_appended_events() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Start with an existing file
+    fs::write(&path, "").unwrap();
+
+    let path_str = path.to_str().unwrap().to_string();
+
+    // Spawn tail in background, then append events, then kill it
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("threatfalcon"))
+        .args(["tail", "--input", &path_str, "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Give tail a moment to start and seek to end
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Append events to the file
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let event = sample_etw_event(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z",
+        );
+        writeln!(f, "{event}").unwrap();
+    }
+
+    // Wait for tail to pick it up (> 1 second poll interval)
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+    // Kill the tail process
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("aaaaaaaa"),
+        "tail should have output the appended event, got: {stdout}"
+    );
+}
+
+#[test]
+fn tail_applies_filters() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let path_str = path.to_str().unwrap().to_string();
+
+    // Spawn tail with --severity high filter
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("threatfalcon"))
+        .args(["tail", "--input", &path_str, "--json", "--severity", "high"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Append both Info and High events
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let info_event = sample_etw_event(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z",
+        );
+        let high_event = sample_evasion_event(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "High", "2026-03-13T10:01:00Z",
+        );
+        writeln!(f, "{info_event}").unwrap();
+        writeln!(f, "{high_event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should contain only the High event, not the Info one
+    assert!(
+        stdout.contains("bbbbbbbb"),
+        "tail should output the high severity event"
+    );
+    assert!(
+        !stdout.contains("aaaaaaaa"),
+        "tail should filter out the Info event"
+    );
+}
+
+#[test]
+fn tail_skips_existing_content() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Write an existing event before starting tail
+    let existing = sample_etw_event(
+        "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+        999, "999:99", "Network", "Info", "2026-03-13T09:00:00Z",
+    );
+    fs::write(&path, format!("{existing}\n")).unwrap();
+
+    let path_str = path.to_str().unwrap().to_string();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("threatfalcon"))
+        .args(["tail", "--input", &path_str, "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Append a new event
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let new_event = sample_etw_event(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z",
+        );
+        writeln!(f, "{new_event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should NOT contain the pre-existing event
+    assert!(
+        !stdout.contains("eeeeeeee"),
+        "tail should skip pre-existing content"
+    );
+    // Should contain the newly appended event
+    assert!(
+        stdout.contains("ffffffff"),
+        "tail should show newly appended event"
+    );
+}
+
+#[test]
+fn tail_survives_file_rotation() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Write some initial content so there's something to rotate away
+    let initial = sample_etw_event(
+        "11111111-1111-1111-1111-111111111111",
+        100, "100:42", "Network", "Info", "2026-03-13T09:00:00Z",
+    );
+    fs::write(&path, format!("{initial}\n")).unwrap();
+
+    let path_str = path.to_str().unwrap().to_string();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("threatfalcon"))
+        .args(["tail", "--input", &path_str, "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Simulate file rotation: rename the current file and create a new one
+    let rotated = dir.path().join("events.jsonl.1");
+    fs::rename(&path, &rotated).unwrap();
+
+    // Create the new file with a post-rotation event
+    let post_rotation = sample_etw_event(
+        "22222222-2222-2222-2222-222222222222",
+        200, "200:43", "Network", "Info", "2026-03-13T10:00:00Z",
+    );
+    fs::write(&path, format!("{post_rotation}\n")).unwrap();
+
+    // Wait for tail to detect rotation and read the new file
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should NOT contain the pre-rotation event
+    assert!(
+        !stdout.contains("11111111"),
+        "tail should not show pre-existing content"
+    );
+    // Should contain the post-rotation event from the new file
+    assert!(
+        stdout.contains("22222222"),
+        "tail should pick up events from the new file after rotation, got: {stdout}"
+    );
+}

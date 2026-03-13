@@ -139,6 +139,45 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Follow new events appended to a JSONL file (like tail -f)
+    Tail {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Filter by process ID
+        #[arg(long)]
+        pid: Option<u32>,
+
+        /// Filter by process_key (e.g., "1234:133579284000000000")
+        #[arg(long)]
+        process_key: Option<String>,
+
+        /// Filter by event category (Process, Network, File, Registry, Dns, etc.)
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Filter by detection rule ID (e.g., "TF-EVA-001")
+        #[arg(long)]
+        rule_id: Option<String>,
+
+        /// Filter by event source type (etw, sysmon, evasion, sensor)
+        #[arg(long)]
+        source: Option<String>,
+
+        /// Filter by minimum severity (Info, Low, Medium, High, Critical)
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Case-insensitive text search across serialized event data
+        #[arg(long, value_name = "TEXT")]
+        contains: Option<String>,
+
+        /// Output as JSONL instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run an investigation subcommand.
@@ -209,6 +248,35 @@ pub fn run(command: Command) -> Result<()> {
         } => run_index(&input, rebuild, status),
 
         Command::Stats { input, json } => run_stats(&input, json),
+
+        Command::Tail {
+            input,
+            pid,
+            process_key,
+            category,
+            rule_id,
+            source,
+            severity,
+            contains,
+            json,
+        } => {
+            let severity = severity
+                .map(|s| parse_severity(&s))
+                .transpose()
+                .context("invalid --severity value")?;
+            let filter = QueryFilter {
+                pid,
+                process_key,
+                category,
+                rule_id,
+                source,
+                severity,
+                contains,
+                from: None,
+                to: None,
+            };
+            run_tail(&input, &filter, json)
+        }
     }
 }
 
@@ -1030,6 +1098,120 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tail
+// ---------------------------------------------------------------------------
+
+fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let file = std::fs::File::open(input)
+        .with_context(|| format!("cannot open {}", input.display()))?;
+    let file_size = file.metadata()?.len();
+    let mut reader = std::io::BufReader::new(file);
+
+    // Seek to end — only show newly appended events
+    reader.seek(SeekFrom::End(0))?;
+    eprintln!(
+        "Tailing {} (skipped {} bytes, Ctrl+C to stop)",
+        input.display(),
+        file_size,
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    let mut line_buf = String::new();
+
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => {
+                // No new data — check for file rotation before sleeping.
+                // The file at the path may have been replaced (rename + new
+                // create) by the output sink's rotation logic.
+                if tail_file_rotated(input, &reader) {
+                    eprintln!("File rotated, reopening {}", input.display());
+                    drop(stdout);
+                    let new_file = std::fs::File::open(input)
+                        .with_context(|| format!("cannot reopen {}", input.display()))?;
+                    reader = std::io::BufReader::new(new_file);
+                    stdout = std::io::stdout().lock();
+                    continue;
+                }
+
+                drop(stdout);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                stdout = std::io::stdout().lock();
+            }
+            Ok(_) => {
+                let line = line_buf.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<ThreatEvent>(line) {
+                    if !filter.matches(&event) {
+                        continue;
+                    }
+                    if json {
+                        writeln!(stdout, "{line}")?;
+                    } else {
+                        let sev = format!("{:?}", event.severity);
+                        let pid_str = event_pid(&event.data)
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        writeln!(
+                            stdout,
+                            "{} {:>8} {:>9} PID {:>6}  {}",
+                            event.timestamp.format("%H:%M:%S%.3fZ"),
+                            sev,
+                            category_short(&event.category),
+                            pid_str,
+                            event_summary(&event.data),
+                        )?;
+                    }
+                    stdout.flush()?;
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Check if the file at `path` is a different file than the one backing
+/// `reader` (i.e., the file was rotated/replaced).
+fn tail_file_rotated(
+    path: &Path,
+    reader: &std::io::BufReader<std::fs::File>,
+) -> bool {
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false, // path gone temporarily during rotation
+    };
+    let handle_meta = match reader.get_ref().metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    // On Unix, compare device + inode to detect file replacement.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if handle_meta.dev() != path_meta.dev() || handle_meta.ino() != path_meta.ino() {
+            return true;
+        }
+    }
+
+    // Fallback (non-Unix): if the path's file is smaller than our handle's
+    // current size, assume rotation. Not perfect but covers truncation.
+    #[cfg(not(unix))]
+    {
+        if path_meta.len() < handle_meta.len() {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
