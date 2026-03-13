@@ -503,3 +503,209 @@ fn bundle_to_zip() {
         assert!(archive.by_name(name).is_ok(), "missing zip entry: {name}");
     }
 }
+
+// ---- PR #27: Investigation CLI filter extension tests -----------------------
+
+fn sample_etw_event(id: &str, pid: u32, process_key: &str, category: &str, severity: &str, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Network"}}}},"category":"{category}","severity":"{severity}","data":{{"type":"NetworkConnect","pid":{pid},"image_path":"","protocol":"TCP","src_addr":"10.0.0.1","src_port":12345,"dst_addr":"93.184.216.34","dst_port":443,"direction":"Outbound"}},"process_context":{{"process_key":"{process_key}"}}}}"#
+    )
+}
+
+fn sample_evasion_event(id: &str, severity: &str, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":"EvasionDetector","category":"Evasion","severity":"{severity}","data":{{"type":"EvasionDetected","technique":"EtwPatching","pid":100,"process_name":"malware.exe","details":"patched"}},"rule":{{"id":"TF-EVA-001","name":"Test","description":"test","mitre":{{"tactic":"Defense Evasion","technique_id":"T1562.006","technique_name":"Indicator Blocking"}},"confidence":"High","evidence":["byte 0xC3"]}}}}"#
+    )
+}
+
+#[test]
+fn query_filter_by_source_etw() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--source", "etw"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("aaaaaaaa")
+                .and(predicate::str::contains("bbbbbbbb").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_filter_by_source_evasion() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--source", "evasion"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bbbbbbbb")
+                .and(predicate::str::contains("aaaaaaaa").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_filter_by_severity() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--severity", "high"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bbbbbbbb")
+                .and(predicate::str::contains("aaaaaaaa").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_filter_by_contains() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--contains", "malware.exe"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bbbbbbbb")
+                .and(predicate::str::contains("aaaaaaaa").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_filter_by_from_to() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T09:00:00Z"),
+        sample_etw_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network", "Info", "2026-03-13T11:00:00Z"),
+        sample_etw_event("cccccccc-cccc-cccc-cccc-cccccccccccc", 300, "300:44", "Network", "Info", "2026-03-13T13:00:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Only events between 10:00 and 12:00
+    cmd()
+        .args([
+            "query",
+            "--input", path.to_str().unwrap(),
+            "--from", "2026-03-13T10:00:00Z",
+            "--to", "2026-03-13T12:00:00Z",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bbbbbbbb")
+                .and(predicate::str::contains("aaaaaaaa").not())
+                .and(predicate::str::contains("cccccccc").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_since_alias_works() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T09:00:00Z"),
+        sample_etw_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network", "Info", "2026-03-13T11:00:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // --since is an alias for --from
+    cmd()
+        .args([
+            "query",
+            "--input", path.to_str().unwrap(),
+            "--since", "2026-03-13T10:00:00Z",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bbbbbbbb"))
+        .stderr(predicate::str::contains("1 event(s) matched"));
+}
+
+#[test]
+fn query_help_shows_new_flags() {
+    cmd().args(["query", "--help"]).assert().success().stdout(
+        predicate::str::contains("--source")
+            .and(predicate::str::contains("--severity"))
+            .and(predicate::str::contains("--contains"))
+            .and(predicate::str::contains("--from"))
+            .and(predicate::str::contains("--to")),
+    );
+}
+
+#[test]
+fn explain_json_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let event_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let lines = [
+        sample_etw_event(event_id, 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_etw_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, "100:42", "Network", "Info", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args([
+            "explain",
+            "--event", event_id,
+            "--input", path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Must be valid JSON with expected fields
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("explain --json should output valid JSON");
+    assert!(json.get("target_event").is_some());
+    assert!(json.get("timeline").is_some());
+    assert!(json.get("window_minutes").is_some());
+}
+
+#[test]
+fn explain_help_shows_json_flag() {
+    cmd().args(["explain", "--help"]).assert().success().stdout(
+        predicate::str::contains("--json"),
+    );
+}

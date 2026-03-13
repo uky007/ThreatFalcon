@@ -441,12 +441,41 @@ threatfalcon query --input events.jsonl --category network
 # Detection events by rule ID
 threatfalcon query --input events.jsonl --rule-id TF-EVA-001
 
-# Events after a timestamp
+# Filter by source type (etw, sysmon, evasion) or ETW provider name
+threatfalcon query --input events.jsonl --source etw
+threatfalcon query --input events.jsonl --source DNS-Client
+
+# Minimum severity filter (Info, Low, Medium, High, Critical)
+threatfalcon query --input events.jsonl --severity high
+
+# Case-insensitive text search across serialized event data
+threatfalcon query --input events.jsonl --contains "malware.exe"
+
+# Time range filtering (RFC 3339 timestamps)
+threatfalcon query --input events.jsonl --from "2026-03-13T00:00:00Z"
+threatfalcon query --input events.jsonl --from "2026-03-13T00:00:00Z" --to "2026-03-13T12:00:00Z"
+
+# --since is a backward-compatible alias for --from
 threatfalcon query --input events.jsonl --since "2026-03-13T00:00:00Z"
 
 # Combine filters with a result limit
-threatfalcon query --input events.jsonl --pid 1234 --category network --limit 50
+threatfalcon query --input events.jsonl --pid 1234 --category network --severity medium --limit 50
 ```
+
+Available query filters:
+
+| Flag | Description |
+|------|-------------|
+| `--pid <N>` | Filter by process ID |
+| `--process-key <KEY>` | Filter by stable process key (`pid:create_time`) |
+| `--category <CAT>` | Filter by event category (case-insensitive) |
+| `--rule-id <ID>` | Filter by detection rule ID |
+| `--source <SRC>` | Filter by source type (`etw`, `sysmon`, `evasion`, `sensor`) or ETW provider name substring |
+| `--severity <SEV>` | Minimum severity threshold (accepts `info`, `low`, `med`/`medium`, `high`, `crit`/`critical`) |
+| `--contains <TEXT>` | Case-insensitive text search across the entire serialized event |
+| `--from <TS>` | Only events after this RFC 3339 timestamp (alias: `--since`) |
+| `--to <TS>` | Only events before this RFC 3339 timestamp |
+| `--limit <N>` | Maximum number of results (default: 100) |
 
 Output is JSONL (one event per line) for easy piping to `jq`, `grep`, or other tools. The match count is printed to stderr.
 
@@ -463,13 +492,24 @@ threatfalcon explain --event a1b2c3d4 --input events.jsonl
 
 # Custom time window
 threatfalcon explain --event <UUID> --input events.jsonl --window 10
+
+# Output as structured JSON (useful for piping to jq)
+threatfalcon explain --event <UUID> --input events.jsonl --json
 ```
 
-The output includes:
+The human-readable output includes:
 - Target event details (ID, timestamp, category, severity, source, process context)
 - Process timeline showing all events from the same `process_key` within the window
 - Script / AMSI activity section (when the target is a ScriptBlock, AmsiScan, or AMSI bypass detection — shows correlated script executions and AMSI scan results for the same process)
 - Detection rule details (if the event is a detection)
+
+The `--json` flag outputs a single JSON object containing:
+- `target_event`: the full target event
+- `window_minutes`: the time window used
+- `process_key`: the target's process key (if available)
+- `timeline`: array of related events from the same process within the window
+- `script_amsi_activity`: correlated script/AMSI events (when applicable)
+- `rule`: detection rule metadata (when the target is a detection)
 
 ### Bundle
 
@@ -502,7 +542,7 @@ The zip archive contains four files:
 
 | File | Contents |
 |------|----------|
-| `manifest.json` | Machine-readable metadata (format, version, event ID, process key, window, file list) |
+| `manifest.json` | Machine-readable metadata (format, version, event ID, process key, window, event count, time range, file list) |
 | `target_event.json` | The target event (pretty-printed JSON) |
 | `related_events.jsonl` | Related events (one JSON object per line) |
 | `bundle.json` | Full combined bundle (identical to the standalone JSON output) |
