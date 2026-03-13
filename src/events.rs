@@ -25,6 +25,29 @@ pub struct ThreatEvent {
     /// for why this event was flagged as suspicious.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<RuleMetadata>,
+    /// Process identity and metadata for the process that produced this
+    /// event. Populated by the sensor's process context cache from
+    /// ProcessCreate observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_context: Option<ProcessContext>,
+}
+
+/// Stable process identity and cached metadata, attached to events by the
+/// sensor's enrichment pipeline. `process_key` is derived from PID +
+/// creation timestamp to survive PID reuse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessContext {
+    pub process_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
 }
 
 /// Structured metadata attached to detection events for explainability.
@@ -73,6 +96,7 @@ impl ThreatEvent {
             severity,
             data,
             rule: None,
+            process_context: None,
         }
     }
 
@@ -97,6 +121,7 @@ impl ThreatEvent {
             severity,
             data,
             rule: Some(rule),
+            process_context: None,
         }
     }
 }
@@ -142,10 +167,18 @@ pub enum EventData {
         user: String,
         integrity_level: String,
         hashes: Option<String>,
+        /// OS-level process creation timestamp (Windows FILETIME from ETW).
+        /// Used to derive `process_key` for stable identity across PID reuse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        create_time: Option<u64>,
     },
     ProcessTerminate {
         pid: u32,
         image_path: String,
+        /// OS-level process creation timestamp, matching the corresponding
+        /// ProcessCreate event for correlation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        create_time: Option<u64>,
     },
     FileCreate {
         pid: u32,
@@ -311,6 +344,27 @@ pub enum PipeOperation {
     Connected,
 }
 
+impl EventData {
+    /// Return the PID of the process that performed the action, if applicable.
+    /// ProcessCreate and ProcessTerminate are excluded — they are handled
+    /// separately by the process cache (insert / evict).
+    pub fn acting_pid(&self) -> Option<u32> {
+        match self {
+            Self::FileCreate { pid, .. }
+            | Self::FileDelete { pid, .. }
+            | Self::NetworkConnect { pid, .. }
+            | Self::RegistryEvent { pid, .. }
+            | Self::ImageLoad { pid, .. }
+            | Self::DnsQuery { pid, .. }
+            | Self::ScriptBlock { pid, .. }
+            | Self::AmsiScan { pid, .. }
+            | Self::PipeEvent { pid, .. } => Some(*pid),
+            Self::EvasionDetected { pid, .. } => *pid,
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +472,7 @@ mod tests {
                 user: String::new(),
                 integrity_level: String::new(),
                 hashes: None,
+                create_time: None,
             },
         );
         assert!(event.rule.is_none(), "telemetry events must not carry rules");

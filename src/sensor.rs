@@ -11,9 +11,11 @@ use crate::collectors::Collector;
 use crate::config::SensorConfig;
 use crate::events::*;
 use crate::output;
+use crate::process_cache::ProcessCache;
 use crate::state;
 
 const EVENT_CHANNEL_SIZE: usize = 10_000;
+const PROCESS_CACHE_CAPACITY: usize = 10_000;
 
 pub struct Sensor {
     config: SensorConfig,
@@ -102,6 +104,7 @@ impl Sensor {
         info!(active_collectors = active, "Sensor running");
 
         let mut writer = output::create_sink(&self.config.output)?;
+        let mut process_cache = ProcessCache::new(PROCESS_CACHE_CAPACITY);
         let mut event_count = 0u64;
 
         // Health tick — interval of 0 disables periodic health events
@@ -122,7 +125,8 @@ impl Sensor {
             tokio::select! {
                 event = rx.recv() => {
                     match event {
-                        Some(evt) => {
+                        Some(mut evt) => {
+                            process_cache.enrich(&mut evt);
                             if let Err(e) = writer.send(&evt).await {
                                 error!(error = %e, "Failed to write event");
                             }

@@ -19,6 +19,7 @@ ThreatFalcon is early-stage software.
 - Configuration is loaded from `threatfalcon.toml` (TOML format), overridable via `--config`
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
+- Process context enrichment provides stable process identity across PID reuse
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -101,7 +102,8 @@ The default ETW provider set includes:
 ThreatFalcon is split into a small number of clear components:
 
 - `src/sensor.rs`: collector lifecycle, event channel, shutdown handling
-- `src/events.rs`: unified event schema
+- `src/events.rs`: unified event schema (`ThreatEvent`, `ProcessContext`)
+- `src/process_cache.rs`: in-memory process context cache and enrichment
 - `src/output.rs`: sink abstraction (file, stdout, HTTP POST)
 - `src/collectors/etw.rs`: ETW real-time session and event mapping
 - `src/collectors/sysmon.rs`: Sysmon Event Log subscription
@@ -324,8 +326,24 @@ Events are written as JSON Lines. Each event includes:
 - category
 - severity
 - typed event payload
+- process context (when available — see below)
 
-Example event shape:
+### Process Context Enrichment
+
+The sensor maintains an in-memory process context cache, populated from `ProcessCreate` events. Activity events (file, network, registry, DNS, image load, script, AMSI) are enriched with a `process_context` field that provides:
+
+- **`process_key`**: stable process identity derived from `{pid}:{create_time}`, resilient to PID reuse
+- **`image_path`**, **`command_line`**: the executable and its arguments
+- **`user`**, **`integrity_level`**: when available from the source
+- **`ppid`**: parent process ID
+
+`ProcessCreate` events receive a `process_context` containing only the `process_key` (the remaining fields are already in the event payload). `ProcessTerminate` events receive full context from the cache before the entry is evicted.
+
+The cache is bounded (10,000 entries) and keyed by PID. When a PID is reused, the new `ProcessCreate` replaces the old entry. `ProcessTerminate` events verify `create_time` to avoid evicting a newer process that reused the same PID.
+
+ETW events carry a precise OS-level creation timestamp (`create_time`), which produces PID-reuse-safe process keys. Sysmon events do not carry a comparable timestamp, so the cache applies source priority: an ETW-backed entry is never overwritten or evicted by a Sysmon event that lacks `create_time`. In Sysmon-only mode, process keys use a zero create_time (`{pid}:0`) and PID-reuse protection is best-effort.
+
+Example ProcessCreate event:
 
 ```json
 {
@@ -349,7 +367,47 @@ Example event shape:
     "command_line": "cmd.exe /c whoami",
     "user": "",
     "integrity_level": "",
-    "hashes": null
+    "hashes": null,
+    "create_time": 133579284000000000
+  },
+  "process_context": {
+    "process_key": "1234:133579284000000000"
+  }
+}
+```
+
+Example enriched NetworkConnect event:
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "timestamp": "2026-03-11T00:00:01Z",
+  "hostname": "HOST01",
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "sensor_version": "0.2.0",
+  "source": {
+    "Etw": {
+      "provider": "Microsoft-Windows-Kernel-Network"
+    }
+  },
+  "category": "Network",
+  "severity": "Info",
+  "data": {
+    "type": "NetworkConnect",
+    "pid": 1234,
+    "image_path": "",
+    "protocol": "TCP",
+    "src_addr": "10.0.0.5",
+    "src_port": 49152,
+    "dst_addr": "93.184.216.34",
+    "dst_port": 443,
+    "direction": "Outbound"
+  },
+  "process_context": {
+    "process_key": "1234:133579284000000000",
+    "image_path": "C:\\Windows\\System32\\cmd.exe",
+    "command_line": "cmd.exe /c whoami",
+    "ppid": 4321
   }
 }
 ```

@@ -2,6 +2,7 @@ mod collectors;
 mod config;
 mod events;
 mod output;
+mod process_cache;
 mod sensor;
 #[cfg(target_os = "windows")]
 mod service;
