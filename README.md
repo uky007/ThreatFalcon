@@ -152,6 +152,9 @@ Options:
   --output <PATH>       Override output file path (overrides config file)
   --validate-config     Validate config and exit
   --dump-default-config Dump default config as TOML and exit
+  --service             Run as a Windows service (used by SCM)
+  --install-service     Install as a Windows service and exit
+  --uninstall-service   Uninstall the Windows service and exit
   -h, --help            Print help
   -V, --version         Print version
 ```
@@ -202,15 +205,14 @@ C:\ProgramData\ThreatFalcon\
 # Copy the binary
 Copy-Item threatfalcon.exe C:\ProgramData\ThreatFalcon\threatfalcon.exe
 
-# Register the service (config is auto-discovered from ProgramData)
-sc.exe create ThreatFalcon binPath= "C:\ProgramData\ThreatFalcon\threatfalcon.exe --service" start= auto
+# Install (config is auto-discovered from ProgramData)
+.\threatfalcon.exe --install-service
+
+# Or with a custom config path baked into the service registration
+.\threatfalcon.exe --install-service --config C:\ProgramData\ThreatFalcon\threatfalcon.toml
 ```
 
-To use a config file in a custom location:
-
-```powershell
-sc.exe create ThreatFalcon binPath= "C:\ProgramData\ThreatFalcon\threatfalcon.exe --service --config D:\configs\threatfalcon.toml" start= auto
-```
+`--install-service` registers ThreatFalcon with the Service Control Manager as an auto-start service running as LocalSystem. Equivalent to `sc.exe create` but with correct binary path and arguments.
 
 **Start / stop:**
 
@@ -222,14 +224,27 @@ sc.exe stop ThreatFalcon
 **Remove the service:**
 
 ```powershell
-sc.exe delete ThreatFalcon
+.\threatfalcon.exe --uninstall-service
 ```
+
+`--uninstall-service` stops the service if it is running, polls SCM until the service reaches `Stopped` state (up to 30 seconds), then removes it from SCM.
+
+**Service state transitions:**
+
+```
+StartPending → Running → StopPending → Stopped
+```
+
+- `StartPending` (wait_hint: 10s): config loading, logging init, sensor creation
+- `Running`: event loop active, accepting `Stop` control
+- `StopPending` (wait_hint: 15s): reported when SCM sends Stop, before sensor begins flushing sinks and writing final health event
+- `Stopped`: exit code distinguishes success (0), config error (1), runtime error (2)
 
 Notes:
 
 - Service mode refuses the `stdout` sink (there is no console) — use `file` or `http`
-- The `--service` flag is only available on Windows; on other platforms it exits with an error
-- No installer is included yet — use `sc.exe` for manual registration
+- `--service`, `--install-service`, and `--uninstall-service` are only available on Windows; on other platforms they exit with an error
+- Service exit codes match foreground mode: 0 = success, 1 = config error, 2 = runtime error
 
 ## Configuration
 
