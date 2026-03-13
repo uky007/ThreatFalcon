@@ -173,6 +173,7 @@ pub fn map_to_threat_event(
                 user: parsed.get_string("User"),
                 integrity_level: parsed.get_string("IntegrityLevel"),
                 hashes: parsed.get("Hashes").map(String::from),
+                create_time: None,
             },
         ),
 
@@ -206,6 +207,7 @@ pub fn map_to_threat_event(
             EventData::ProcessTerminate {
                 pid: parsed.get_u32("ProcessId"),
                 image_path: parsed.get_string("Image"),
+                create_time: None,
             },
         ),
 

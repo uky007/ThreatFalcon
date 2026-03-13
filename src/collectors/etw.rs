@@ -601,19 +601,19 @@ mod platform {
                     // ProcessStart v2+: PID(u32), CreateTime(u64),
                     //   ParentPID(u32), SessionID(u32), Flags(u32),
                     //   ImageName(wstr), CommandLine(wstr)
-                    let (process_id, ppid, image, cmdline) = data
+                    let (process_id, create_time, ppid, image, cmdline) = data
                         .and_then(|d| {
                             let mut r = UserDataReader::new(d, ps);
                             let process_id = r.read_u32()?;
-                            let _create_time = r.read_u64()?;
+                            let create_time = r.read_u64()?;
                             let ppid = r.read_u32()?;
                             let _session_id = r.read_u32()?;
                             let _flags = r.read_u32()?;
                             let image = r.read_utf16_nul();
                             let cmdline = r.read_utf16_nul();
-                            Some((process_id, ppid, image, cmdline))
+                            Some((process_id, Some(create_time), ppid, image, cmdline))
                         })
-                        .unwrap_or((pid, 0, String::new(), String::new()));
+                        .unwrap_or((pid, None, 0, String::new(), String::new()));
                     (
                         EventCategory::Process,
                         Severity::Info,
@@ -625,29 +625,31 @@ mod platform {
                             user: String::new(),
                             integrity_level: String::new(),
                             hashes: None,
+                            create_time,
                         },
                     )
                 }
                 2 => {
                     // ProcessStop: PID(u32), CreateTime(u64),
                     //   ExitTime(u64), ExitCode(u32), ImageName(wstr)
-                    let (process_id, image) = data
+                    let (process_id, create_time, image) = data
                         .and_then(|d| {
                             let mut r = UserDataReader::new(d, ps);
                             let process_id = r.read_u32()?;
-                            let _create_time = r.read_u64()?;
+                            let create_time = r.read_u64()?;
                             let _exit_time = r.read_u64()?;
                             let _exit_code = r.read_u32()?;
                             let image = r.read_utf16_nul();
-                            Some((process_id, image))
+                            Some((process_id, Some(create_time), image))
                         })
-                        .unwrap_or((pid, String::new()));
+                        .unwrap_or((pid, None, String::new()));
                     (
                         EventCategory::Process,
                         Severity::Info,
                         EventData::ProcessTerminate {
                             pid: process_id,
                             image_path: image,
+                            create_time,
                         },
                     )
                 }
