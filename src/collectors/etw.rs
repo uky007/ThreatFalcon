@@ -1142,14 +1142,23 @@ mod platform {
                     // MessageNumber(i32), MessageTotal(i32),
                     // ScriptBlockText(wstr), ScriptBlockId(wstr),
                     // Path(wstr)
-                    let content = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_u32()?; // MessageNumber
-                            r.read_u32()?; // MessageTotal
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
+                    let parsed = data.and_then(|d| {
+                        let mut r = UserDataReader::new(d, ps);
+                        r.read_u32()?; // MessageNumber
+                        r.read_u32()?; // MessageTotal
+                        let content = r.read_utf16_nul();
+                        let script_block_id = {
+                            let s = r.read_utf16_nul();
+                            if s.is_empty() { None } else { Some(s) }
+                        };
+                        let script_path = {
+                            let s = r.read_utf16_nul();
+                            if s.is_empty() { None } else { Some(s) }
+                        };
+                        Some((content, script_block_id, script_path))
+                    });
+                    let (content, script_block_id, script_path) =
+                        parsed.unwrap_or_default();
                     (
                         EventCategory::Script,
                         Severity::Medium,
@@ -1157,6 +1166,8 @@ mod platform {
                             pid,
                             script_engine: "PowerShell".into(),
                             content,
+                            script_path,
+                            script_block_id,
                         },
                     )
                 }
@@ -1186,6 +1197,8 @@ mod platform {
                     } else {
                         Severity::Info
                     };
+                    let scan_result_name =
+                        crate::events::amsi_result_name(scan_result).to_string();
                     (
                         EventCategory::Script,
                         severity,
@@ -1195,6 +1208,7 @@ mod platform {
                             content_name,
                             content_size,
                             scan_result,
+                            scan_result_name,
                         },
                     )
                 }

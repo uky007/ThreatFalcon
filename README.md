@@ -41,7 +41,7 @@ ThreatFalcon currently emits normalized telemetry for:
 - registry events
 - image load events
 - DNS events
-- script-related events
+- script-related events (PowerShell ScriptBlock with path/ID correlation, AMSI scan with result classification)
 - evasion-oriented signal events for selected techniques
 - sensor health events (periodic heartbeat with uptime, throughput, and collector status)
 
@@ -468,6 +468,7 @@ threatfalcon explain --event <UUID> --input events.jsonl --window 10
 The output includes:
 - Target event details (ID, timestamp, category, severity, source, process context)
 - Process timeline showing all events from the same `process_key` within the window
+- Script / AMSI activity section (when the target is a ScriptBlock, AmsiScan, or AMSI bypass detection — shows correlated script executions and AMSI scan results for the same process)
 - Detection rule details (if the event is a detection)
 
 ### Bundle
@@ -499,7 +500,7 @@ The evasion collector periodically scans running processes for EDR evasion techn
 | Rule ID | Name | Technique | MITRE | Confidence |
 |---------|------|-----------|-------|------------|
 | TF-EVA-001 | ETW Event Write Patching | `ntdll!EtwEventWrite` patched to `ret` | T1562.006 | High |
-| TF-EVA-002 | AMSI Scan Buffer Bypass | `amsi!AmsiScanBuffer` patched to return clean | T1562.001 | High |
+| TF-EVA-002 | AMSI Scan Buffer Bypass | `amsi!AmsiScanBuffer` patched to return clean | T1562.001 | High/Medium |
 | TF-EVA-003 | ntdll User-Mode Hook Removal | ntdll `.text` replaced with clean on-disk copy | T1562.001 | Medium |
 | TF-EVA-004 | Suspicious Direct Syscall Stub | `syscall`/`int 0x2e` stubs in non-system module | T1562.001 | Medium |
 
@@ -517,6 +518,25 @@ syscall / int 0x2e  ; 0F 05 or CD 2E
 The scanner enumerates loaded modules per process, skips system DLLs that legitimately contain syscall stubs (ntdll.dll, win32u.dll — verified by full path to `System32`/`SysWOW64`, not just basename), parses each module's PE headers to locate the `.text` section by RVA and characteristics, and matches the stub pattern. Evidence includes the module name, stub offset, SSN value, and raw bytes.
 
 Function locations for ETW patching (`EtwEventWrite`) and AMSI bypass (`AmsiScanBuffer`) detection are resolved from the on-disk PE export table at scanner startup, eliminating per-process `GetProcAddress` calls and enabling AMSI detection even when the sensor process does not have `amsi.dll` loaded.
+
+### TF-EVA-002: AMSI Bypass Detection
+
+TF-EVA-002 detects multiple patterns of `AmsiScanBuffer` patching:
+
+| Pattern | Bytes | Meaning | Confidence |
+|---------|-------|---------|------------|
+| `mov eax, 0x80070057; ret` | `B8 57 00 07 80 C3` | Force E_INVALIDARG return (classic) | High |
+| `mov eax, 1; ret` | `B8 01 00 00 00 C3` | Force S_FALSE return | High |
+| `mov eax, <imm32>; ret` | `B8 xx xx xx xx C3` | Force arbitrary return value | High |
+| `xor eax, eax; ret` | `31 C0 C3` / `33 C0 C3` | Force S_OK (scan always clean) | High |
+| `ret` | `C3` | Immediate return, function body skipped | Medium |
+| `nop; ret` | `90 C3` | Function body replaced with no-op | Medium |
+
+Evidence includes the decoded instruction, raw bytes, amsi.dll base address in the target process, and the function RVA from the export table.
+
+### Script / AMSI Correlation
+
+When using `explain` on a ScriptBlock, AmsiScan, or AMSI bypass detection event, ThreatFalcon shows a dedicated "Script / AMSI Activity" section. This section lists all PowerShell script block executions and AMSI scan results from the same process, making the script execution → AMSI scan → bypass chain visible and explainable.
 
 Note: TF-EVA-004 detects the **presence** of syscall stubs in non-system modules. It does not confirm that the stubs were executed or that ntdll hooks were actively bypassed. Confidence is Medium to reflect this distinction.
 

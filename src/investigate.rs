@@ -255,6 +255,71 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64) -> Result<()> {
         writeln!(stdout, "\nNo process_context — cannot build timeline.")?;
     }
 
+    // --- Script / AMSI correlation ---
+    // When the target is a script-related event (ScriptBlock, AmsiScan) or
+    // an AMSI bypass detection, show correlated script activity from the
+    // same process to make the execution → scan → bypass chain visible.
+    if is_script_related(&target.data) {
+        let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
+        let target_pid = target.data.acting_pid();
+
+        // Collect script events (ScriptBlock + AmsiScan) from the same
+        // process, using process_key when available, falling back to PID.
+        let script_events: Vec<&ThreatEvent> = events
+            .iter()
+            .filter(|e| {
+                if !is_script_or_amsi(&e.data) {
+                    return false;
+                }
+                // Match by process_key (preferred) or PID
+                if let Some(key) = process_key {
+                    e.process_context
+                        .as_ref()
+                        .map(|c| c.process_key.as_str())
+                        == Some(key)
+                } else if let Some(pid) = target_pid {
+                    e.data.acting_pid() == Some(pid)
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if !script_events.is_empty() {
+            let mut sorted = script_events;
+            sorted.sort_by_key(|e| e.timestamp);
+
+            let amsi_count = sorted
+                .iter()
+                .filter(|e| matches!(e.data, EventData::AmsiScan { .. }))
+                .count();
+            let script_count = sorted
+                .iter()
+                .filter(|e| matches!(e.data, EventData::ScriptBlock { .. }))
+                .count();
+            let detected_count = sorted
+                .iter()
+                .filter(|e| matches!(&e.data, EventData::AmsiScan { scan_result, .. } if *scan_result >= 32768))
+                .count();
+
+            writeln!(
+                stdout,
+                "\n=== Script / AMSI Activity ({script_count} script block(s), \
+                 {amsi_count} scan(s), {detected_count} detected) ==="
+            )?;
+
+            for evt in &sorted {
+                let marker = if evt.id == target.id { ">" } else { " " };
+                writeln!(
+                    stdout,
+                    "{marker} {}  {}",
+                    evt.timestamp.format("%H:%M:%S%.3fZ"),
+                    event_summary(&evt.data),
+                )?;
+            }
+        }
+    }
+
     // --- Rule ---
     if let Some(ref rule) = target.rule {
         writeln!(stdout, "\n=== Detection Rule ===")?;
@@ -574,17 +639,28 @@ fn event_summary(data: &EventData) -> String {
         EventData::ScriptBlock {
             pid,
             script_engine,
+            script_path,
             ..
         } => {
-            format!("ScriptBlock       pid:{pid} {script_engine}")
+            let path_suffix = script_path
+                .as_deref()
+                .map(|p| format!(" {p}"))
+                .unwrap_or_default();
+            format!("ScriptBlock       pid:{pid} {script_engine}{path_suffix}")
         }
         EventData::AmsiScan {
             pid,
             app_name,
-            scan_result,
+            content_name,
+            scan_result_name,
             ..
         } => {
-            format!("AmsiScan          pid:{pid} {app_name} result:{scan_result}")
+            let result = if scan_result_name.is_empty() {
+                "unknown"
+            } else {
+                scan_result_name.as_str()
+            };
+            format!("AmsiScan          pid:{pid} {app_name} [{result}] {content_name}")
         }
         EventData::EvasionDetected {
             technique,
@@ -627,6 +703,28 @@ fn event_summary(data: &EventData) -> String {
             format!("SensorHealth      uptime:{uptime_secs}s events:{events_total}")
         }
     }
+}
+
+/// True if the event is a script-related type that benefits from
+/// Script / AMSI correlation display in explain output.
+fn is_script_related(data: &EventData) -> bool {
+    matches!(
+        data,
+        EventData::ScriptBlock { .. }
+            | EventData::AmsiScan { .. }
+            | EventData::EvasionDetected {
+                technique: crate::events::EvasionTechnique::AmsiBypass,
+                ..
+            }
+    )
+}
+
+/// True if the event is a ScriptBlock or AmsiScan.
+fn is_script_or_amsi(data: &EventData) -> bool {
+    matches!(
+        data,
+        EventData::ScriptBlock { .. } | EventData::AmsiScan { .. }
+    )
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -1337,5 +1435,320 @@ mod tests {
         assert_eq!(bundle.related_events.len(), 2);
         assert_eq!(bundle.related_events[0].id, evt_a.id);
         assert_eq!(bundle.related_events[1].id, evt_c.id);
+    }
+
+    // ---- Script / AMSI correlation tests ------------------------------------
+
+    fn make_script_block(pid: u32, key: &str, content: &str) -> ThreatEvent {
+        let mut evt = ThreatEvent::new(
+            &test_agent(),
+            EventSource::Etw {
+                provider: "Microsoft-Windows-PowerShell".into(),
+            },
+            EventCategory::Script,
+            Severity::Medium,
+            EventData::ScriptBlock {
+                pid,
+                script_engine: "PowerShell".into(),
+                content: content.into(),
+                script_path: Some(r"C:\Users\test\malware.ps1".into()),
+                script_block_id: Some("abc-123".into()),
+            },
+        );
+        evt.process_context = Some(ProcessContext {
+            process_key: key.into(),
+            image_path: Some("powershell.exe".into()),
+            command_line: Some("powershell.exe -File malware.ps1".into()),
+            user: None,
+            integrity_level: None,
+            ppid: Some(1),
+        });
+        evt
+    }
+
+    fn make_amsi_scan(
+        pid: u32,
+        key: &str,
+        content_name: &str,
+        scan_result: u32,
+    ) -> ThreatEvent {
+        let mut evt = ThreatEvent::new(
+            &test_agent(),
+            EventSource::Etw {
+                provider: "Microsoft-Antimalware-Scan-Interface".into(),
+            },
+            EventCategory::Script,
+            if scan_result >= 32768 {
+                Severity::High
+            } else {
+                Severity::Info
+            },
+            EventData::AmsiScan {
+                pid,
+                app_name: "PowerShell".into(),
+                content_name: content_name.into(),
+                content_size: 256,
+                scan_result,
+                scan_result_name: crate::events::amsi_result_name(scan_result).to_string(),
+            },
+        );
+        evt.process_context = Some(ProcessContext {
+            process_key: key.into(),
+            image_path: Some("powershell.exe".into()),
+            command_line: None,
+            user: None,
+            integrity_level: None,
+            ppid: None,
+        });
+        evt
+    }
+
+    #[test]
+    fn is_script_related_matches_script_events() {
+        assert!(is_script_related(&EventData::ScriptBlock {
+            pid: 1,
+            script_engine: "PowerShell".into(),
+            content: String::new(),
+            script_path: None,
+            script_block_id: None,
+        }));
+        assert!(is_script_related(&EventData::AmsiScan {
+            pid: 1,
+            app_name: "PowerShell".into(),
+            content_name: String::new(),
+            content_size: 0,
+            scan_result: 0,
+            scan_result_name: String::new(),
+        }));
+        assert!(is_script_related(&EventData::EvasionDetected {
+            technique: EvasionTechnique::AmsiBypass,
+            pid: Some(1),
+            process_name: None,
+            details: String::new(),
+        }));
+        // Non-script events should not match
+        assert!(!is_script_related(&EventData::DnsQuery {
+            pid: 1,
+            query_name: String::new(),
+            query_type: String::new(),
+            response: None,
+        }));
+        // Non-AMSI evasion should not match
+        assert!(!is_script_related(&EventData::EvasionDetected {
+            technique: EvasionTechnique::EtwPatching,
+            pid: Some(1),
+            process_name: None,
+            details: String::new(),
+        }));
+    }
+
+    #[test]
+    fn explain_script_amsi_correlation() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+
+        let mut evt_script = make_script_block(100, key, "Invoke-Mimikatz");
+        evt_script.timestamp = "2026-03-13T10:00:01Z".parse().unwrap();
+
+        let mut evt_amsi_clean = make_amsi_scan(100, key, "prompt", 0);
+        evt_amsi_clean.timestamp = "2026-03-13T10:00:00Z".parse().unwrap();
+
+        let mut evt_amsi_detected =
+            make_amsi_scan(100, key, "malware.ps1", 32768);
+        evt_amsi_detected.timestamp = "2026-03-13T10:00:02Z".parse().unwrap();
+
+        // Unrelated event from a different process
+        let mut evt_other = make_network_event(200, "200:99");
+        evt_other.timestamp = "2026-03-13T10:00:01Z".parse().unwrap();
+
+        let path = write_events(
+            &dir,
+            &[
+                evt_amsi_clean.clone(),
+                evt_script.clone(),
+                evt_amsi_detected.clone(),
+                evt_other,
+            ],
+        );
+
+        // When we explain a ScriptBlock event, the script/AMSI section
+        // should include the 2 AMSI scans + 1 ScriptBlock from the same
+        // process.
+        let all = read_all_events(&path).unwrap();
+        let target = find_event(&all, &evt_script.id.to_string()).unwrap();
+
+        assert!(is_script_related(&target.data));
+
+        let pk = target
+            .process_context
+            .as_ref()
+            .map(|c| c.process_key.as_str());
+
+        let script_events: Vec<&ThreatEvent> = all
+            .iter()
+            .filter(|e| {
+                is_script_or_amsi(&e.data)
+                    && e.process_context
+                        .as_ref()
+                        .map(|c| c.process_key.as_str())
+                        == pk
+            })
+            .collect();
+
+        assert_eq!(script_events.len(), 3);
+
+        // Count breakdowns
+        let amsi_count = script_events
+            .iter()
+            .filter(|e| matches!(e.data, EventData::AmsiScan { .. }))
+            .count();
+        let detected_count = script_events
+            .iter()
+            .filter(|e| matches!(&e.data, EventData::AmsiScan { scan_result, .. } if *scan_result >= 32768))
+            .count();
+
+        assert_eq!(amsi_count, 2);
+        assert_eq!(detected_count, 1);
+    }
+
+    #[test]
+    fn amsi_scan_result_name_in_summary() {
+        let summary = event_summary(&EventData::AmsiScan {
+            pid: 100,
+            app_name: "PowerShell".into(),
+            content_name: "malware.ps1".into(),
+            content_size: 256,
+            scan_result: 32768,
+            scan_result_name: "AMSI_RESULT_DETECTED".into(),
+        });
+        assert!(summary.contains("AMSI_RESULT_DETECTED"));
+        assert!(summary.contains("malware.ps1"));
+    }
+
+    #[test]
+    fn script_block_summary_includes_path() {
+        let summary = event_summary(&EventData::ScriptBlock {
+            pid: 100,
+            script_engine: "PowerShell".into(),
+            content: "Get-Process".into(),
+            script_path: Some(r"C:\test.ps1".into()),
+            script_block_id: Some("abc".into()),
+        });
+        assert!(summary.contains(r"C:\test.ps1"));
+    }
+
+    #[test]
+    fn script_block_summary_without_path() {
+        let summary = event_summary(&EventData::ScriptBlock {
+            pid: 100,
+            script_engine: "PowerShell".into(),
+            content: "Get-Process".into(),
+            script_path: None,
+            script_block_id: None,
+        });
+        assert!(summary.contains("PowerShell"));
+        assert!(!summary.contains("null"));
+    }
+
+    #[test]
+    fn amsi_scan_roundtrip_with_new_fields() {
+        let evt = make_amsi_scan(100, "100:42", "test.ps1", 32768);
+        let json = serde_json::to_string(&evt).unwrap();
+        let rt: ThreatEvent = serde_json::from_str(&json).unwrap();
+        match rt.data {
+            EventData::AmsiScan {
+                scan_result_name,
+                scan_result,
+                ..
+            } => {
+                assert_eq!(scan_result, 32768);
+                assert_eq!(scan_result_name, "AMSI_RESULT_DETECTED");
+            }
+            _ => panic!("expected AmsiScan"),
+        }
+    }
+
+    #[test]
+    fn script_block_roundtrip_with_new_fields() {
+        let evt = make_script_block(100, "100:42", "test content");
+        let json = serde_json::to_string(&evt).unwrap();
+        let rt: ThreatEvent = serde_json::from_str(&json).unwrap();
+        match rt.data {
+            EventData::ScriptBlock {
+                script_path,
+                script_block_id,
+                ..
+            } => {
+                assert_eq!(script_path.as_deref(), Some(r"C:\Users\test\malware.ps1"));
+                assert_eq!(script_block_id.as_deref(), Some("abc-123"));
+            }
+            _ => panic!("expected ScriptBlock"),
+        }
+    }
+
+    #[test]
+    fn old_amsi_json_without_result_name_deserializes() {
+        // Simulate JSONL from before scan_result_name was added
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "timestamp": "2026-03-13T10:00:00Z",
+            "hostname": "TEST",
+            "agent_id": "00000000-0000-0000-0000-000000000000",
+            "sensor_version": "0.2.0",
+            "source": {"Etw":{"provider":"AMSI"}},
+            "category": "Script",
+            "severity": "High",
+            "data": {
+                "type": "AmsiScan",
+                "pid": 100,
+                "app_name": "PowerShell",
+                "content_name": "test.ps1",
+                "content_size": 256,
+                "scan_result": 32768
+            }
+        }"#;
+        let evt: ThreatEvent = serde_json::from_str(json).unwrap();
+        match evt.data {
+            EventData::AmsiScan {
+                scan_result_name, ..
+            } => {
+                // Default empty string when field is missing
+                assert_eq!(scan_result_name, "");
+            }
+            _ => panic!("expected AmsiScan"),
+        }
+    }
+
+    #[test]
+    fn old_scriptblock_json_without_new_fields_deserializes() {
+        // Simulate JSONL from before script_path/script_block_id were added
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "timestamp": "2026-03-13T10:00:00Z",
+            "hostname": "TEST",
+            "agent_id": "00000000-0000-0000-0000-000000000000",
+            "sensor_version": "0.2.0",
+            "source": {"Etw":{"provider":"PowerShell"}},
+            "category": "Script",
+            "severity": "Medium",
+            "data": {
+                "type": "ScriptBlock",
+                "pid": 100,
+                "script_engine": "PowerShell",
+                "content": "Get-Process"
+            }
+        }"#;
+        let evt: ThreatEvent = serde_json::from_str(json).unwrap();
+        match evt.data {
+            EventData::ScriptBlock {
+                script_path,
+                script_block_id,
+                ..
+            } => {
+                assert!(script_path.is_none());
+                assert!(script_block_id.is_none());
+            }
+            _ => panic!("expected ScriptBlock"),
+        }
     }
 }

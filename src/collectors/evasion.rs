@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::EvasionConfig;
-use crate::events::{AgentInfo, ThreatEvent};
+use crate::events::{AgentInfo, Confidence, ThreatEvent};
 
 use super::Collector;
 
@@ -172,6 +172,70 @@ fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
     }
 
     matches
+}
+
+/// Detect known AMSI bypass patterns in the first bytes of AmsiScanBuffer.
+///
+/// Returns `(description, confidence)` if a patch pattern is recognized.
+/// Extracted from the platform module for cross-platform testing.
+#[allow(dead_code)] // used on Windows; tested cross-platform
+fn detect_amsi_patch_pattern(
+    bytes: &[u8],
+) -> Option<(&'static str, Confidence)> {
+    if bytes.len() < 2 {
+        return None;
+    }
+
+    // Pattern 1: mov eax, imm32; ret  (B8 xx xx xx xx C3)
+    // Most common — forces a specific HRESULT return.
+    // 0x80070057 = E_INVALIDARG (classic AmsiScanBuffer bypass)
+    // 0x00000001 = S_FALSE, etc.
+    if bytes.len() >= 6 && bytes[0] == 0xB8 && bytes[5] == 0xC3 {
+        let imm =
+            u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        return Some((
+            match imm {
+                0x80070057 => "mov eax, 0x80070057 (E_INVALIDARG); ret",
+                0x00000001 => "mov eax, 1 (S_FALSE); ret",
+                _ => "mov eax, <imm32>; ret — forced return value",
+            },
+            Confidence::High,
+        ));
+    }
+
+    // Pattern 2: xor eax, eax; ret  (31 C0 C3  or  33 C0 C3)
+    // Returns S_OK (0), telling caller the scan completed successfully
+    // with no detection.
+    if bytes.len() >= 3
+        && (bytes[0] == 0x31 || bytes[0] == 0x33)
+        && bytes[1] == 0xC0
+        && bytes[2] == 0xC3
+    {
+        return Some((
+            "xor eax, eax; ret — returns S_OK (scan always clean)",
+            Confidence::High,
+        ));
+    }
+
+    // Pattern 3: immediate ret (C3)
+    // Skips the function body entirely; return value is whatever
+    // happened to be in eax — usually succeeds with garbage result.
+    if bytes[0] == 0xC3 {
+        return Some((
+            "ret — immediate return, function body skipped",
+            Confidence::Medium,
+        ));
+    }
+
+    // Pattern 4: nop; ret  (90 C3)
+    if bytes.len() >= 2 && bytes[0] == 0x90 && bytes[1] == 0xC3 {
+        return Some((
+            "nop; ret — function body replaced with no-op",
+            Confidence::Medium,
+        ));
+    }
+
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -422,11 +486,15 @@ mod platform {
             return None;
         }
 
-        // Common AMSI patch: mov eax, 0x80070057; ret
-        //   B8 57 00 07 80 C3
-        if buf[0] == 0xB8 && buf[5] == 0xC3 {
+        // Detect known AMSI bypass patterns in the first bytes of
+        // AmsiScanBuffer.  Each pattern is a (description, confidence)
+        // pair so evidence is self-documenting.
+        let patch = detect_amsi_patch_pattern(&buf[..read]);
+
+        if let Some((description, confidence)) = patch {
             let evidence = vec![
-                format!("AmsiScanBuffer first bytes: {:02X?}", &buf[..6]),
+                format!("AmsiScanBuffer first bytes: {:02X?}", &buf[..read.min(8)]),
+                format!("decoded: {description}"),
                 format!("amsi.dll base in target: 0x{amsi_base:X}"),
                 format!("function RVA: 0x{:X} (from export table)", amsi_ref.scan_buffer_rva),
             ];
@@ -440,8 +508,8 @@ mod platform {
                     pid: Some(pid),
                     process_name: None,
                     details: format!(
-                        "AmsiScanBuffer patched: first bytes = {:02X?}",
-                        &buf[..6]
+                        "AmsiScanBuffer patched: {description} (bytes: {:02X?})",
+                        &buf[..read.min(8)]
                     ),
                 },
                 RuleMetadata {
@@ -456,7 +524,7 @@ mod platform {
                         technique_id: "T1562.001".into(),
                         technique_name: "Impair Defenses: Disable or Modify Tools".into(),
                     },
-                    confidence: Confidence::High,
+                    confidence,
                     evidence,
                 },
             ));
@@ -1268,5 +1336,79 @@ mod tests {
         assert!(!is_syscall_whitelisted("malware.dll"));
         assert!(!is_syscall_whitelisted("myapp.exe"));
         assert!(!is_syscall_whitelisted("kernel32.dll"));
+    }
+
+    // ---- AMSI bypass pattern tests ------------------------------------------
+
+    #[test]
+    fn amsi_patch_classic_e_invalidarg() {
+        // mov eax, 0x80070057; ret
+        let bytes = [0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3, 0x00, 0x00];
+        let (desc, conf) = detect_amsi_patch_pattern(&bytes).unwrap();
+        assert!(desc.contains("E_INVALIDARG"));
+        assert_eq!(conf, Confidence::High);
+    }
+
+    #[test]
+    fn amsi_patch_s_false() {
+        // mov eax, 1 (S_FALSE); ret
+        let bytes = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x00, 0x00];
+        let (desc, conf) = detect_amsi_patch_pattern(&bytes).unwrap();
+        assert!(desc.contains("S_FALSE"));
+        assert_eq!(conf, Confidence::High);
+    }
+
+    #[test]
+    fn amsi_patch_mov_eax_arbitrary() {
+        // mov eax, 0xDEADBEEF; ret
+        let bytes = [0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0xC3, 0x00, 0x00];
+        let (desc, conf) = detect_amsi_patch_pattern(&bytes).unwrap();
+        assert!(desc.contains("forced return value"));
+        assert_eq!(conf, Confidence::High);
+    }
+
+    #[test]
+    fn amsi_patch_xor_eax_ret() {
+        // xor eax, eax; ret  (31 C0 C3)
+        let bytes = [0x31, 0xC0, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let (desc, conf) = detect_amsi_patch_pattern(&bytes).unwrap();
+        assert!(desc.contains("S_OK"));
+        assert_eq!(conf, Confidence::High);
+
+        // Alternate encoding: 33 C0 C3
+        let bytes2 = [0x33, 0xC0, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let (desc2, _) = detect_amsi_patch_pattern(&bytes2).unwrap();
+        assert!(desc2.contains("S_OK"));
+    }
+
+    #[test]
+    fn amsi_patch_immediate_ret() {
+        // C3 (ret)
+        let bytes = [0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let (desc, conf) = detect_amsi_patch_pattern(&bytes).unwrap();
+        assert!(desc.contains("immediate return"));
+        assert_eq!(conf, Confidence::Medium);
+    }
+
+    #[test]
+    fn amsi_patch_nop_ret() {
+        // nop; ret (90 C3)
+        let bytes = [0x90, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let (desc, conf) = detect_amsi_patch_pattern(&bytes).unwrap();
+        assert!(desc.contains("no-op"));
+        assert_eq!(conf, Confidence::Medium);
+    }
+
+    #[test]
+    fn amsi_patch_no_match_normal_prologue() {
+        // Normal function prologue: sub rsp, 28h; mov ...
+        let bytes = [0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0xC1, 0x00];
+        assert!(detect_amsi_patch_pattern(&bytes).is_none());
+    }
+
+    #[test]
+    fn amsi_patch_too_short() {
+        assert!(detect_amsi_patch_pattern(&[]).is_none());
+        assert!(detect_amsi_patch_pattern(&[0x00]).is_none());
     }
 }

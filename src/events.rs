@@ -224,6 +224,12 @@ pub enum EventData {
         pid: u32,
         script_engine: String,
         content: String,
+        /// Script file path (if available from ETW ScriptBlockLogging).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        script_path: Option<String>,
+        /// GUID linking multi-part script blocks from the same script.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        script_block_id: Option<String>,
     },
     AmsiScan {
         pid: u32,
@@ -231,6 +237,9 @@ pub enum EventData {
         content_name: String,
         content_size: u32,
         scan_result: u32,
+        /// Human-readable AMSI_RESULT name (e.g. "AMSI_RESULT_DETECTED").
+        #[serde(default)]
+        scan_result_name: String,
     },
     EvasionDetected {
         technique: EvasionTechnique,
@@ -342,6 +351,21 @@ pub enum EvasionTechnique {
 pub enum PipeOperation {
     Created,
     Connected,
+}
+
+/// Map an AMSI_RESULT numeric value to a human-readable name.
+///
+/// Values follow the Windows AMSI_RESULT enum:
+/// <https://learn.microsoft.com/en-us/windows/win32/api/amsi/ne-amsi-amsi_result>
+#[allow(dead_code)] // used by ETW collector on Windows; tested cross-platform
+pub fn amsi_result_name(result: u32) -> &'static str {
+    match result {
+        0 => "AMSI_RESULT_CLEAN",
+        1 => "AMSI_RESULT_NOT_DETECTED",
+        16384..=20479 => "AMSI_RESULT_BLOCKED_BY_ADMIN",
+        32768.. => "AMSI_RESULT_DETECTED",
+        _ => "AMSI_RESULT_NOT_DETECTED",
+    }
 }
 
 impl EventData {
@@ -576,5 +600,29 @@ mod tests {
             !json.contains("rule"),
             "rule:None must be omitted from JSON via skip_serializing_if"
         );
+    }
+
+    // --- AMSI result name tests -----------------------------------------------
+
+    #[test]
+    fn amsi_result_name_clean() {
+        assert_eq!(amsi_result_name(0), "AMSI_RESULT_CLEAN");
+    }
+
+    #[test]
+    fn amsi_result_name_not_detected() {
+        assert_eq!(amsi_result_name(1), "AMSI_RESULT_NOT_DETECTED");
+    }
+
+    #[test]
+    fn amsi_result_name_blocked_by_admin() {
+        assert_eq!(amsi_result_name(16384), "AMSI_RESULT_BLOCKED_BY_ADMIN");
+        assert_eq!(amsi_result_name(20479), "AMSI_RESULT_BLOCKED_BY_ADMIN");
+    }
+
+    #[test]
+    fn amsi_result_name_detected() {
+        assert_eq!(amsi_result_name(32768), "AMSI_RESULT_DETECTED");
+        assert_eq!(amsi_result_name(65535), "AMSI_RESULT_DETECTED");
     }
 }
