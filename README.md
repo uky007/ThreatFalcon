@@ -473,25 +473,41 @@ The output includes:
 
 ### Bundle
 
-Package an event and its related context into a single JSON document for sharing or archiving:
+Package an event and its related context into a single JSON document or zip archive for sharing or archiving:
 
 ```bash
-# Bundle to stdout
+# Bundle to stdout (JSON)
 threatfalcon bundle --event <UUID> --input events.jsonl
 
-# Bundle to a file
+# Bundle to a JSON file
 threatfalcon bundle --event <UUID> --input events.jsonl --output bundle.json
 
+# Bundle to a zip archive
+threatfalcon bundle --event <UUID> --input events.jsonl --output bundle.zip
+
 # Custom time window
-threatfalcon bundle --event <UUID> --input events.jsonl --window 10 --output bundle.json
+threatfalcon bundle --event <UUID> --input events.jsonl --window 10 --output bundle.zip
 ```
 
-The bundle includes:
+**JSON output** (default, or when the output path does not end in `.zip`):
 - `bundle_version`: schema version (currently 1)
 - `target_event`: the event being investigated
 - `related_events`: all events sharing the same `process_key` within the time window
 - `event_count`: total number of events in the bundle
 - Metadata: `created_at`, `process_key`, `window_minutes`
+
+**Zip output** (when the output path ends in `.zip`):
+
+The zip archive contains four files:
+
+| File | Contents |
+|------|----------|
+| `manifest.json` | Machine-readable metadata (format, version, event ID, process key, window, file list) |
+| `target_event.json` | The target event (pretty-printed JSON) |
+| `related_events.jsonl` | Related events (one JSON object per line) |
+| `bundle.json` | Full combined bundle (identical to the standalone JSON output) |
+
+The zip format is useful for attaching bundles to tickets, sharing with analysts, or archiving investigations. The `manifest.json` enables tooling to identify and process bundles programmatically.
 
 ## Evasion Detection Rules
 

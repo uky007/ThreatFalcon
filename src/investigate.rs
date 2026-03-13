@@ -443,10 +443,17 @@ fn run_bundle(
         related_events: related,
     };
 
-    let json = serde_json::to_string_pretty(&bundle)?;
-
     match output {
+        Some(path) if is_zip_extension(path) => {
+            write_bundle_zip(path, &bundle)?;
+            eprintln!(
+                "Bundle written to {} ({} events, zip)",
+                path.display(),
+                bundle.event_count
+            );
+        }
         Some(path) => {
+            let json = serde_json::to_string_pretty(&bundle)?;
             std::fs::write(path, &json)
                 .with_context(|| format!("failed to write bundle to {}", path.display()))?;
             eprintln!(
@@ -456,10 +463,90 @@ fn run_bundle(
             );
         }
         None => {
+            let json = serde_json::to_string_pretty(&bundle)?;
             println!("{json}");
         }
     }
 
+    Ok(())
+}
+
+/// True if the path has a `.zip` extension (case-insensitive).
+fn is_zip_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false)
+}
+
+/// Manifest included in zip bundles for metadata and tool interop.
+#[derive(Serialize)]
+struct BundleManifest {
+    format: &'static str,
+    format_version: u32,
+    created_at: DateTime<Utc>,
+    sensor_version: String,
+    target_event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_key: Option<String>,
+    window_minutes: u64,
+    event_count: usize,
+    files: Vec<&'static str>,
+}
+
+/// Write an evidence bundle as a zip archive containing:
+///   - `manifest.json`    — machine-readable metadata
+///   - `target_event.json` — the target event (pretty-printed)
+///   - `related_events.jsonl` — related events (one per line)
+///   - `bundle.json`      — the full combined bundle (same as JSON output)
+fn write_bundle_zip(path: &Path, bundle: &EvidenceBundle) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("failed to create zip at {}", path.display()))?;
+    let mut zip = zip::ZipWriter::new(file);
+
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    // manifest.json
+    let manifest = BundleManifest {
+        format: "threatfalcon-evidence-bundle",
+        format_version: 1,
+        created_at: bundle.created_at,
+        sensor_version: bundle.target_event.sensor_version.clone(),
+        target_event_id: bundle.target_event_id.clone(),
+        process_key: bundle.process_key.clone(),
+        window_minutes: bundle.window_minutes,
+        event_count: bundle.event_count,
+        files: vec![
+            "manifest.json",
+            "target_event.json",
+            "related_events.jsonl",
+            "bundle.json",
+        ],
+    };
+    zip.start_file("manifest.json", options)?;
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    zip.write_all(manifest_json.as_bytes())?;
+
+    // target_event.json
+    zip.start_file("target_event.json", options)?;
+    let target_json = serde_json::to_string_pretty(&bundle.target_event)?;
+    zip.write_all(target_json.as_bytes())?;
+
+    // related_events.jsonl
+    zip.start_file("related_events.jsonl", options)?;
+    for event in &bundle.related_events {
+        let line = serde_json::to_string(event)?;
+        zip.write_all(line.as_bytes())?;
+        zip.write_all(b"\n")?;
+    }
+
+    // bundle.json (full combined — same as non-zip output)
+    zip.start_file("bundle.json", options)?;
+    let bundle_json = serde_json::to_string_pretty(bundle)?;
+    zip.write_all(bundle_json.as_bytes())?;
+
+    zip.finish()?;
     Ok(())
 }
 
@@ -1813,5 +1900,191 @@ mod tests {
             }
             _ => panic!("expected ScriptBlock"),
         }
+    }
+
+    // ---- Zip bundle tests ---------------------------------------------------
+
+    #[test]
+    fn bundle_zip_creates_valid_archive() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+            make_dns_event(100, key),
+        ];
+        let path = write_events(&dir, &events);
+        let zip_path = dir.path().join("bundle.zip");
+
+        let event_id = events[1].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+
+        // Open and verify the zip
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        let expected_files = [
+            "manifest.json",
+            "target_event.json",
+            "related_events.jsonl",
+            "bundle.json",
+        ];
+        assert_eq!(archive.len(), expected_files.len());
+        for name in &expected_files {
+            assert!(
+                archive.by_name(name).is_ok(),
+                "missing zip entry: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_zip_manifest_is_valid() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+        ];
+        let path = write_events(&dir, &events);
+        let zip_path = dir.path().join("out.zip");
+
+        let event_id = events[1].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        let manifest_entry = archive.by_name("manifest.json").unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_reader(manifest_entry).unwrap();
+
+        assert_eq!(manifest["format"], "threatfalcon-evidence-bundle");
+        assert_eq!(manifest["format_version"], 1);
+        assert_eq!(manifest["target_event_id"], event_id);
+        assert_eq!(manifest["process_key"], key);
+        assert_eq!(manifest["event_count"], 2); // target + 1 related
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn bundle_zip_target_event_matches() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![make_network_event(100, key)];
+        let path = write_events(&dir, &events);
+        let zip_path = dir.path().join("target.zip");
+
+        let event_id = events[0].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        let target_entry = archive.by_name("target_event.json").unwrap();
+        let target: ThreatEvent =
+            serde_json::from_reader(target_entry).unwrap();
+
+        assert_eq!(target.id.to_string(), event_id);
+    }
+
+    #[test]
+    fn bundle_zip_related_events_as_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+            make_dns_event(100, key),
+        ];
+        let path = write_events(&dir, &events);
+        let zip_path = dir.path().join("related.zip");
+
+        // Target is events[1]; related should be events[0] and events[2]
+        let event_id = events[1].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        let related_entry = archive.by_name("related_events.jsonl").unwrap();
+        let reader = std::io::BufReader::new(related_entry);
+        let lines: Vec<String> = reader
+            .lines()
+            .map(|l| l.unwrap())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        assert_eq!(lines.len(), 2);
+        // Each line should be valid JSON
+        for line in &lines {
+            let _: ThreatEvent = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn bundle_zip_bundle_json_matches_standalone() {
+        let dir = TempDir::new().unwrap();
+        let key = "100:42";
+        let events = vec![
+            make_process_create(100, key),
+            make_network_event(100, key),
+        ];
+        let path = write_events(&dir, &events);
+        let zip_path = dir.path().join("full.zip");
+        let json_path = dir.path().join("full.json");
+
+        let event_id = events[1].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&json_path)).unwrap();
+        run_bundle(&path, &event_id, 5, Some(&zip_path)).unwrap();
+
+        // Read bundle.json from the zip
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let zip_entry = archive.by_name("bundle.json").unwrap();
+        let zip_bundle: EvidenceBundle =
+            serde_json::from_reader(zip_entry).unwrap();
+
+        // Read the standalone JSON
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        let json_bundle: EvidenceBundle =
+            serde_json::from_str(&json_content).unwrap();
+
+        // Core fields should match
+        assert_eq!(
+            zip_bundle.target_event_id,
+            json_bundle.target_event_id
+        );
+        assert_eq!(zip_bundle.event_count, json_bundle.event_count);
+        assert_eq!(zip_bundle.process_key, json_bundle.process_key);
+        assert_eq!(
+            zip_bundle.related_events.len(),
+            json_bundle.related_events.len()
+        );
+    }
+
+    #[test]
+    fn bundle_non_zip_extension_stays_json() {
+        let dir = TempDir::new().unwrap();
+        let events = vec![make_network_event(100, "100:42")];
+        let path = write_events(&dir, &events);
+        let out_path = dir.path().join("bundle.json");
+
+        let event_id = events[0].id.to_string();
+        run_bundle(&path, &event_id, 5, Some(&out_path)).unwrap();
+
+        // Should be plain JSON, not a zip
+        let content = std::fs::read_to_string(&out_path).unwrap();
+        let _: EvidenceBundle = serde_json::from_str(&content).unwrap();
+    }
+
+    #[test]
+    fn is_zip_extension_variants() {
+        assert!(is_zip_extension(Path::new("bundle.zip")));
+        assert!(is_zip_extension(Path::new("bundle.ZIP")));
+        assert!(is_zip_extension(Path::new("/tmp/out.Zip")));
+        assert!(!is_zip_extension(Path::new("bundle.json")));
+        assert!(!is_zip_extension(Path::new("bundle")));
+        assert!(!is_zip_extension(Path::new("zipfile.tar")));
     }
 }

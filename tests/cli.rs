@@ -458,3 +458,48 @@ fn bundle_to_stdout() {
                 .and(predicate::str::contains(event_id)),
         );
 }
+
+#[test]
+fn bundle_to_zip() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let zip_output = dir.path().join("bundle.zip");
+
+    let event_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let lines = [
+        sample_event(event_id, 100, "100:42", "Network"),
+        sample_event(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            100,
+            "100:42",
+            "Network",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args([
+            "bundle",
+            "--event",
+            event_id,
+            "--input",
+            path.to_str().unwrap(),
+            "--output",
+            zip_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Bundle written to")
+                .and(predicate::str::contains("zip")),
+        );
+
+    // Verify it's a valid zip with the expected entries
+    let file = fs::File::open(&zip_output).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    assert_eq!(archive.len(), 4);
+
+    for name in ["manifest.json", "target_event.json", "related_events.jsonl", "bundle.json"] {
+        assert!(archive.by_name(name).is_ok(), "missing zip entry: {name}");
+    }
+}
