@@ -771,6 +771,43 @@ mod platform {
 
     // ---- Direct syscall detection ----------------------------------------------
 
+    /// Check if a module should be skipped for syscall scanning.
+    ///
+    /// Requires **both** a whitelisted basename (ntdll.dll, win32u.dll)
+    /// **and** a verified system-directory path. A DLL named `ntdll.dll`
+    /// loaded from a non-system location will NOT be whitelisted.
+    fn is_system_syscall_module(
+        handle: HANDLE,
+        module: HMODULE,
+        basename: &str,
+    ) -> bool {
+        if !super::is_syscall_whitelisted(basename) {
+            return false;
+        }
+
+        // Verify the module is loaded from a system directory
+        let mut path_buf = [0u8; 520];
+        let len = unsafe {
+            GetModuleFileNameExA(handle, module, &mut path_buf)
+        };
+        if len == 0 {
+            // Can't verify path — don't whitelist (safe default)
+            return false;
+        }
+        let path = std::str::from_utf8(&path_buf[..len as usize])
+            .unwrap_or("");
+        let path_lower = path.to_ascii_lowercase();
+
+        let sys_root = std::env::var("SystemRoot")
+            .unwrap_or_else(|_| r"C:\Windows".to_string())
+            .to_ascii_lowercase();
+
+        path_lower.starts_with(&format!(r"{}\system32\", sys_root))
+            || path_lower.starts_with(
+                &format!(r"{}\syswow64\", sys_root),
+            )
+    }
+
     /// Maximum bytes to read from a remote module's .text section.
     const MAX_TEXT_READ: usize = 1024 * 1024; // 1 MB
 
@@ -809,8 +846,10 @@ mod platform {
                 std::str::from_utf8(&name_buf[..len as usize])
                     .unwrap_or("");
 
-            // Skip DLLs that legitimately contain syscall stubs
-            if super::is_syscall_whitelisted(mod_name) {
+            // Skip DLLs that legitimately contain syscall stubs,
+            // but only if they're actually loaded from a system
+            // directory (prevents side-loaded same-name bypasses).
+            if is_system_syscall_module(handle, *m, mod_name) {
                 continue;
             }
 
@@ -854,21 +893,22 @@ mod platform {
                     pid: Some(pid),
                     process_name: None,
                     details: format!(
-                        "{} direct syscall stub(s) in module {}: \
-                         process bypasses ntdll user-mode hooks",
+                        "{} suspicious direct syscall stub(s) \
+                         found in non-system module {}",
                         stubs.len(),
                         mod_name,
                     ),
                 },
                 RuleMetadata {
                     id: "TF-EVA-004".into(),
-                    name: "Direct Syscall Stub".into(),
+                    name: "Suspicious Direct Syscall Stub".into(),
                     description: "A non-system module contains \
-                        syscall/int 0x2e stubs with the canonical \
-                        mov r10,rcx; mov eax,SSN prologue used by \
-                        tools like SysWhispers. The process makes \
-                        direct system calls that bypass ntdll \
-                        user-mode hooks installed by security tools."
+                        syscall/int 0x2e instruction sequences \
+                        with the mov r10,rcx; mov eax,SSN prologue \
+                        characteristic of tools like SysWhispers. \
+                        This pattern is commonly used to invoke \
+                        system calls without going through ntdll, \
+                        but the sensor has not confirmed execution."
                         .into(),
                     mitre: MitreRef {
                         tactic: "Defense Evasion".into(),
@@ -877,7 +917,7 @@ mod platform {
                             "Impair Defenses: Disable or Modify Tools"
                                 .into(),
                     },
-                    confidence: Confidence::High,
+                    confidence: Confidence::Medium,
                     evidence,
                 },
             ));
