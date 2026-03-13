@@ -1109,10 +1109,11 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
 
     let file = std::fs::File::open(input)
         .with_context(|| format!("cannot open {}", input.display()))?;
+    let file_size = file.metadata()?.len();
     let mut reader = std::io::BufReader::new(file);
 
     // Seek to end — only show newly appended events
-    let file_size = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::End(0))?;
     eprintln!(
         "Tailing {} (skipped {} bytes, Ctrl+C to stop)",
         input.display(),
@@ -1126,7 +1127,19 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
         line_buf.clear();
         match reader.read_line(&mut line_buf) {
             Ok(0) => {
-                // No new data — wait before polling again
+                // No new data — check for file rotation before sleeping.
+                // The file at the path may have been replaced (rename + new
+                // create) by the output sink's rotation logic.
+                if tail_file_rotated(input, &reader) {
+                    eprintln!("File rotated, reopening {}", input.display());
+                    drop(stdout);
+                    let new_file = std::fs::File::open(input)
+                        .with_context(|| format!("cannot reopen {}", input.display()))?;
+                    reader = std::io::BufReader::new(new_file);
+                    stdout = std::io::stdout().lock();
+                    continue;
+                }
+
                 drop(stdout);
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 stdout = std::io::stdout().lock();
@@ -1162,6 +1175,42 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Check if the file at `path` is a different file than the one backing
+/// `reader` (i.e., the file was rotated/replaced).
+fn tail_file_rotated(
+    path: &Path,
+    reader: &std::io::BufReader<std::fs::File>,
+) -> bool {
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false, // path gone temporarily during rotation
+    };
+    let handle_meta = match reader.get_ref().metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    // On Unix, compare device + inode to detect file replacement.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if handle_meta.dev() != path_meta.dev() || handle_meta.ino() != path_meta.ino() {
+            return true;
+        }
+    }
+
+    // Fallback (non-Unix): if the path's file is smaller than our handle's
+    // current size, assume rotation. Not perfect but covers truncation.
+    #[cfg(not(unix))]
+    {
+        if path_meta.len() < handle_meta.len() {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------

@@ -1281,3 +1281,56 @@ fn tail_skips_existing_content() {
         "tail should show newly appended event"
     );
 }
+
+#[test]
+fn tail_survives_file_rotation() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Write some initial content so there's something to rotate away
+    let initial = sample_etw_event(
+        "11111111-1111-1111-1111-111111111111",
+        100, "100:42", "Network", "Info", "2026-03-13T09:00:00Z",
+    );
+    fs::write(&path, format!("{initial}\n")).unwrap();
+
+    let path_str = path.to_str().unwrap().to_string();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("threatfalcon"))
+        .args(["tail", "--input", &path_str, "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Simulate file rotation: rename the current file and create a new one
+    let rotated = dir.path().join("events.jsonl.1");
+    fs::rename(&path, &rotated).unwrap();
+
+    // Create the new file with a post-rotation event
+    let post_rotation = sample_etw_event(
+        "22222222-2222-2222-2222-222222222222",
+        200, "200:43", "Network", "Info", "2026-03-13T10:00:00Z",
+    );
+    fs::write(&path, format!("{post_rotation}\n")).unwrap();
+
+    // Wait for tail to detect rotation and read the new file
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should NOT contain the pre-rotation event
+    assert!(
+        !stdout.contains("11111111"),
+        "tail should not show pre-existing content"
+    );
+    // Should contain the post-rotation event from the new file
+    assert!(
+        stdout.contains("22222222"),
+        "tail should pick up events from the new file after rotation, got: {stdout}"
+    );
+}
