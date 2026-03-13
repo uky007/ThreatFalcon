@@ -99,12 +99,16 @@ fn stdout_and_output_conflict() {
 }
 
 #[test]
-fn service_flag_shown_in_help() {
+fn service_flags_shown_in_help() {
     cmd()
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("--service"));
+        .stdout(
+            predicate::str::contains("--service")
+                .and(predicate::str::contains("--install-service"))
+                .and(predicate::str::contains("--uninstall-service")),
+        );
 }
 
 #[test]
@@ -133,4 +137,42 @@ fn service_flag_rejected_on_non_windows() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("only supported on Windows"));
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn install_service_rejected_on_non_windows() {
+    cmd()
+        .arg("--install-service")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported on Windows"));
+}
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn uninstall_service_rejected_on_non_windows() {
+    cmd()
+        .arg("--uninstall-service")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported on Windows"));
+}
+
+#[test]
+fn install_service_conflicts_with_stdout() {
+    cmd()
+        .args(["--install-service", "--stdout"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn uninstall_service_conflicts_with_service() {
+    cmd()
+        .args(["--uninstall-service", "--service"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }

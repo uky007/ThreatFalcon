@@ -52,6 +52,14 @@ struct Cli {
     /// Run as a Windows service (used by SCM, not for manual invocation)
     #[arg(long, conflicts_with_all = ["stdout", "output"])]
     service: bool,
+
+    /// Install ThreatFalcon as a Windows service and exit
+    #[arg(long, conflicts_with_all = ["stdout", "output", "service", "validate_config", "dump_default_config"])]
+    install_service: bool,
+
+    /// Uninstall the ThreatFalcon Windows service and exit
+    #[arg(long, conflicts_with_all = ["stdout", "output", "service", "validate_config", "dump_default_config", "config"])]
+    uninstall_service: bool,
 }
 
 fn main() {
@@ -85,6 +93,16 @@ fn main() {
                 std::process::exit(exit_code::CONFIG_ERROR);
             }
         }
+    }
+
+    // --install-service: register with SCM and exit
+    if cli.install_service {
+        run_install_service(cli.config);
+    }
+
+    // --uninstall-service: remove from SCM and exit
+    if cli.uninstall_service {
+        run_uninstall_service();
     }
 
     // --service: run as Windows service
@@ -123,6 +141,56 @@ fn run_service_mode(config_path: Option<PathBuf>) -> ! {
     {
         let _ = config_path;
         eprintln!("--service is only supported on Windows");
+        std::process::exit(exit_code::RUNTIME_ERROR);
+    }
+}
+
+/// Register ThreatFalcon with the Windows Service Control Manager.
+fn run_install_service(config_path: Option<PathBuf>) -> ! {
+    #[cfg(target_os = "windows")]
+    {
+        match service::install(config_path.as_deref()) {
+            Ok(()) => {
+                eprintln!("Service '{}' installed successfully.", service::SERVICE_NAME);
+                if let Some(ref p) = config_path {
+                    eprintln!("Config: {}", p.display());
+                }
+                std::process::exit(exit_code::SUCCESS);
+            }
+            Err(e) => {
+                eprintln!("Failed to install service: {e}");
+                std::process::exit(exit_code::RUNTIME_ERROR);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = config_path;
+        eprintln!("--install-service is only supported on Windows");
+        std::process::exit(exit_code::RUNTIME_ERROR);
+    }
+}
+
+/// Remove ThreatFalcon from the Windows Service Control Manager.
+fn run_uninstall_service() -> ! {
+    #[cfg(target_os = "windows")]
+    {
+        match service::uninstall() {
+            Ok(()) => {
+                eprintln!("Service '{}' uninstalled successfully.", service::SERVICE_NAME);
+                std::process::exit(exit_code::SUCCESS);
+            }
+            Err(e) => {
+                eprintln!("Failed to uninstall service: {e}");
+                std::process::exit(exit_code::RUNTIME_ERROR);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        eprintln!("--uninstall-service is only supported on Windows");
         std::process::exit(exit_code::RUNTIME_ERROR);
     }
 }
