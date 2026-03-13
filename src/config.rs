@@ -186,6 +186,28 @@ pub struct EvasionConfig {
     pub detect_direct_syscall: bool,
 }
 
+/// Search for `CONFIG_FILE` in a list of candidate directories.
+///
+/// When `cwd_override` is `Some`, that directory is checked first (used in
+/// tests to avoid mutating the process-global cwd). When `None`, the real
+/// current directory is checked. The platform base dir (ProgramData on
+/// Windows) is always checked second.
+fn find_config_file(cwd_override: Option<&std::path::Path>) -> Option<PathBuf> {
+    let cwd_path = match cwd_override {
+        Some(dir) => dir.join(CONFIG_FILE),
+        None => PathBuf::from(CONFIG_FILE),
+    };
+    let platform_path = default_base_dir().map(|d| d.join(CONFIG_FILE));
+
+    if cwd_path.exists() {
+        Some(cwd_path)
+    } else if let Some(ref pp) = platform_path {
+        if pp.exists() { Some(pp.clone()) } else { None }
+    } else {
+        None
+    }
+}
+
 impl SensorConfig {
     /// Load config from the given path, or from the default `CONFIG_FILE` if
     /// `path` is `None`. Returns defaults when no file is found.
@@ -213,17 +235,7 @@ impl SensorConfig {
                 (cfg, anchor)
             }
             None => {
-                // Search order: cwd, then platform base dir (ProgramData on Windows).
-                let cwd_path = PathBuf::from(CONFIG_FILE);
-                let platform_path = default_base_dir().map(|d| d.join(CONFIG_FILE));
-
-                let found = if cwd_path.exists() {
-                    Some(cwd_path)
-                } else if let Some(ref pp) = platform_path {
-                    if pp.exists() { Some(pp.clone()) } else { None }
-                } else {
-                    None
-                };
+                let found = find_config_file(None);
 
                 if let Some(path) = found {
                     let content = std::fs::read_to_string(&path)?;
@@ -710,26 +722,22 @@ mod tests {
     }
 
     #[test]
-    fn config_file_lookup_prefers_cwd() {
-        // When a config file exists in cwd, it should be used even if
-        // a platform dir would also have one.
+    fn config_file_lookup_finds_in_cwd() {
+        // find_config_file should discover a config in the given directory.
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join(CONFIG_FILE);
-        std::fs::write(
-            &config_path,
-            "hostname = \"FROM-CWD\"\n",
-        )
-        .unwrap();
+        std::fs::write(&config_path, "hostname = \"FROM-CWD\"\n").unwrap();
 
-        // Change cwd to the temp dir
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
+        let found = find_config_file(Some(dir.path()));
+        assert_eq!(found, Some(config_path));
+    }
 
-        let cfg = SensorConfig::load_from(None).unwrap();
-        assert_eq!(cfg.hostname, "FROM-CWD");
-
-        // Restore cwd
-        std::env::set_current_dir(original_dir).unwrap();
+    #[test]
+    fn config_file_lookup_returns_none_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No config file written — should return None.
+        let found = find_config_file(Some(dir.path()));
+        assert_eq!(found, None);
     }
 
     #[test]
