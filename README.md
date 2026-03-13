@@ -341,6 +341,8 @@ The sensor maintains an in-memory process context cache, populated from `Process
 
 The cache is bounded (10,000 entries) and keyed by PID. When a PID is reused, the new `ProcessCreate` replaces the old entry. `ProcessTerminate` events verify `create_time` to avoid evicting a newer process that reused the same PID.
 
+ETW events carry a precise OS-level creation timestamp (`create_time`), which produces PID-reuse-safe process keys. Sysmon events do not carry a comparable timestamp, so the cache applies source priority: an ETW-backed entry is never overwritten or evicted by a Sysmon event that lacks `create_time`. In Sysmon-only mode, process keys use a zero create_time (`{pid}:0`) and PID-reuse protection is best-effort.
+
 Example ProcessCreate event:
 
 ```json

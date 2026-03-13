@@ -6,6 +6,11 @@ use crate::events::{EventData, ProcessContext, ThreatEvent};
 #[derive(Debug, Clone)]
 struct CacheEntry {
     process_key: String,
+    /// Original create_time from the ProcessCreate event. `Some` for ETW
+    /// events (which carry a Windows FILETIME), `None` for Sysmon events.
+    /// Used to decide source priority: entries with a real create_time are
+    /// never overwritten or evicted by events that lack one.
+    create_time: Option<u64>,
     image_path: String,
     command_line: String,
     user: String,
@@ -59,8 +64,29 @@ impl ProcessCache {
             } => {
                 let process_key = make_process_key(*pid, *create_time);
 
+                // Don't downgrade: if the cache already holds an ETW entry
+                // (with a real create_time) for this PID, a Sysmon event
+                // (create_time: None) must not overwrite it.
+                if create_time.is_none() {
+                    if let Some(existing) = self.entries.get(pid) {
+                        if existing.create_time.is_some() {
+                            // Return the existing (stronger) key on the event.
+                            event.process_context = Some(ProcessContext {
+                                process_key: existing.process_key.clone(),
+                                image_path: None,
+                                command_line: None,
+                                user: None,
+                                integrity_level: None,
+                                ppid: None,
+                            });
+                            return;
+                        }
+                    }
+                }
+
                 let entry = CacheEntry {
                     process_key: process_key.clone(),
+                    create_time: *create_time,
                     image_path: image_path.clone(),
                     command_line: command_line.clone(),
                     user: user.clone(),
@@ -94,17 +120,23 @@ impl ProcessCache {
                 pid, create_time, ..
             } => {
                 if let Some(entry) = self.entries.get(pid) {
-                    // If create_time is available, verify it matches to avoid
-                    // evicting a newer process that reused the same PID.
-                    let matches = match create_time {
+                    let should_evict = match create_time {
                         Some(ct) => {
+                            // Verify create_time matches to avoid evicting a
+                            // newer process that reused the same PID.
                             let expected = make_process_key(*pid, Some(*ct));
                             entry.process_key == expected
                         }
-                        None => true,
+                        None => {
+                            // Terminate without create_time (e.g., Sysmon).
+                            // Only evict if the cached entry also lacks a real
+                            // create_time — don't let a Sysmon terminate evict
+                            // a stronger ETW-backed entry.
+                            entry.create_time.is_none()
+                        }
                     };
 
-                    if matches {
+                    if should_evict {
                         event.process_context = Some(build_context(entry));
                         self.entries.remove(pid);
                     }
@@ -398,19 +430,35 @@ mod tests {
     }
 
     #[test]
-    fn terminate_without_create_time_evicts() {
+    fn sysmon_terminate_does_not_evict_etw_entry() {
         let mut cache = ProcessCache::new(1000);
 
+        // ETW-backed entry (has real create_time)
         let mut create = process_create_event(600, Some(5000));
         cache.enrich(&mut create);
 
-        // Terminate without create_time (e.g., from Sysmon)
+        // Sysmon terminate (no create_time) — must not evict the stronger entry
         let mut term = process_terminate_event(600, None);
         cache.enrich(&mut term);
 
-        // Should evict — no create_time to mismatch
+        assert!(term.process_context.is_none());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn sysmon_terminate_evicts_sysmon_entry() {
+        let mut cache = ProcessCache::new(1000);
+
+        // Sysmon-backed entry (no create_time)
+        let mut create = process_create_event(600, None);
+        cache.enrich(&mut create);
+
+        // Sysmon terminate (no create_time) — both weak, safe to evict
+        let mut term = process_terminate_event(600, None);
+        cache.enrich(&mut term);
+
         let ctx = term.process_context.unwrap();
-        assert_eq!(ctx.process_key, "600:5000");
+        assert_eq!(ctx.process_key, "600:0");
         assert_eq!(cache.len(), 0);
     }
 
@@ -587,6 +635,71 @@ mod tests {
         assert!(!json.contains("command_line"));
         assert!(!json.contains("user"));
         assert!(!json.contains("ppid"));
+    }
+
+    // ---- Mixed-source priority tests -----------------------------------------
+
+    #[test]
+    fn sysmon_create_does_not_overwrite_etw_entry() {
+        let mut cache = ProcessCache::new(1000);
+
+        // ETW ProcessCreate (has real create_time)
+        let mut etw_create = process_create_event(100, Some(9999));
+        cache.enrich(&mut etw_create);
+
+        // Sysmon ProcessCreate for same PID (no create_time) arrives later
+        let mut sysmon_create = process_create_event(100, None);
+        cache.enrich(&mut sysmon_create);
+
+        // Sysmon event should get the existing ETW key, not overwrite
+        let ctx = sysmon_create.process_context.unwrap();
+        assert_eq!(ctx.process_key, "100:9999");
+
+        // Activity events should still see the ETW entry
+        let mut net = network_event(100);
+        cache.enrich(&mut net);
+        assert_eq!(net.process_context.unwrap().process_key, "100:9999");
+    }
+
+    #[test]
+    fn etw_create_overwrites_sysmon_entry() {
+        let mut cache = ProcessCache::new(1000);
+
+        // Sysmon first (no create_time)
+        let mut sysmon_create = process_create_event(100, None);
+        cache.enrich(&mut sysmon_create);
+        assert_eq!(
+            sysmon_create.process_context.unwrap().process_key,
+            "100:0"
+        );
+
+        // ETW arrives later (has real create_time) — should replace
+        let mut etw_create = process_create_event(100, Some(8888));
+        cache.enrich(&mut etw_create);
+
+        let mut net = network_event(100);
+        cache.enrich(&mut net);
+        assert_eq!(net.process_context.unwrap().process_key, "100:8888");
+    }
+
+    #[test]
+    fn sysmon_only_mode_works_with_weak_keys() {
+        let mut cache = ProcessCache::new(1000);
+
+        // Sysmon create and activity
+        let mut create = process_create_event(42, None);
+        cache.enrich(&mut create);
+        assert_eq!(create.process_context.unwrap().process_key, "42:0");
+
+        let mut net = network_event(42);
+        cache.enrich(&mut net);
+        assert_eq!(net.process_context.unwrap().process_key, "42:0");
+
+        // Sysmon terminate evicts the weak entry
+        let mut term = process_terminate_event(42, None);
+        cache.enrich(&mut term);
+        assert_eq!(term.process_context.unwrap().process_key, "42:0");
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
