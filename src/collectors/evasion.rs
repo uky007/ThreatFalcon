@@ -212,9 +212,10 @@ mod platform {
         let interval =
             std::time::Duration::from_millis(config.scan_interval_ms);
 
-        // Build a reference for ntdll unhooking detection: on-disk clean
-        // copy + whether our own in-memory ntdll has EDR hooks installed.
+        // Build references at startup: on-disk PE parsing + export table
+        // resolution. These are reused across all scan cycles.
         let ntdll_reference = build_ntdll_reference();
+        let amsi_reference = build_amsi_reference();
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -234,7 +235,7 @@ mod platform {
 
                 if config.detect_etw_patching {
                     if let Some(evt) =
-                        check_etw_patching(handle, *pid, agent)
+                        check_etw_patching(handle, *pid, agent, &ntdll_reference)
                     {
                         if let Err(e) = tx.try_send(evt) {
                             dropped.fetch_add(1, Ordering::Relaxed);
@@ -245,7 +246,7 @@ mod platform {
 
                 if config.detect_amsi_bypass {
                     if let Some(evt) =
-                        check_amsi_bypass(handle, *pid, agent)
+                        check_amsi_bypass(handle, *pid, agent, &amsi_reference)
                     {
                         if let Err(e) = tx.try_send(evt) {
                             dropped.fetch_add(1, Ordering::Relaxed);
@@ -327,24 +328,12 @@ mod platform {
         handle: HANDLE,
         pid: u32,
         agent: &crate::events::AgentInfo,
+        ntdll_ref: &Option<NtdllReference>,
     ) -> Option<ThreatEvent> {
+        let ntdll_ref = ntdll_ref.as_ref()?;
+        let rva = ntdll_ref.etw_write_rva?;
         let ntdll_base = find_module_in_process(handle, "ntdll.dll")?;
-
-        let our_ntdll = unsafe {
-            GetModuleHandleA(windows::core::PCSTR(
-                b"ntdll.dll\0".as_ptr(),
-            ))
-        }
-        .ok()?;
-        let fn_addr = unsafe {
-            GetProcAddress(
-                our_ntdll,
-                windows::core::PCSTR(b"EtwEventWrite\0".as_ptr()),
-            )
-        }?;
-
-        let offset = fn_addr as usize - our_ntdll.0 as usize;
-        let target_addr = ntdll_base + offset;
+        let target_addr = ntdll_base + rva as usize;
 
         let mut buf = [0u8; 4];
         let mut read = 0usize;
@@ -367,7 +356,7 @@ mod platform {
             let evidence = vec![
                 format!("EtwEventWrite first bytes: {:02X} {:02X} {:02X} {:02X}", buf[0], buf[1], buf[2], buf[3]),
                 format!("ntdll base in target: 0x{ntdll_base:X}"),
-                format!("function offset: 0x{offset:X}"),
+                format!("function RVA: 0x{rva:X} (from export table)"),
             ];
             return Some(ThreatEvent::with_rule(
                 agent,
@@ -411,24 +400,11 @@ mod platform {
         handle: HANDLE,
         pid: u32,
         agent: &crate::events::AgentInfo,
+        amsi_ref: &Option<AmsiReference>,
     ) -> Option<ThreatEvent> {
+        let amsi_ref = amsi_ref.as_ref()?;
         let amsi_base = find_module_in_process(handle, "amsi.dll")?;
-
-        let our_amsi = unsafe {
-            GetModuleHandleA(windows::core::PCSTR(
-                b"amsi.dll\0".as_ptr(),
-            ))
-        }
-        .ok()?;
-        let fn_addr = unsafe {
-            GetProcAddress(
-                our_amsi,
-                windows::core::PCSTR(b"AmsiScanBuffer\0".as_ptr()),
-            )
-        }?;
-
-        let offset = fn_addr as usize - our_amsi.0 as usize;
-        let target_addr = amsi_base + offset;
+        let target_addr = amsi_base + amsi_ref.scan_buffer_rva as usize;
 
         let mut buf = [0u8; 8];
         let mut read = 0usize;
@@ -452,7 +428,7 @@ mod platform {
             let evidence = vec![
                 format!("AmsiScanBuffer first bytes: {:02X?}", &buf[..6]),
                 format!("amsi.dll base in target: 0x{amsi_base:X}"),
-                format!("function offset: 0x{offset:X}"),
+                format!("function RVA: 0x{:X} (from export table)", amsi_ref.scan_buffer_rva),
             ];
             return Some(ThreatEvent::with_rule(
                 agent,
@@ -491,7 +467,7 @@ mod platform {
 
     // ---- ntdll unhooking detection ------------------------------------------
 
-    /// Reference data for ntdll unhooking detection.
+    /// Reference data for ntdll unhooking and ETW patching detection.
     struct NtdllReference {
         /// Clean .text section bytes read from on-disk ntdll.dll
         ondisk_text: Vec<u8>,
@@ -511,12 +487,41 @@ mod platform {
         /// This is a deliberate trade-off — false negatives in that edge
         /// case are preferable to mass false positives.
         hooks_present: bool,
+        /// RVA of `EtwEventWrite` from the export table.
+        /// Used by ETW patching detection to locate the function in
+        /// target processes without calling GetProcAddress per-process.
+        etw_write_rva: Option<u32>,
     }
 
-    /// Build the reference by loading the on-disk ntdll and comparing it
-    /// with our own in-memory copy to detect whether hooks are installed.
+    /// Reference data for AMSI bypass detection.
+    struct AmsiReference {
+        /// RVA of `AmsiScanBuffer` from the on-disk amsi.dll export table.
+        scan_buffer_rva: u32,
+    }
+
+    /// Build the ntdll reference by parsing the on-disk PE headers and
+    /// export table, then comparing .text with our in-memory copy to
+    /// detect whether hooks are installed.
     fn build_ntdll_reference() -> Option<NtdllReference> {
-        let (ondisk_text, text_rva, text_size) = load_ondisk_ntdll_text()?;
+        let path = r"C:\Windows\System32\ntdll.dll";
+        let data = std::fs::read(path).ok()?;
+        let pe = crate::pe::PeHeaders::parse(&data)?;
+        let text = pe.text_section()?;
+        let ondisk_text = pe.read_section_data(&data, text)?.to_vec();
+        let text_rva = text.virtual_address;
+        let text_size = ondisk_text.len() as u32;
+
+        // Resolve EtwEventWrite RVA from export table (replaces per-process
+        // GetProcAddress calls with a single on-disk parse at startup).
+        let etw_write_rva = pe.find_export_rva(&data, "EtwEventWrite");
+        if etw_write_rva.is_some() {
+            tracing::info!(
+                rva = format_args!("0x{:X}", etw_write_rva.unwrap()),
+                "EtwEventWrite located via export table"
+            );
+        } else {
+            tracing::warn!("EtwEventWrite not found in ntdll export table");
+        }
 
         // Read our own in-memory ntdll .text to check for hooks
         let our_ntdll = unsafe {
@@ -561,6 +566,24 @@ mod platform {
             text_rva,
             text_size,
             hooks_present,
+            etw_write_rva,
+        })
+    }
+
+    /// Build the AMSI reference by parsing amsi.dll's export table from
+    /// disk. This avoids the need for the sensor to have amsi.dll loaded
+    /// (it is typically only loaded by PowerShell/.NET hosts).
+    fn build_amsi_reference() -> Option<AmsiReference> {
+        let path = r"C:\Windows\System32\amsi.dll";
+        let data = std::fs::read(path).ok()?;
+        let pe = crate::pe::PeHeaders::parse(&data)?;
+        let rva = pe.find_export_rva(&data, "AmsiScanBuffer")?;
+        tracing::info!(
+            rva = format_args!("0x{rva:X}"),
+            "AmsiScanBuffer located via export table"
+        );
+        Some(AmsiReference {
+            scan_buffer_rva: rva,
         })
     }
 
@@ -701,73 +724,8 @@ mod platform {
         None
     }
 
-    /// Load the ntdll .text section from disk at
-    /// `C:\Windows\System32\ntdll.dll` and parse PE headers to find the
-    /// .text section RVA and size.  Returns (bytes, rva, size).
-    fn load_ondisk_ntdll_text() -> Option<(Vec<u8>, u32, u32)> {
-        let path = r"C:\Windows\System32\ntdll.dll";
-        let data = std::fs::read(path).ok()?;
-
-        // Minimal PE parsing
-        if data.len() < 0x40 {
-            return None;
-        }
-        let pe_offset =
-            u32::from_le_bytes(data[0x3C..0x40].try_into().ok()?) as usize;
-        if data.len() < pe_offset + 4 {
-            return None;
-        }
-        // Verify PE signature "PE\0\0"
-        if &data[pe_offset..pe_offset + 4] != b"PE\0\0" {
-            return None;
-        }
-
-        let coff_start = pe_offset + 4;
-        let num_sections = u16::from_le_bytes(
-            data[coff_start + 2..coff_start + 4].try_into().ok()?,
-        ) as usize;
-        let opt_header_size = u16::from_le_bytes(
-            data[coff_start + 16..coff_start + 18].try_into().ok()?,
-        ) as usize;
-
-        let sections_start = coff_start + 20 + opt_header_size;
-
-        for i in 0..num_sections {
-            let sec = sections_start + i * 40;
-            if data.len() < sec + 40 {
-                break;
-            }
-            let sec_name = &data[sec..sec + 8];
-            if sec_name.starts_with(b".text") {
-                let virtual_size = u32::from_le_bytes(
-                    data[sec + 8..sec + 12].try_into().ok()?,
-                );
-                let virtual_addr = u32::from_le_bytes(
-                    data[sec + 12..sec + 16].try_into().ok()?,
-                );
-                let raw_size = u32::from_le_bytes(
-                    data[sec + 16..sec + 20].try_into().ok()?,
-                );
-                let raw_offset = u32::from_le_bytes(
-                    data[sec + 20..sec + 24].try_into().ok()?,
-                );
-
-                let size = raw_size.min(virtual_size) as usize;
-                let off = raw_offset as usize;
-                if data.len() < off + size {
-                    return None;
-                }
-
-                return Some((
-                    data[off..off + size].to_vec(),
-                    virtual_addr,
-                    size as u32,
-                ));
-            }
-        }
-
-        None
-    }
+    // load_ondisk_ntdll_text removed — PE parsing now handled by
+    // build_ntdll_reference() via crate::pe::PeHeaders.
 
     // ---- Direct syscall detection ----------------------------------------------
 
@@ -927,100 +885,57 @@ mod platform {
     }
 
     /// Read the .text section of a remote module by parsing its PE
-    /// header from the target process's memory.  Returns `(bytes, rva)`.
+    /// headers from the target process's memory.  Returns `(bytes, rva)`.
     fn read_remote_text_section(
         handle: HANDLE,
         module_base: usize,
     ) -> Option<(Vec<u8>, u32)> {
-        // Read DOS header (first 64 bytes)
-        let mut dos = [0u8; 64];
+        // Read the first 4096 bytes — enough for DOS + PE + COFF +
+        // optional header + section headers in all practical cases.
+        const HEADER_READ: usize = 4096;
+        let mut header_buf = [0u8; HEADER_READ];
         let mut read = 0usize;
         unsafe {
             ReadProcessMemory(
                 handle,
                 module_base as *const std::ffi::c_void,
-                dos.as_mut_ptr() as *mut std::ffi::c_void,
-                64,
+                header_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                HEADER_READ,
                 Some(&mut read),
             )
             .ok()?;
         }
-        if read < 64 || dos[0] != b'M' || dos[1] != b'Z' {
+        if read < 64 {
             return None;
         }
 
-        let pe_offset = u32::from_le_bytes(
-            dos[0x3C..0x40].try_into().ok()?,
-        ) as usize;
+        let pe = crate::pe::PeHeaders::parse(&header_buf[..read])?;
+        let text = pe.text_section()?;
 
-        // Read PE + COFF + optional header + section headers
-        let header_size = 4 + 20 + 240 + 40 * 96;
-        let mut pe_buf = vec![0u8; header_size];
-        unsafe {
+        // Validate: only read sections that are actually code
+        if !text.is_executable() && !text.contains_code() {
+            return None;
+        }
+
+        let size = (text.virtual_size as usize).min(MAX_TEXT_READ);
+        let text_addr = module_base + text.virtual_address as usize;
+
+        let mut text_bytes = vec![0u8; size];
+        let ok = unsafe {
             ReadProcessMemory(
                 handle,
-                (module_base + pe_offset) as *const std::ffi::c_void,
-                pe_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                header_size,
+                text_addr as *const std::ffi::c_void,
+                text_bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                size,
                 Some(&mut read),
             )
-            .ok()?;
-        }
-        if read < 28 || &pe_buf[0..4] != b"PE\0\0" {
+        };
+
+        if ok.is_err() || read < size {
             return None;
         }
 
-        let coff_start = 4;
-        let num_sections = u16::from_le_bytes(
-            pe_buf[coff_start + 2..coff_start + 4].try_into().ok()?,
-        ) as usize;
-        let opt_header_size = u16::from_le_bytes(
-            pe_buf[coff_start + 16..coff_start + 18]
-                .try_into()
-                .ok()?,
-        ) as usize;
-
-        let sections_start = coff_start + 20 + opt_header_size;
-
-        for i in 0..num_sections {
-            let sec = sections_start + i * 40;
-            if pe_buf.len() < sec + 40 {
-                break;
-            }
-            if pe_buf[sec..sec + 8].starts_with(b".text") {
-                let virtual_size = u32::from_le_bytes(
-                    pe_buf[sec + 8..sec + 12].try_into().ok()?,
-                );
-                let virtual_addr = u32::from_le_bytes(
-                    pe_buf[sec + 12..sec + 16].try_into().ok()?,
-                );
-
-                let size =
-                    (virtual_size as usize).min(MAX_TEXT_READ);
-                let text_addr =
-                    module_base + virtual_addr as usize;
-
-                let mut text = vec![0u8; size];
-                let ok = unsafe {
-                    ReadProcessMemory(
-                        handle,
-                        text_addr as *const std::ffi::c_void,
-                        text.as_mut_ptr()
-                            as *mut std::ffi::c_void,
-                        size,
-                        Some(&mut read),
-                    )
-                };
-
-                if ok.is_err() || read < size {
-                    return None;
-                }
-
-                return Some((text, virtual_addr));
-            }
-        }
-
-        None
+        Some((text_bytes, text.virtual_address))
     }
 }
 

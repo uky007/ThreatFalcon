@@ -3,6 +3,8 @@ mod config;
 mod events;
 mod investigate;
 mod output;
+#[allow(dead_code)] // used by evasion collector on Windows; tested cross-platform
+mod pe;
 mod process_cache;
 mod sensor;
 #[cfg(target_os = "windows")]

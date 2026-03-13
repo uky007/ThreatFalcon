@@ -109,6 +109,7 @@ ThreatFalcon is split into a small number of clear components:
 - `src/collectors/etw.rs`: ETW real-time session and event mapping
 - `src/collectors/sysmon.rs`: Sysmon Event Log subscription
 - `src/collectors/sysmon_parser.rs`: Sysmon XML parsing and mapping
+- `src/pe.rs`: cross-platform PE header parser (sections, exports)
 - `src/investigate.rs`: local investigation CLI (query, explain, bundle)
 - `src/collectors/evasion.rs`: evasion-oriented process inspection
 
@@ -513,7 +514,9 @@ mov eax, <SSN>      ; B8 xx xx xx xx
 syscall / int 0x2e  ; 0F 05 or CD 2E
 ```
 
-The scanner enumerates loaded modules per process, skips system DLLs that legitimately contain syscall stubs (ntdll.dll, win32u.dll — verified by full path to `System32`/`SysWOW64`, not just basename), reads the `.text` section of remaining modules, and matches the stub pattern. Evidence includes the module name, stub offset, SSN value, and raw bytes.
+The scanner enumerates loaded modules per process, skips system DLLs that legitimately contain syscall stubs (ntdll.dll, win32u.dll — verified by full path to `System32`/`SysWOW64`, not just basename), parses each module's PE headers to locate the `.text` section by RVA and characteristics, and matches the stub pattern. Evidence includes the module name, stub offset, SSN value, and raw bytes.
+
+Function locations for ETW patching (`EtwEventWrite`) and AMSI bypass (`AmsiScanBuffer`) detection are resolved from the on-disk PE export table at scanner startup, eliminating per-process `GetProcAddress` calls and enabling AMSI detection even when the sensor process does not have `amsi.dll` loaded.
 
 Note: TF-EVA-004 detects the **presence** of syscall stubs in non-system modules. It does not confirm that the stubs were executed or that ntdll hooks were actively bypassed. Confidence is Medium to reflect this distinction.
 
