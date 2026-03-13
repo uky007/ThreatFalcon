@@ -128,6 +128,17 @@ pub enum Command {
         #[arg(long)]
         status: bool,
     },
+
+    /// Show summary statistics for a JSONL telemetry file
+    Stats {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run an investigation subcommand.
@@ -196,6 +207,8 @@ pub fn run(command: Command) -> Result<()> {
             rebuild,
             status,
         } => run_index(&input, rebuild, status),
+
+        Command::Stats { input, json } => run_stats(&input, json),
     }
 }
 
@@ -762,6 +775,260 @@ fn run_index(input: &Path, rebuild: bool, status: bool) -> Result<()> {
         stats.total_events,
         index::index_path_for(input).display()
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+/// Summary statistics for a JSONL telemetry file.
+#[derive(Serialize)]
+struct EventStats {
+    total_events: u64,
+    time_range: Option<TimeRange>,
+    by_category: Vec<CountEntry>,
+    by_severity: Vec<CountEntry>,
+    by_source: Vec<CountEntry>,
+    top_processes: Vec<ProcessEntry>,
+    top_rules: Vec<CountEntry>,
+}
+
+#[derive(Serialize)]
+struct CountEntry {
+    label: String,
+    count: u64,
+}
+
+#[derive(Serialize)]
+struct ProcessEntry {
+    pid: u32,
+    process_key: Option<String>,
+    image: Option<String>,
+    count: u64,
+}
+
+fn run_stats(input: &Path, json: bool) -> Result<()> {
+    use std::collections::HashMap;
+
+    let mut total: u64 = 0;
+    let mut earliest: Option<DateTime<Utc>> = None;
+    let mut latest: Option<DateTime<Utc>> = None;
+    let mut by_category: HashMap<String, u64> = HashMap::new();
+    let mut by_severity: HashMap<String, u64> = HashMap::new();
+    let mut by_source: HashMap<String, u64> = HashMap::new();
+    let mut by_rule: HashMap<String, u64> = HashMap::new();
+
+    // Track per-process stats keyed by process_key (PID-reuse safe),
+    // with PID-only fallback for unenriched events.
+    struct ProcessInfo {
+        pid: u32,
+        process_key: Option<String>,
+        image: Option<String>,
+        count: u64,
+    }
+    let mut by_process: HashMap<String, ProcessInfo> = HashMap::new();
+
+    for_each_event(input, |event| {
+        total += 1;
+
+        // Time range
+        match (&earliest, &latest) {
+            (None, _) => {
+                earliest = Some(event.timestamp);
+                latest = Some(event.timestamp);
+            }
+            (Some(e), Some(l)) => {
+                if event.timestamp < *e {
+                    earliest = Some(event.timestamp);
+                }
+                if event.timestamp > *l {
+                    latest = Some(event.timestamp);
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        // Category
+        *by_category
+            .entry(category_short(&event.category).to_string())
+            .or_default() += 1;
+
+        // Severity
+        *by_severity
+            .entry(format!("{:?}", event.severity))
+            .or_default() += 1;
+
+        // Source
+        let src_label = match &event.source {
+            crate::events::EventSource::Etw { provider } => format!("ETW/{provider}"),
+            crate::events::EventSource::Sysmon { event_id } => {
+                format!("Sysmon/{event_id}")
+            }
+            crate::events::EventSource::EvasionDetector => "EvasionDetector".into(),
+            crate::events::EventSource::Sensor => "Sensor".into(),
+        };
+        *by_source.entry(src_label).or_default() += 1;
+
+        // Rules
+        if let Some(ref rule) = event.rule {
+            *by_rule.entry(rule.id.clone()).or_default() += 1;
+        }
+
+        // Per-process — prefer process_key, fall back to PID
+        if let Some(pid) = event_pid(&event.data) {
+            let key = event
+                .process_context
+                .as_ref()
+                .map(|c| c.process_key.clone())
+                .unwrap_or_else(|| format!("pid:{pid}"));
+            let info = by_process.entry(key.clone()).or_insert_with(|| ProcessInfo {
+                pid,
+                process_key: event.process_context.as_ref().map(|c| c.process_key.clone()),
+                image: None,
+                count: 0,
+            });
+            info.count += 1;
+            if info.image.is_none() {
+                if let Some(ref ctx) = event.process_context {
+                    info.image = ctx.image_path.clone();
+                }
+            }
+        }
+
+        true
+    })?;
+
+    // Sort aggregates by count descending
+    let mut cat_vec: Vec<CountEntry> = by_category
+        .into_iter()
+        .map(|(label, count)| CountEntry { label, count })
+        .collect();
+    cat_vec.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Sort severity in logical order
+    let sev_order = ["Critical", "High", "Medium", "Low", "Info"];
+    let mut sev_vec: Vec<CountEntry> = sev_order
+        .iter()
+        .filter_map(|s| {
+            by_severity
+                .get(*s)
+                .map(|c| CountEntry {
+                    label: s.to_string(),
+                    count: *c,
+                })
+        })
+        .collect();
+    // Include any unexpected severity values
+    for (label, count) in &by_severity {
+        if !sev_order.contains(&label.as_str()) {
+            sev_vec.push(CountEntry {
+                label: label.clone(),
+                count: *count,
+            });
+        }
+    }
+
+    let mut src_vec: Vec<CountEntry> = by_source
+        .into_iter()
+        .map(|(label, count)| CountEntry { label, count })
+        .collect();
+    src_vec.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let mut rule_vec: Vec<CountEntry> = by_rule
+        .into_iter()
+        .map(|(label, count)| CountEntry { label, count })
+        .collect();
+    rule_vec.sort_by(|a, b| b.count.cmp(&a.count));
+
+    // Top 10 processes by event count
+    let mut proc_vec: Vec<ProcessInfo> = by_process.into_values().collect();
+    proc_vec.sort_by(|a, b| b.count.cmp(&a.count));
+    let top_processes: Vec<ProcessEntry> = proc_vec
+        .into_iter()
+        .take(10)
+        .map(|info| ProcessEntry {
+            pid: info.pid,
+            process_key: info.process_key,
+            image: info.image,
+            count: info.count,
+        })
+        .collect();
+
+    let time_range = earliest.and_then(|e| latest.map(|l| TimeRange { earliest: e, latest: l }));
+
+    let stats = EventStats {
+        total_events: total,
+        time_range,
+        by_category: cat_vec,
+        by_severity: sev_vec,
+        by_source: src_vec,
+        top_processes,
+        top_rules: rule_vec,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
+    // Human-readable output
+    let mut out = std::io::stdout().lock();
+
+    writeln!(out, "=== Event Statistics ===")?;
+    writeln!(out, "Total events: {}", stats.total_events)?;
+
+    if let Some(ref tr) = stats.time_range {
+        writeln!(out, "Time range:   {} → {}", tr.earliest, tr.latest)?;
+        let duration = tr.latest - tr.earliest;
+        let hours = duration.num_hours();
+        let mins = duration.num_minutes() % 60;
+        if hours > 0 {
+            writeln!(out, "Duration:     {hours}h {mins}m")?;
+        } else {
+            writeln!(out, "Duration:     {mins}m")?;
+        }
+    }
+
+    if !stats.by_category.is_empty() {
+        writeln!(out, "\n--- By Category ---")?;
+        for entry in &stats.by_category {
+            writeln!(out, "  {:12} {:>6}", entry.label, entry.count)?;
+        }
+    }
+
+    if !stats.by_severity.is_empty() {
+        writeln!(out, "\n--- By Severity ---")?;
+        for entry in &stats.by_severity {
+            writeln!(out, "  {:12} {:>6}", entry.label, entry.count)?;
+        }
+    }
+
+    if !stats.by_source.is_empty() {
+        writeln!(out, "\n--- By Source ---")?;
+        for entry in &stats.by_source {
+            writeln!(out, "  {:40} {:>6}", entry.label, entry.count)?;
+        }
+    }
+
+    if !stats.top_processes.is_empty() {
+        writeln!(out, "\n--- Top Processes (by event count) ---")?;
+        for p in &stats.top_processes {
+            let label = p
+                .image
+                .as_deref()
+                .unwrap_or_else(|| p.process_key.as_deref().unwrap_or("?"));
+            writeln!(out, "  PID {:>6}  {:>6} events  {}", p.pid, p.count, label)?;
+        }
+    }
+
+    if !stats.top_rules.is_empty() {
+        writeln!(out, "\n--- Detection Rules ---")?;
+        for entry in &stats.top_rules {
+            writeln!(out, "  {:20} {:>6}", entry.label, entry.count)?;
+        }
+    }
+
     Ok(())
 }
 
