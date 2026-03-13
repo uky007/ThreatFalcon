@@ -663,11 +663,21 @@ fn source_matches(source: &crate::events::EventSource, filter: &str) -> bool {
 }
 
 /// Case-insensitive text search across the serialized event JSON.
+///
+/// Searches both the raw JSON (which has escaped backslashes like `C:\\Temp`)
+/// and an unescaped version (where `\\` is collapsed to `\`), so that a user
+/// query for `C:\Temp\evil.exe` matches the JSON-escaped form.
 fn event_contains(event: &ThreatEvent, text: &str) -> bool {
     if let Ok(json) = serde_json::to_string(event) {
         let lower_json = json.to_ascii_lowercase();
         let lower_text = text.to_ascii_lowercase();
-        lower_json.contains(&lower_text)
+        if lower_json.contains(&lower_text) {
+            return true;
+        }
+        // Also search an unescaped copy so that Windows paths typed naturally
+        // (C:\Temp\evil.exe) match their JSON-escaped form (C:\\Temp\\evil.exe).
+        let unescaped = lower_json.replace("\\\\", "\\");
+        unescaped.contains(&lower_text)
     } else {
         false
     }
@@ -2483,6 +2493,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn contains_matches_windows_path_with_backslashes() {
+        // The JSON serializer escapes backslashes (C:\Temp → C:\\Temp).
+        // A user searching for "C:\Temp\evil.exe" should still match.
+        let mut evt = make_process_create(100, "100:42");
+        evt.data = EventData::ProcessCreate {
+            pid: 100,
+            ppid: 1,
+            image_path: r"C:\Temp\evil.exe".into(),
+            command_line: r"C:\Temp\evil.exe --payload".into(),
+            user: String::new(),
+            integrity_level: String::new(),
+            hashes: None,
+            create_time: Some(42),
+        };
+        assert!(
+            event_contains(&evt, r"C:\Temp\evil.exe"),
+            "natural Windows path should match JSON-escaped backslashes"
+        );
+        // Also verify the escaped form still matches
+        assert!(
+            event_contains(&evt, r"C:\\Temp\\evil.exe"),
+            "escaped path should also match directly"
+        );
     }
 
     #[test]

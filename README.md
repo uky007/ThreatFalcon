@@ -472,7 +472,7 @@ Available query filters:
 | `--rule-id <ID>` | Filter by detection rule ID |
 | `--source <SRC>` | Filter by source type (`etw`, `sysmon`, `evasion`, `sensor`) or ETW provider name substring |
 | `--severity <SEV>` | Minimum severity threshold (accepts `info`, `low`, `med`/`medium`, `high`, `crit`/`critical`) |
-| `--contains <TEXT>` | Case-insensitive text search across the entire serialized event |
+| `--contains <TEXT>` | Case-insensitive text search across the entire serialized event (Windows paths like `C:\Temp\evil.exe` are matched automatically) |
 | `--from <TS>` | Only events after this RFC 3339 timestamp (alias: `--since`) |
 | `--to <TS>` | Only events before this RFC 3339 timestamp |
 | `--limit <N>` | Maximum number of results (default: 100) |
