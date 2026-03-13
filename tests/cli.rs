@@ -709,3 +709,239 @@ fn explain_help_shows_json_flag() {
         predicate::str::contains("--json"),
     );
 }
+
+// ---- Index subcommand tests -------------------------------------------------
+
+#[test]
+fn index_help() {
+    cmd().args(["index", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--rebuild"))
+            .and(predicate::str::contains("--status")),
+    );
+}
+
+#[test]
+fn help_shows_index_subcommand() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("index"),
+    );
+}
+
+#[test]
+fn index_build_creates_index_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let event = sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Indexed")
+                .and(predicate::str::contains("1 new event(s)"))
+                .and(predicate::str::contains("1 total")),
+        );
+
+    // Verify index file was created
+    let idx_path = format!("{}.idx.sqlite", path.display());
+    assert!(std::path::Path::new(&idx_path).exists(), "index file should be created");
+}
+
+#[test]
+fn index_status_shows_health() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network"),
+        sample_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, "200:43", "Network"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build first
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Check status
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap(), "--status"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Events:")
+                .and(predicate::str::contains("2"))
+                .and(predicate::str::contains("current")),
+        );
+}
+
+#[test]
+fn index_rebuild_reindexes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let event = sample_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network");
+    fs::write(&path, &event).unwrap();
+
+    // Build
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Rebuild
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap(), "--rebuild"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("1 new event(s)"));
+}
+
+#[test]
+fn query_with_index_returns_same_results() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build index
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Query with index (--severity high should return only the evasion event)
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--severity", "high"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bbbbbbbb")
+                .and(predicate::str::contains("aaaaaaaa").not()),
+        )
+        .stderr(predicate::str::contains("1 event(s) matched (indexed)"));
+}
+
+#[test]
+fn query_no_index_forces_scan() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:42", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_evasion_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "High", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build index
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Query with --no-index should use full scan (no "(indexed)" in output)
+    cmd()
+        .args(["query", "--input", path.to_str().unwrap(), "--severity", "high", "--no-index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bbbbbbbb"))
+        .stderr(
+            predicate::str::contains("1 event(s) matched")
+                .and(predicate::str::contains("indexed").not()),
+        );
+}
+
+#[test]
+fn query_no_index_flag_shown_in_help() {
+    cmd().args(["query", "--help"]).assert().success().stdout(
+        predicate::str::contains("--no-index"),
+    );
+    cmd().args(["explain", "--help"]).assert().success().stdout(
+        predicate::str::contains("--no-index"),
+    );
+    cmd().args(["bundle", "--help"]).assert().success().stdout(
+        predicate::str::contains("--no-index"),
+    );
+}
+
+/// Event without process_context — PID-based fallback should still work.
+fn sample_event_no_context(id: &str, pid: u32, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Network"}}}},"category":"Network","severity":"Info","data":{{"type":"NetworkConnect","pid":{pid},"image_path":"","protocol":"TCP","src_addr":"10.0.0.1","src_port":12345,"dst_addr":"93.184.216.34","dst_port":443,"direction":"Outbound"}}}}"#
+    )
+}
+
+#[test]
+fn explain_indexed_pid_fallback_no_process_context() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    // Two events with same PID but no process_context
+    let lines = [
+        sample_event_no_context(target_id, 100, "2026-03-13T10:00:00Z"),
+        sample_event_no_context("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, "2026-03-13T10:01:00Z"),
+        sample_event_no_context("cccccccc-cccc-cccc-cccc-cccccccccccc", 200, "2026-03-13T10:02:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Build index
+    cmd()
+        .args(["index", "--input", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Explain with index — should fall back to PID and show timeline with 2 events (pid 100)
+    cmd()
+        .args([
+            "explain",
+            "--event", target_id,
+            "--input", path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("=== Target Event ===")
+                .and(predicate::str::contains(target_id))
+                .and(predicate::str::contains("pid:100"))
+                .and(predicate::str::contains("2 events")),
+        );
+}
+
+#[test]
+fn explain_no_index_pid_fallback_no_process_context() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let lines = [
+        sample_event_no_context(target_id, 100, "2026-03-13T10:00:00Z"),
+        sample_event_no_context("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, "2026-03-13T10:01:00Z"),
+        sample_event_no_context("cccccccc-cccc-cccc-cccc-cccccccccccc", 200, "2026-03-13T10:02:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Explain without index — same PID fallback
+    cmd()
+        .args([
+            "explain",
+            "--event", target_id,
+            "--input", path.to_str().unwrap(),
+            "--no-index",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("=== Target Event ===")
+                .and(predicate::str::contains(target_id))
+                .and(predicate::str::contains("pid:100"))
+                .and(predicate::str::contains("2 events")),
+        );
+}

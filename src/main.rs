@@ -1,6 +1,7 @@
 mod collectors;
 mod config;
 mod events;
+mod index;
 mod investigate;
 mod output;
 #[allow(dead_code)] // used by evasion collector on Windows; tested cross-platform

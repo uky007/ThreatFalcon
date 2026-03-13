@@ -21,6 +21,7 @@ ThreatFalcon is early-stage software.
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
 - Local investigation CLI (`query`, `explain`, `bundle`) reads JSONL output directly
+- Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -155,6 +156,7 @@ Commands:
   query    Query events from a JSONL telemetry file
   explain  Explain an event with its process context timeline
   bundle   Bundle an event and related context into a single JSON document
+  index    Build or manage the SQLite index for fast event lookups
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -548,6 +550,32 @@ The zip archive contains four files:
 | `bundle.json` | Full combined bundle (identical to the standalone JSON output) |
 
 The zip format is useful for attaching bundles to tickets, sharing with analysts, or archiving investigations. The `manifest.json` enables tooling to identify and process bundles programmatically.
+
+### Index
+
+Build a SQLite sidecar index for fast event lookups on large JSONL files. The JSONL file remains the source of truth — the index is an optional acceleration layer.
+
+```bash
+# Build or incrementally update the index
+threatfalcon index --input events.jsonl
+
+# Force a full rebuild
+threatfalcon index --input events.jsonl --rebuild
+
+# Show index health and coverage
+threatfalcon index --input events.jsonl --status
+```
+
+The index stores `event_id`, `timestamp`, `pid`, `process_key`, `category`, `source`, `rule_id`, `severity`, and byte offsets back into the JSONL file. This allows `query`, `explain`, and `bundle` to skip full file scans and seek directly to matching events.
+
+**Transparent behavior:**
+- If an index exists and is current, `query`/`explain`/`bundle` use it automatically
+- If an index exists but is behind (new events appended), it is incrementally updated before querying
+- If no index exists, commands fall back to the current full JSONL scan (no index is created implicitly)
+- If the index is corrupt, it is deleted and the command falls back to a full scan
+- Use `--no-index` on any command to force a full scan (useful for debugging)
+
+The index file is stored alongside the JSONL file as `<filename>.idx.sqlite` (e.g., `events.jsonl.idx.sqlite`).
 
 ## Evasion Detection Rules
 
