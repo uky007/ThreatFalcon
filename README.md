@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -623,6 +623,29 @@ Duration:     10h 30m
   TF-EVA-001                42
   TF-EVA-004                 3
 ```
+
+### Tail
+
+Follow new events appended to a JSONL file in real time (like `tail -f`). Existing content is skipped — only newly appended events are shown:
+
+```bash
+# Follow all new events
+threatfalcon tail --input events.jsonl
+
+# Follow only high-severity events
+threatfalcon tail --input events.jsonl --severity high
+
+# Follow events from a specific PID
+threatfalcon tail --input events.jsonl --pid 1234
+
+# Follow with text search
+threatfalcon tail --input events.jsonl --contains "malware.exe"
+
+# JSONL output for piping to other tools
+threatfalcon tail --input events.jsonl --json | jq '.severity'
+```
+
+The human-readable format shows timestamp, severity, category, PID, and a one-line event summary. Press Ctrl+C to stop.
 
 ## Evasion Detection Rules
 
