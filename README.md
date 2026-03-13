@@ -65,6 +65,24 @@ The built-in default configuration currently does the following:
 
 By default, ThreatFalcon writes events locally only and does not transmit telemetry to a remote service.
 
+### Windows Default Paths
+
+On Windows, when no config file is found, all data paths default under `%ProgramData%\ThreatFalcon\` (typically `C:\ProgramData\ThreatFalcon\`):
+
+| File | Default path (Windows) | Default path (dev / non-Windows) |
+|------|------------------------|----------------------------------|
+| Config file | `%ProgramData%\ThreatFalcon\threatfalcon.toml` | `./threatfalcon.toml` |
+| Agent state | `%ProgramData%\ThreatFalcon\threatfalcon.state` | `./threatfalcon.state` |
+| Event output | `%ProgramData%\ThreatFalcon\threatfalcon_events.jsonl` | `./threatfalcon_events.jsonl` |
+
+Config file lookup order (when `--config` is not specified):
+
+1. `./threatfalcon.toml` (current working directory)
+2. `%ProgramData%\ThreatFalcon\threatfalcon.toml` (Windows only)
+3. Built-in defaults if neither exists
+
+Relative paths in the config file are resolved against the config file's directory, not the process working directory. This ensures consistent behavior between foreground mode and Windows service mode (where cwd is typically `System32`). Explicit absolute paths in the config are never rewritten.
+
 When the HTTP sink is configured with `spool_dir`, failed batches are written to disk instead of dropped. Spooled batches are re-sent on the next successful POST or periodic health flush (every `health_interval_secs`), whichever comes first. This prevents event loss during network outages or server maintenance. Spool size is capped by `spool_max_mb` (default: 256 MB).
 
 The default ETW provider set includes:
@@ -169,16 +187,29 @@ On startup, the sensor initializes enabled collectors, writes newline-delimited 
 
 ThreatFalcon can run as a Windows service. The `--service` flag connects to the Service Control Manager (SCM) so the sensor starts at boot and stops cleanly on service stop commands.
 
+**Recommended directory layout:**
+
+```
+C:\ProgramData\ThreatFalcon\
+    threatfalcon.toml              # config
+    threatfalcon.state             # agent identity (auto-created)
+    threatfalcon_events.jsonl      # event output (file sink)
+```
+
 **Install the service:**
 
 ```powershell
-sc.exe create ThreatFalcon binPath= "C:\path\to\threatfalcon.exe --service" start= auto
+# Copy the binary
+Copy-Item threatfalcon.exe C:\ProgramData\ThreatFalcon\threatfalcon.exe
+
+# Register the service (config is auto-discovered from ProgramData)
+sc.exe create ThreatFalcon binPath= "C:\ProgramData\ThreatFalcon\threatfalcon.exe --service" start= auto
 ```
 
-To use a custom config file:
+To use a config file in a custom location:
 
 ```powershell
-sc.exe create ThreatFalcon binPath= "C:\path\to\threatfalcon.exe --service --config C:\ProgramData\ThreatFalcon\threatfalcon.toml" start= auto
+sc.exe create ThreatFalcon binPath= "C:\ProgramData\ThreatFalcon\threatfalcon.exe --service --config D:\configs\threatfalcon.toml" start= auto
 ```
 
 **Start / stop:**
@@ -202,7 +233,9 @@ Notes:
 
 ## Configuration
 
-ThreatFalcon loads `threatfalcon.toml` from the current directory on startup. If the file is not found, built-in defaults are used. Use `--config <path>` to load from a different location, or `--stdout` / `--output <path>` to override the output destination from the command line.
+ThreatFalcon searches for `threatfalcon.toml` in the current directory first, then `%ProgramData%\ThreatFalcon\` on Windows. If no file is found, built-in defaults are used. Use `--config <path>` to load from a different location, or `--stdout` / `--output <path>` to override the output destination from the command line.
+
+Relative paths (`state_path`, `output.path`, `output.spool_dir`) are resolved against the config file's directory. When using built-in defaults (no config file), they are resolved against the executable's directory.
 
 All sections are optional. Only the fields you want to override need to be specified.
 
@@ -214,8 +247,10 @@ hostname = "WORKSTATION-01"
 # A final shutdown health event is always emitted regardless of this setting.
 health_interval_secs = 60
 
-# Path to persistent agent state file (default: threatfalcon.state)
+# Path to persistent agent state file.
 # A stable agent_id is generated on first run and reused across restarts.
+# Default: "threatfalcon.state" (relative to config dir; on Windows defaults
+# to %ProgramData%\ThreatFalcon\threatfalcon.state)
 # state_path = "threatfalcon.state"
 
 # Output sink type: "file" (default), "stdout", or "http"

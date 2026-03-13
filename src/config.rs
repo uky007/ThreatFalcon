@@ -6,6 +6,23 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE: &str = "threatfalcon.toml";
 
+/// Platform-appropriate base directory for ThreatFalcon data files.
+///
+/// Windows: `%ProgramData%\ThreatFalcon` (typically `C:\ProgramData\ThreatFalcon`).
+/// Other platforms: `None` — relative paths are used for development.
+fn default_base_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("ProgramData")
+            .ok()
+            .map(|pd| PathBuf::from(pd).join("ThreatFalcon"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SensorConfig {
@@ -196,20 +213,31 @@ impl SensorConfig {
                 (cfg, anchor)
             }
             None => {
-                let default = PathBuf::from(CONFIG_FILE);
-                if default.exists() {
-                    let content = std::fs::read_to_string(&default)?;
+                // Search order: cwd, then platform base dir (ProgramData on Windows).
+                let cwd_path = PathBuf::from(CONFIG_FILE);
+                let platform_path = default_base_dir().map(|d| d.join(CONFIG_FILE));
+
+                let found = if cwd_path.exists() {
+                    Some(cwd_path)
+                } else if let Some(ref pp) = platform_path {
+                    if pp.exists() { Some(pp.clone()) } else { None }
+                } else {
+                    None
+                };
+
+                if let Some(path) = found {
+                    let content = std::fs::read_to_string(&path)?;
                     let cfg: SensorConfig = toml::from_str(&content)?;
-                    tracing::info!("Loaded config from {}", default.display());
-                    let anchor = default
+                    tracing::info!("Loaded config from {}", path.display());
+                    let anchor = path
                         .canonicalize()
-                        .unwrap_or_else(|_| default.clone())
+                        .unwrap_or_else(|_| path.clone())
                         .parent()
                         .map(|p| p.to_path_buf());
                     (cfg, anchor)
                 } else {
                     tracing::info!(
-                        "No config file found at {CONFIG_FILE} — using defaults"
+                        "No config file found — using defaults"
                     );
                     // Anchor to the executable's directory.
                     let anchor = std::env::current_exe()
@@ -230,6 +258,9 @@ impl SensorConfig {
             if self.state_path.is_relative() {
                 self.state_path = base.join(&self.state_path);
             }
+            if self.output.path.is_relative() {
+                self.output.path = base.join(&self.output.path);
+            }
             if let Some(ref dir) = self.output.spool_dir {
                 if dir.is_relative() {
                     self.output.spool_dir = Some(base.join(dir));
@@ -240,15 +271,27 @@ impl SensorConfig {
     }
 }
 
-impl Default for SensorConfig {
-    fn default() -> Self {
+impl SensorConfig {
+    /// Build defaults rooted at `base`. When `Some`, paths are absolute
+    /// under that directory (used on Windows with ProgramData). When
+    /// `None`, paths are relative (development / non-Windows).
+    pub fn with_base_dir(base: Option<&std::path::Path>) -> Self {
         Self {
             hostname: hostname(),
-            output: OutputConfig::default(),
+            output: OutputConfig::with_base_dir(base),
             collectors: CollectorConfig::default(),
             health_interval_secs: 60,
-            state_path: PathBuf::from("threatfalcon.state"),
+            state_path: match base {
+                Some(d) => d.join("threatfalcon.state"),
+                None => PathBuf::from("threatfalcon.state"),
+            },
         }
+    }
+}
+
+impl Default for SensorConfig {
+    fn default() -> Self {
+        Self::with_base_dir(default_base_dir().as_deref())
     }
 }
 
@@ -258,11 +301,14 @@ impl Default for SinkType {
     }
 }
 
-impl Default for OutputConfig {
-    fn default() -> Self {
+impl OutputConfig {
+    fn with_base_dir(base: Option<&std::path::Path>) -> Self {
         Self {
             sink_type: SinkType::File,
-            path: PathBuf::from("threatfalcon_events.jsonl"),
+            path: match base {
+                Some(d) => d.join("threatfalcon_events.jsonl"),
+                None => PathBuf::from("threatfalcon_events.jsonl"),
+            },
             rotation_size_mb: 100,
             pretty: false,
             url: None,
@@ -276,6 +322,12 @@ impl Default for OutputConfig {
             spool_dir: None,
             spool_max_mb: 256,
         }
+    }
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self::with_base_dir(default_base_dir().as_deref())
     }
 }
 
@@ -537,7 +589,9 @@ mod tests {
         .unwrap();
         let cfg = SensorConfig::load_from(Some(&path)).unwrap();
         assert_eq!(cfg.hostname, "CUSTOM");
-        assert_eq!(cfg.output.path, PathBuf::from("custom.jsonl"));
+        // Relative output.path is resolved against config directory
+        let expected_dir = dir.path().canonicalize().unwrap();
+        assert_eq!(cfg.output.path, expected_dir.join("custom.jsonl"));
     }
 
     #[test]
@@ -556,6 +610,126 @@ mod tests {
         // This may or may not find a file depending on the test runner's cwd,
         // but load_from(None) should never panic.
         let _ = SensorConfig::load_from(None);
+    }
+
+    #[test]
+    fn with_base_dir_none_uses_relative_paths() {
+        let cfg = SensorConfig::with_base_dir(None);
+        assert_eq!(cfg.state_path, PathBuf::from("threatfalcon.state"));
+        assert_eq!(cfg.output.path, PathBuf::from("threatfalcon_events.jsonl"));
+    }
+
+    #[test]
+    fn with_base_dir_some_uses_absolute_paths() {
+        let base = std::path::Path::new("C:\\ProgramData\\ThreatFalcon");
+        let cfg = SensorConfig::with_base_dir(Some(base));
+
+        assert_eq!(cfg.state_path, base.join("threatfalcon.state"));
+        assert_eq!(cfg.output.path, base.join("threatfalcon_events.jsonl"));
+        // health_interval and collectors unchanged
+        assert_eq!(cfg.health_interval_secs, 60);
+        assert!(cfg.collectors.etw.enabled);
+    }
+
+    #[test]
+    fn with_base_dir_output_paths_match_sensor() {
+        let base = std::path::Path::new("/opt/threatfalcon");
+        let cfg = SensorConfig::with_base_dir(Some(base));
+
+        assert!(cfg.state_path.starts_with(base));
+        assert!(cfg.output.path.starts_with(base));
+    }
+
+    #[test]
+    fn resolve_paths_skips_absolute() {
+        let cfg = SensorConfig {
+            state_path: PathBuf::from("/absolute/state.file"),
+            output: OutputConfig {
+                path: PathBuf::from("/absolute/events.jsonl"),
+                spool_dir: Some(PathBuf::from("/absolute/spool")),
+                ..OutputConfig::with_base_dir(None)
+            },
+            ..SensorConfig::with_base_dir(None)
+        };
+        let resolved = cfg.resolve_paths(Some(PathBuf::from("/other/dir")));
+        // Absolute paths should not be rewritten
+        assert_eq!(resolved.state_path, PathBuf::from("/absolute/state.file"));
+        assert_eq!(resolved.output.path, PathBuf::from("/absolute/events.jsonl"));
+        assert_eq!(resolved.output.spool_dir, Some(PathBuf::from("/absolute/spool")));
+    }
+
+    #[test]
+    fn resolve_paths_resolves_relative() {
+        let cfg = SensorConfig {
+            state_path: PathBuf::from("my.state"),
+            output: OutputConfig {
+                path: PathBuf::from("events.jsonl"),
+                spool_dir: Some(PathBuf::from("spool")),
+                ..OutputConfig::with_base_dir(None)
+            },
+            ..SensorConfig::with_base_dir(None)
+        };
+        let anchor = PathBuf::from("/config/dir");
+        let resolved = cfg.resolve_paths(Some(anchor.clone()));
+        assert_eq!(resolved.state_path, anchor.join("my.state"));
+        assert_eq!(resolved.output.path, anchor.join("events.jsonl"));
+        assert_eq!(resolved.output.spool_dir, Some(anchor.join("spool")));
+    }
+
+    #[test]
+    fn resolve_paths_none_anchor_leaves_unchanged() {
+        let cfg = SensorConfig {
+            state_path: PathBuf::from("my.state"),
+            output: OutputConfig {
+                path: PathBuf::from("events.jsonl"),
+                ..OutputConfig::with_base_dir(None)
+            },
+            ..SensorConfig::with_base_dir(None)
+        };
+        let resolved = cfg.resolve_paths(None);
+        assert_eq!(resolved.state_path, PathBuf::from("my.state"));
+        assert_eq!(resolved.output.path, PathBuf::from("events.jsonl"));
+    }
+
+    #[test]
+    fn spool_dir_resolved_relative_to_config_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("sensor.toml");
+        std::fs::write(
+            &config_path,
+            "[output]\ntype = \"http\"\nurl = \"https://example.com\"\nspool_dir = \"spool\"\n",
+        )
+        .unwrap();
+
+        let cfg = SensorConfig::load_from(Some(&config_path)).unwrap();
+        let expected_dir = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            cfg.output.spool_dir,
+            Some(expected_dir.join("spool")),
+        );
+    }
+
+    #[test]
+    fn config_file_lookup_prefers_cwd() {
+        // When a config file exists in cwd, it should be used even if
+        // a platform dir would also have one.
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join(CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            "hostname = \"FROM-CWD\"\n",
+        )
+        .unwrap();
+
+        // Change cwd to the temp dir
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let cfg = SensorConfig::load_from(None).unwrap();
+        assert_eq!(cfg.hostname, "FROM-CWD");
+
+        // Restore cwd
+        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[test]
