@@ -40,6 +40,140 @@ impl EvasionCollector {
     }
 }
 
+// ---- Direct syscall stub scanner (cross-platform, testable) ----------------
+
+/// A syscall stub match found in a byte stream.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read in tests and on Windows
+struct SyscallStubMatch {
+    /// Byte offset of the stub within the scanned region.
+    offset: usize,
+    /// The syscall instruction type found.
+    instruction: SyscallInstruction,
+    /// System service number from the `mov eax, <SSN>` instruction.
+    ssn: u32,
+    /// Raw bytes of the matched stub for evidence.
+    raw_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyscallInstruction {
+    /// `syscall` — opcode 0F 05
+    Syscall,
+    /// `int 0x2e` — opcode CD 2E
+    Int2E,
+}
+
+impl std::fmt::Display for SyscallInstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syscall => write!(f, "syscall (0F 05)"),
+            Self::Int2E => write!(f, "int 0x2e (CD 2E)"),
+        }
+    }
+}
+
+/// System DLLs that legitimately contain `syscall`/`int 0x2e` stubs.
+#[allow(dead_code)] // used on Windows and in tests
+const SYSCALL_WHITELISTED_MODULES: &[&str] = &["ntdll.dll", "win32u.dll"];
+
+#[allow(dead_code)] // used on Windows and in tests
+fn is_syscall_whitelisted(name: &str) -> bool {
+    SYSCALL_WHITELISTED_MODULES
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+}
+
+/// Scan a byte slice for direct syscall stub patterns.
+///
+/// Detects the canonical stub prologue used by SysWhispers and similar tools:
+///
+/// ```text
+/// 4C 8B D1          mov r10, rcx      (or 49 89 CA)
+/// B8 xx xx xx xx    mov eax, <SSN>
+/// ...               (up to MAX_GAP bytes of intervening instructions)
+/// 0F 05             syscall            (or CD 2E — int 0x2e)
+/// ```
+///
+/// The scanner allows a gap between `mov eax` and the syscall instruction
+/// to handle the Wow64 compatibility-check variant that inserts a
+/// `test byte ptr [SharedUserData], 1; jne` sequence.
+#[allow(dead_code)] // used on Windows and in tests
+fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
+    /// Max bytes between `mov eax, SSN` and `syscall`/`int 0x2e`.
+    /// 12 covers the Wow64 test+jne sequence (10 bytes).
+    const MAX_GAP: usize = 12;
+
+    let mut matches = Vec::new();
+    if data.len() < 10 {
+        return matches;
+    }
+
+    let mut i = 0;
+    while i + 9 < data.len() {
+        // Step 1: mov r10, rcx  (4C 8B D1 or 49 89 CA)
+        let is_mov_r10 =
+            (data[i] == 0x4C && data[i + 1] == 0x8B && data[i + 2] == 0xD1)
+                || (data[i] == 0x49 && data[i + 1] == 0x89 && data[i + 2] == 0xCA);
+        if !is_mov_r10 {
+            i += 1;
+            continue;
+        }
+
+        // Step 2: mov eax, imm32  (B8 xx xx xx xx)
+        if i + 7 >= data.len() || data[i + 3] != 0xB8 {
+            i += 1;
+            continue;
+        }
+
+        let ssn = u32::from_le_bytes([
+            data[i + 4],
+            data[i + 5],
+            data[i + 6],
+            data[i + 7],
+        ]);
+
+        // Step 3: scan forward for syscall/int 0x2e within MAX_GAP
+        let scan_end = (i + 8 + MAX_GAP).min(data.len().saturating_sub(1));
+        let mut found = false;
+        for j in (i + 8)..=scan_end {
+            if j + 1 >= data.len() {
+                break;
+            }
+            let instr = if data[j] == 0x0F && data[j + 1] == 0x05 {
+                Some(SyscallInstruction::Syscall)
+            } else if data[j] == 0xCD && data[j + 1] == 0x2E {
+                Some(SyscallInstruction::Int2E)
+            } else {
+                None
+            };
+
+            if let Some(instruction) = instr {
+                let mut end = j + 2;
+                // Include trailing ret (C3) if present
+                if end < data.len() && data[end] == 0xC3 {
+                    end += 1;
+                }
+                matches.push(SyscallStubMatch {
+                    offset: i,
+                    instruction,
+                    ssn,
+                    raw_bytes: data[i..end].to_vec(),
+                });
+                found = true;
+                i = end;
+                break;
+            }
+        }
+
+        if !found {
+            i += 1;
+        }
+    }
+
+    matches
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
@@ -127,6 +261,17 @@ mod platform {
                         agent,
                         &ntdll_reference,
                     ) {
+                        if let Err(e) = tx.try_send(evt) {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(error = %e, "Evasion event dropped");
+                        }
+                    }
+                }
+
+                if config.detect_direct_syscall {
+                    if let Some(evt) =
+                        check_direct_syscall(handle, *pid, agent)
+                    {
                         if let Err(e) = tx.try_send(evt) {
                             dropped.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(error = %e, "Evasion event dropped");
@@ -623,6 +768,220 @@ mod platform {
 
         None
     }
+
+    // ---- Direct syscall detection ----------------------------------------------
+
+    /// Maximum bytes to read from a remote module's .text section.
+    const MAX_TEXT_READ: usize = 1024 * 1024; // 1 MB
+
+    fn check_direct_syscall(
+        handle: HANDLE,
+        pid: u32,
+        agent: &crate::events::AgentInfo,
+    ) -> Option<ThreatEvent> {
+        let mut modules = [HMODULE::default(); 1024];
+        let mut needed = 0u32;
+        unsafe {
+            if EnumProcessModules(
+                handle,
+                modules.as_mut_ptr(),
+                std::mem::size_of_val(&modules) as u32,
+                &mut needed,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
+
+        let count =
+            needed as usize / std::mem::size_of::<HMODULE>();
+
+        for m in &modules[..count] {
+            let mut name_buf = [0u8; 260];
+            let len = unsafe {
+                GetModuleBaseNameA(handle, *m, &mut name_buf)
+            };
+            if len == 0 {
+                continue;
+            }
+            let mod_name =
+                std::str::from_utf8(&name_buf[..len as usize])
+                    .unwrap_or("");
+
+            // Skip DLLs that legitimately contain syscall stubs
+            if super::is_syscall_whitelisted(mod_name) {
+                continue;
+            }
+
+            let module_base = m.0 as usize;
+            let (text, _text_rva) =
+                match read_remote_text_section(handle, module_base) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+            let stubs = super::scan_for_syscall_stubs(&text);
+            if stubs.is_empty() {
+                continue;
+            }
+
+            let first = &stubs[0];
+            let evidence = vec![
+                format!(
+                    "module: {} at base 0x{:X}",
+                    mod_name, module_base
+                ),
+                format!(
+                    "{} syscall stub(s) found in .text section",
+                    stubs.len()
+                ),
+                format!(
+                    "first stub at .text+0x{:X}: {}",
+                    first.offset, first.instruction
+                ),
+                format!("SSN: 0x{:X}", first.ssn),
+                format!("stub bytes: {:02X?}", first.raw_bytes),
+            ];
+
+            return Some(ThreatEvent::with_rule(
+                agent,
+                EventSource::EvasionDetector,
+                EventCategory::Evasion,
+                Severity::High,
+                EventData::EvasionDetected {
+                    technique: EvasionTechnique::DirectSyscall,
+                    pid: Some(pid),
+                    process_name: None,
+                    details: format!(
+                        "{} direct syscall stub(s) in module {}: \
+                         process bypasses ntdll user-mode hooks",
+                        stubs.len(),
+                        mod_name,
+                    ),
+                },
+                RuleMetadata {
+                    id: "TF-EVA-004".into(),
+                    name: "Direct Syscall Stub".into(),
+                    description: "A non-system module contains \
+                        syscall/int 0x2e stubs with the canonical \
+                        mov r10,rcx; mov eax,SSN prologue used by \
+                        tools like SysWhispers. The process makes \
+                        direct system calls that bypass ntdll \
+                        user-mode hooks installed by security tools."
+                        .into(),
+                    mitre: MitreRef {
+                        tactic: "Defense Evasion".into(),
+                        technique_id: "T1562.001".into(),
+                        technique_name:
+                            "Impair Defenses: Disable or Modify Tools"
+                                .into(),
+                    },
+                    confidence: Confidence::High,
+                    evidence,
+                },
+            ));
+        }
+
+        None
+    }
+
+    /// Read the .text section of a remote module by parsing its PE
+    /// header from the target process's memory.  Returns `(bytes, rva)`.
+    fn read_remote_text_section(
+        handle: HANDLE,
+        module_base: usize,
+    ) -> Option<(Vec<u8>, u32)> {
+        // Read DOS header (first 64 bytes)
+        let mut dos = [0u8; 64];
+        let mut read = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                module_base as *const std::ffi::c_void,
+                dos.as_mut_ptr() as *mut std::ffi::c_void,
+                64,
+                Some(&mut read),
+            )
+            .ok()?;
+        }
+        if read < 64 || dos[0] != b'M' || dos[1] != b'Z' {
+            return None;
+        }
+
+        let pe_offset = u32::from_le_bytes(
+            dos[0x3C..0x40].try_into().ok()?,
+        ) as usize;
+
+        // Read PE + COFF + optional header + section headers
+        let header_size = 4 + 20 + 240 + 40 * 96;
+        let mut pe_buf = vec![0u8; header_size];
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                (module_base + pe_offset) as *const std::ffi::c_void,
+                pe_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                header_size,
+                Some(&mut read),
+            )
+            .ok()?;
+        }
+        if read < 28 || &pe_buf[0..4] != b"PE\0\0" {
+            return None;
+        }
+
+        let coff_start = 4;
+        let num_sections = u16::from_le_bytes(
+            pe_buf[coff_start + 2..coff_start + 4].try_into().ok()?,
+        ) as usize;
+        let opt_header_size = u16::from_le_bytes(
+            pe_buf[coff_start + 16..coff_start + 18]
+                .try_into()
+                .ok()?,
+        ) as usize;
+
+        let sections_start = coff_start + 20 + opt_header_size;
+
+        for i in 0..num_sections {
+            let sec = sections_start + i * 40;
+            if pe_buf.len() < sec + 40 {
+                break;
+            }
+            if pe_buf[sec..sec + 8].starts_with(b".text") {
+                let virtual_size = u32::from_le_bytes(
+                    pe_buf[sec + 8..sec + 12].try_into().ok()?,
+                );
+                let virtual_addr = u32::from_le_bytes(
+                    pe_buf[sec + 12..sec + 16].try_into().ok()?,
+                );
+
+                let size =
+                    (virtual_size as usize).min(MAX_TEXT_READ);
+                let text_addr =
+                    module_base + virtual_addr as usize;
+
+                let mut text = vec![0u8; size];
+                let ok = unsafe {
+                    ReadProcessMemory(
+                        handle,
+                        text_addr as *const std::ffi::c_void,
+                        text.as_mut_ptr()
+                            as *mut std::ffi::c_void,
+                        size,
+                        Some(&mut read),
+                    )
+                };
+
+                if ok.is_err() || read < size {
+                    return None;
+                }
+
+                return Some((text, virtual_addr));
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -672,5 +1031,207 @@ impl Collector for EvasionCollector {
 
     fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- syscall stub scanner tests ----------------------------------------
+
+    #[test]
+    fn detect_classic_syscall_stub() {
+        // SysWhispers2 classic: mov r10,rcx; mov eax,0x18; syscall; ret
+        let data = [
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
+            0x0F, 0x05, // syscall
+            0xC3, // ret
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].offset, 0);
+        assert_eq!(matches[0].ssn, 0x18);
+        assert_eq!(matches[0].instruction, SyscallInstruction::Syscall);
+        assert_eq!(matches[0].raw_bytes, data.to_vec());
+    }
+
+    #[test]
+    fn detect_int2e_stub() {
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x50, 0x00, 0x00, 0x00,
+            0xCD, 0x2E, // int 0x2e
+            0xC3,
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].instruction, SyscallInstruction::Int2E);
+        assert_eq!(matches[0].ssn, 0x50);
+    }
+
+    #[test]
+    fn detect_alternate_mov_r10_encoding() {
+        // 49 89 CA is the alternate encoding of mov r10, rcx
+        let data = [
+            0x49, 0x89, 0xCA,
+            0xB8, 0x26, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0xC3,
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x26);
+    }
+
+    #[test]
+    fn detect_wow64_variant_with_gap() {
+        // Wow64 compat check inserts test+jne between mov eax and syscall
+        let data = [
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
+            0xF6, 0x04, 0x25, 0x08, 0x03, 0xFE, 0x7F, 0x01, // test byte ptr [7FFE0308h], 1
+            0x75, 0x03, // jne +3
+            0x0F, 0x05, // syscall
+            0xC3, // ret
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x18);
+        assert_eq!(matches[0].instruction, SyscallInstruction::Syscall);
+    }
+
+    #[test]
+    fn no_match_on_regular_code() {
+        let data = [
+            0x48, 0x89, 0x5C, 0x24, 0x08, // mov [rsp+8], rbx
+            0x48, 0x89, 0x6C, 0x24, 0x10, // mov [rsp+10], rbp
+            0x48, 0x89, 0x74, 0x24, 0x18, // mov [rsp+18], rsi
+            0x57, // push rdi
+            0x41, 0x56, // push r14
+            0xC3, // ret
+        ];
+        assert!(scan_for_syscall_stubs(&data).is_empty());
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(scan_for_syscall_stubs(&[]).is_empty());
+    }
+
+    #[test]
+    fn short_input_no_panic() {
+        assert!(scan_for_syscall_stubs(&[0x4C, 0x8B]).is_empty());
+    }
+
+    #[test]
+    fn multiple_stubs_detected() {
+        let mut data = Vec::new();
+        // Stub 1: SSN 0x18
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0x00, 0x00, 0x00,
+            0x0F, 0x05, 0xC3,
+        ]);
+        // Padding
+        data.extend_from_slice(&[0xCC; 5]);
+        // Stub 2: SSN 0x3A
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x3A, 0x00, 0x00, 0x00,
+            0x0F, 0x05, 0xC3,
+        ]);
+
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].ssn, 0x18);
+        assert_eq!(matches[1].ssn, 0x3A);
+    }
+
+    #[test]
+    fn no_match_without_mov_eax() {
+        // mov r10,rcx present but no mov eax before syscall
+        let data = [
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0x90, 0x90, 0x90, 0x90, 0x90, // nops
+            0x0F, 0x05, // syscall
+        ];
+        assert!(scan_for_syscall_stubs(&data).is_empty());
+    }
+
+    #[test]
+    fn no_match_when_gap_too_large() {
+        let mut data = vec![
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
+        ];
+        // 20 nops — exceeds MAX_GAP of 12
+        data.extend_from_slice(&[0x90; 20]);
+        data.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+        assert!(scan_for_syscall_stubs(&data).is_empty());
+    }
+
+    #[test]
+    fn stub_without_trailing_ret() {
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0x0F, 0x05,
+            0x90, // nop instead of ret
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        // raw_bytes should NOT include the trailing nop
+        assert_eq!(matches[0].raw_bytes.len(), 10);
+    }
+
+    #[test]
+    fn stub_embedded_in_larger_code() {
+        let mut data = Vec::new();
+        // Preamble: random code
+        data.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 28h
+        data.extend_from_slice(&[0x48, 0x8B, 0xC1]); // mov rax, rcx
+        // Syscall stub at offset 7
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x55, 0x00, 0x00, 0x00,
+            0x0F, 0x05, 0xC3,
+        ]);
+        // Epilogue
+        data.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 28h
+        data.extend_from_slice(&[0xC3]); // ret
+
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].offset, 7);
+        assert_eq!(matches[0].ssn, 0x55);
+    }
+
+    #[test]
+    fn instruction_display() {
+        assert_eq!(
+            format!("{}", SyscallInstruction::Syscall),
+            "syscall (0F 05)"
+        );
+        assert_eq!(
+            format!("{}", SyscallInstruction::Int2E),
+            "int 0x2e (CD 2E)"
+        );
+    }
+
+    // ---- whitelist tests ---------------------------------------------------
+
+    #[test]
+    fn whitelist_system_dlls() {
+        assert!(is_syscall_whitelisted("ntdll.dll"));
+        assert!(is_syscall_whitelisted("NTDLL.DLL"));
+        assert!(is_syscall_whitelisted("win32u.dll"));
+        assert!(is_syscall_whitelisted("Win32u.DLL"));
+    }
+
+    #[test]
+    fn whitelist_rejects_non_system() {
+        assert!(!is_syscall_whitelisted("malware.dll"));
+        assert!(!is_syscall_whitelisted("myapp.exe"));
+        assert!(!is_syscall_whitelisted("kernel32.dll"));
     }
 }
