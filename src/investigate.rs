@@ -819,13 +819,15 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
     let mut by_source: HashMap<String, u64> = HashMap::new();
     let mut by_rule: HashMap<String, u64> = HashMap::new();
 
-    // Track per-PID stats with optional metadata
-    struct PidInfo {
+    // Track per-process stats keyed by process_key (PID-reuse safe),
+    // with PID-only fallback for unenriched events.
+    struct ProcessInfo {
+        pid: u32,
         process_key: Option<String>,
         image: Option<String>,
         count: u64,
     }
-    let mut by_pid: HashMap<u32, PidInfo> = HashMap::new();
+    let mut by_process: HashMap<String, ProcessInfo> = HashMap::new();
 
     for_each_event(input, |event| {
         total += 1;
@@ -873,18 +875,22 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
             *by_rule.entry(rule.id.clone()).or_default() += 1;
         }
 
-        // Per-PID
+        // Per-process — prefer process_key, fall back to PID
         if let Some(pid) = event_pid(&event.data) {
-            let info = by_pid.entry(pid).or_insert_with(|| PidInfo {
-                process_key: None,
+            let key = event
+                .process_context
+                .as_ref()
+                .map(|c| c.process_key.clone())
+                .unwrap_or_else(|| format!("pid:{pid}"));
+            let info = by_process.entry(key.clone()).or_insert_with(|| ProcessInfo {
+                pid,
+                process_key: event.process_context.as_ref().map(|c| c.process_key.clone()),
                 image: None,
                 count: 0,
             });
             info.count += 1;
-            // Capture metadata from first occurrence with context
-            if info.process_key.is_none() {
+            if info.image.is_none() {
                 if let Some(ref ctx) = event.process_context {
-                    info.process_key = Some(ctx.process_key.clone());
                     info.image = ctx.image_path.clone();
                 }
             }
@@ -936,13 +942,13 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
     rule_vec.sort_by(|a, b| b.count.cmp(&a.count));
 
     // Top 10 processes by event count
-    let mut pid_vec: Vec<(u32, PidInfo)> = by_pid.into_iter().collect();
-    pid_vec.sort_by(|a, b| b.1.count.cmp(&a.1.count));
-    let top_processes: Vec<ProcessEntry> = pid_vec
+    let mut proc_vec: Vec<ProcessInfo> = by_process.into_values().collect();
+    proc_vec.sort_by(|a, b| b.count.cmp(&a.count));
+    let top_processes: Vec<ProcessEntry> = proc_vec
         .into_iter()
         .take(10)
-        .map(|(pid, info)| ProcessEntry {
-            pid,
+        .map(|info| ProcessEntry {
+            pid: info.pid,
             process_key: info.process_key,
             image: info.image,
             count: info.count,

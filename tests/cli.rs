@@ -1077,3 +1077,36 @@ fn stats_empty_file() {
         .success()
         .stdout(predicate::str::contains("Total events: 0"));
 }
+
+#[test]
+fn stats_pid_reuse_separates_by_process_key() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Same PID 100, but two different process_keys (PID reuse)
+    let lines = [
+        sample_etw_event("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, "100:1000", "Network", "Info", "2026-03-13T10:00:00Z"),
+        sample_etw_event("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, "100:1000", "Network", "Info", "2026-03-13T10:01:00Z"),
+        sample_etw_event("cccccccc-cccc-cccc-cccc-cccccccccccc", 100, "100:2000", "Network", "Info", "2026-03-13T10:05:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["stats", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    // Should have 2 separate process entries (not merged into one PID 100 bucket)
+    let procs = json["top_processes"].as_array().unwrap();
+    assert_eq!(procs.len(), 2, "PID-reused processes should be separate entries");
+
+    // First entry has 2 events, second has 1
+    assert_eq!(procs[0]["count"], 2);
+    assert_eq!(procs[0]["process_key"], "100:1000");
+    assert_eq!(procs[1]["count"], 1);
+    assert_eq!(procs[1]["process_key"], "100:2000");
+}
