@@ -2464,7 +2464,9 @@ fn score_detection_events_add_points() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("events.jsonl");
 
-    // A detection event (EvasionDetected with rule) should add 40 points
+    // A detection event (EvasionDetected with rule) should add 40 points.
+    // sample_detection_event has pid:100 but no process_context — the score
+    // subcommand must fall back to "pid:100" attribution.
     let lines = [
         sample_process_create_key("a2000000-0000-0000-0000-000000000001", 100, 1, "C:/malware.exe", "malware.exe", "2026-03-13T10:00:00Z", "100:1000"),
         sample_detection_event("a2000000-0000-0000-0000-000000000002", "TF-EVA-001"),
@@ -2479,9 +2481,22 @@ fn score_detection_events_add_points() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    // Detection events in sample_detection_event don't have process_context,
-    // so they won't be attributed. But we can verify the file was scanned.
     assert!(parsed["total_events"].as_u64().unwrap() >= 2);
+
+    // The detection event (pid:100, no process_context) should create a
+    // "pid:100" entry with score >= 40
+    let procs = parsed["scored_processes"].as_array().unwrap();
+    let detection_proc = procs.iter().find(|p| {
+        p["breakdown"]["detections"].as_u64().unwrap_or(0) > 0
+    });
+    assert!(
+        detection_proc.is_some(),
+        "detection event without process_context should still be scored via PID fallback"
+    );
+    assert!(
+        detection_proc.unwrap()["score"].as_u64().unwrap() >= 40,
+        "detection should contribute at least 40 points"
+    );
 }
 
 #[test]

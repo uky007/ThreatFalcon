@@ -1322,22 +1322,24 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
                 }
             }
 
-            EventData::EvasionDetected { .. } => {
+            EventData::EvasionDetected { pid, .. } => {
                 if event.rule.is_some() {
-                    if let Some(ref key) = event_key {
-                        let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
-                            pid: event.data.acting_pid().unwrap_or(0),
-                            image: event
-                                .process_context
-                                .as_ref()
-                                .and_then(|c| c.image_path.clone())
-                                .unwrap_or_default(),
-                            breakdown: ScoreBreakdown::default(),
-                            unique_ips: HashSet::new(),
-                            unique_domains: HashSet::new(),
-                        });
-                        acc.breakdown.detections += 1;
-                    }
+                    let pid_val = pid.unwrap_or(0);
+                    let key = event_key
+                        .clone()
+                        .unwrap_or_else(|| format!("pid:{pid_val}"));
+                    let acc = acc_map.entry(key).or_insert_with(|| ProcAcc {
+                        pid: pid_val,
+                        image: event
+                            .process_context
+                            .as_ref()
+                            .and_then(|c| c.image_path.clone())
+                            .unwrap_or_default(),
+                        breakdown: ScoreBreakdown::default(),
+                        unique_ips: HashSet::new(),
+                        unique_domains: HashSet::new(),
+                    });
+                    acc.breakdown.detections += 1;
                 }
             }
 
