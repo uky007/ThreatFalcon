@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`, `hunt`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -162,6 +162,7 @@ Commands:
   tree     Show process tree (parent-child relationships)
   inspect  Inspect a PE file: headers, sections, imports, and exports
   ioc      Extract indicators of compromise (IPs, domains, hashes)
+  hunt     Run threat hunting rules against events
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -813,6 +814,56 @@ The IOC extraction covers:
 | File Hashes | `ProcessCreate`, `ImageLoad` | `SHA256=...`, `MD5=...` format preserved |
 
 Results are deduplicated and sorted by frequency (descending). Use `--limit` to control the number of results per type (default: 50).
+
+### Hunt
+
+Run threat hunting rules against telemetry events to surface suspicious patterns:
+
+```bash
+# Run all hunting rules
+threatfalcon hunt --input events.jsonl
+
+# Run a specific rule
+threatfalcon hunt --input events.jsonl --rule suspicious-parent
+
+# JSON output for integration
+threatfalcon hunt --input events.jsonl --json
+```
+
+Example output:
+
+```
+=== Threat Hunt (2841 events scanned, 3 findings) ===
+
+[High] suspicious-parent (T1204.002)
+  PID:     4521
+  Process: C:\Windows\System32\cmd.exe
+  Detail:  winword.exe spawned cmd.exe (cmd.exe /c whoami)
+  Time:    2026-03-13T10:05:12+00:00
+
+[Medium] lolbin (T1218)
+  PID:     5102
+  Process: C:\Windows\System32\certutil.exe
+  Detail:  LOLBin execution: certutil.exe (certutil.exe -urlcache -f ...)
+  Time:    2026-03-13T10:07:33+00:00
+
+[Medium] beaconing (T1071.001)
+  PID:     3200
+  Process: C:\Users\user\malware.exe
+  Detail:  42 connections to 185.100.87.174 from malware.exe
+  Time:    2026-03-13T09:00:00+00:00
+```
+
+Available hunting rules:
+
+| Rule | Severity | MITRE | Description |
+|------|----------|-------|-------------|
+| `suspicious-parent` | High | T1204.002 | Office/PDF apps spawning shells or scripting engines |
+| `lolbin` | Medium | T1218 | Execution of living-off-the-land binaries (certutil, mshta, regsvr32, etc.) |
+| `unsigned-dll` | Low | T1574.001 | Unsigned DLL loaded into a process |
+| `beaconing` | Medium | T1071.001 | Repeated connections to the same external IP (threshold: 10+) |
+
+Results are sorted by severity (descending), then by timestamp. Use `--limit` to control the maximum number of findings (default: 50).
 
 ## Evasion Detection Rules
 
