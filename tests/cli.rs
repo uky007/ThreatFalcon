@@ -1715,3 +1715,254 @@ fn inspect_malformed_import_table_warns() {
         "should warn about malformed import table, got: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// IOC subcommand tests
+// ---------------------------------------------------------------------------
+
+fn sample_network_event(id: &str, dst_addr: &str, dst_port: u16, image: &str, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Network"}}}},"category":"Network","severity":"Info","data":{{"type":"NetworkConnect","pid":100,"image_path":"{image}","protocol":"TCP","src_addr":"10.0.0.1","src_port":12345,"dst_addr":"{dst_addr}","dst_port":{dst_port},"direction":"Outbound"}}}}"#
+    )
+}
+
+fn sample_dns_event(id: &str, query: &str, response: Option<&str>, timestamp: &str) -> String {
+    let resp = match response {
+        Some(r) => format!(r#","response":"{r}""#),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-DNS-Client"}}}},"category":"Dns","severity":"Info","data":{{"type":"DnsQuery","pid":100,"query_name":"{query}","query_type":"A"{resp}}}}}"#
+    )
+}
+
+fn sample_process_create_with_hashes(id: &str, image: &str, hashes: &str, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"Process","severity":"Info","data":{{"type":"ProcessCreate","pid":200,"ppid":1,"image_path":"{image}","command_line":"{image}","user":"TEST\\\\user","integrity_level":"Medium","hashes":"{hashes}"}}}}"#
+    )
+}
+
+#[test]
+fn ioc_help() {
+    cmd().args(["ioc", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--type"))
+            .and(predicate::str::contains("--limit"))
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_ioc_subcommand() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ioc"));
+}
+
+#[test]
+fn ioc_extracts_ips_and_domains() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000001", "93.184.216.34", 443, "C:/Windows/explorer.exe", "2026-03-13T10:00:00Z"),
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000002", "93.184.216.34", 443, "C:/Windows/explorer.exe", "2026-03-13T10:01:00Z"),
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000003", "8.8.8.8", 53, "C:/Windows/svchost.exe", "2026-03-13T10:02:00Z"),
+        // Private IP — should be excluded
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000004", "192.168.1.1", 80, "C:/test.exe", "2026-03-13T10:03:00Z"),
+        // IPv6 non-public — should all be excluded
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000005", "fc00::1", 443, "C:/test.exe", "2026-03-13T10:03:01Z"),       // unique-local
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000006", "fe80::1", 443, "C:/test.exe", "2026-03-13T10:03:02Z"),       // link-local
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000007", "ff02::1", 443, "C:/test.exe", "2026-03-13T10:03:03Z"),       // multicast
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000008", "2001:db8::1", 443, "C:/test.exe", "2026-03-13T10:03:04Z"),   // documentation
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000009", "::1", 443, "C:/test.exe", "2026-03-13T10:03:05Z"),           // loopback
+        // IPv6 public — should be included
+        sample_network_event("a1a1a1a1-0000-0000-0000-00000000000a", "2607:f8b0:4004:800::200e", 443, "C:/chrome.exe", "2026-03-13T10:03:06Z"),
+        sample_dns_event("b1b1b1b1-0000-0000-0000-000000000001", "evil.example.com", Some("93.184.216.34"), "2026-03-13T10:04:00Z"),
+        sample_dns_event("b1b1b1b1-0000-0000-0000-000000000002", "evil.example.com", None, "2026-03-13T10:05:00Z"),
+        sample_dns_event("b1b1b1b1-0000-0000-0000-000000000003", "good.example.org", None, "2026-03-13T10:06:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Public IPs should appear, private should not
+    assert!(stdout.contains("93.184.216.34"), "should contain public IP");
+    assert!(stdout.contains("8.8.8.8"), "should contain DNS IP");
+    assert!(!stdout.contains("192.168.1.1"), "should exclude private IP");
+    // IPv6 non-public should be excluded
+    assert!(!stdout.contains("fc00::1"), "should exclude unique-local IPv6");
+    assert!(!stdout.contains("fe80::1"), "should exclude link-local IPv6");
+    assert!(!stdout.contains("ff02::1"), "should exclude multicast IPv6");
+    assert!(!stdout.contains("2001:db8::1"), "should exclude documentation IPv6");
+    assert!(!stdout.contains("::1"), "should exclude loopback IPv6");
+    // IPv6 public should appear
+    assert!(stdout.contains("2607:f8b0:4004:800::200e"), "should contain public IPv6");
+
+    // Domains
+    assert!(stdout.contains("evil.example.com"), "should contain queried domain");
+    assert!(stdout.contains("good.example.org"), "should contain queried domain");
+
+    // Section headers
+    assert!(stdout.contains("[External IPs]"));
+    assert!(stdout.contains("[Domains]"));
+}
+
+#[test]
+fn ioc_extracts_hashes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_with_hashes(
+            "c1c1c1c1-0000-0000-0000-000000000001",
+            "C:/malware.exe",
+            "SHA256=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890,MD5=d41d8cd98f00b204e9800998ecf8427e",
+            "2026-03-13T10:00:00Z",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("SHA256=abcdef"), "should contain SHA256 hash");
+    assert!(stdout.contains("MD5=d41d8cd"), "should contain MD5 hash");
+    assert!(stdout.contains("[File Hashes]"));
+}
+
+#[test]
+fn ioc_json_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_network_event("d1d1d1d1-0000-0000-0000-000000000001", "1.2.3.4", 443, "C:/app.exe", "2026-03-13T10:00:00Z"),
+        sample_dns_event("d1d1d1d1-0000-0000-0000-000000000002", "test.example.com", None, "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(parsed["total_events"].as_u64().unwrap() >= 2);
+    assert!(parsed["ips"].is_array());
+    assert!(parsed["domains"].is_array());
+    assert!(parsed["hashes"].is_array());
+
+    // Check IP entry structure
+    let ip = &parsed["ips"][0];
+    assert_eq!(ip["value"].as_str().unwrap(), "1.2.3.4");
+    assert!(ip["count"].as_u64().unwrap() >= 1);
+    assert!(ip["first_seen"].is_string());
+    assert!(ip["sources"].is_array());
+}
+
+#[test]
+fn ioc_type_filter() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_network_event("e1e1e1e1-0000-0000-0000-000000000001", "5.6.7.8", 80, "C:/app.exe", "2026-03-13T10:00:00Z"),
+        sample_dns_event("e1e1e1e1-0000-0000-0000-000000000002", "filtered.example.com", None, "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // --type ip: should show IPs only
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap(), "--type", "ip"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[External IPs]"), "should show IP section");
+    assert!(!stdout.contains("[Domains]"), "should hide domain section");
+    assert!(!stdout.contains("[File Hashes]"), "should hide hash section");
+
+    // --type domain: should show domains only
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap(), "--type", "domain"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("[External IPs]"), "should hide IP section");
+    assert!(stdout.contains("[Domains]"), "should show domain section");
+}
+
+#[test]
+fn ioc_invalid_type_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    cmd()
+        .args(["ioc", "--input", path.to_str().unwrap(), "--type", "bogus"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --type"));
+}
+
+#[test]
+fn ioc_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("0 events scanned"));
+    assert!(stdout.contains("(none)"));
+}
+
+#[test]
+fn ioc_deduplicates_by_count() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Same destination IP appearing 3 times
+    let lines = [
+        sample_network_event("f1f1f1f1-0000-0000-0000-000000000001", "44.55.66.77", 443, "C:/app.exe", "2026-03-13T10:00:00Z"),
+        sample_network_event("f1f1f1f1-0000-0000-0000-000000000002", "44.55.66.77", 443, "C:/app.exe", "2026-03-13T10:01:00Z"),
+        sample_network_event("f1f1f1f1-0000-0000-0000-000000000003", "44.55.66.77", 80, "C:/app.exe", "2026-03-13T10:02:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["ioc", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    // Should be deduplicated to a single entry with count 3
+    assert_eq!(parsed["ips"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["ips"][0]["count"].as_u64().unwrap(), 3);
+}
