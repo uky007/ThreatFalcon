@@ -1682,3 +1682,36 @@ fn inspect_missing_file() {
         .assert()
         .failure();
 }
+
+#[test]
+fn inspect_malformed_import_table_warns() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("bad_imports.exe");
+
+    // Build a PE that has import data directory pointing at valid offset
+    // but the section data is garbage (all 0xFF), so parsing will fail.
+    let mut pe = build_test_pe();
+
+    // Point import data directory at .text section (VA 0x1000) which has 0xCC bytes.
+    // This is a valid RVA but the data there is not a valid import descriptor.
+    let pe_offset = u32::from_le_bytes(pe[0x3C..0x40].try_into().unwrap()) as usize;
+    let opt = pe_offset + 4 + 20;
+    // Data directory entry 1 (import) is at opt+112+8 for PE32+
+    let dd = opt + 112 + 8;
+    pe[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes()); // import RVA → .text
+    pe[dd + 4..dd + 8].copy_from_slice(&40u32.to_le_bytes()); // size = 40
+
+    fs::write(&path, &pe).unwrap();
+
+    let output = cmd()
+        .args(["inspect", "--file", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("could not be parsed"),
+        "should warn about malformed import table, got: {stdout}"
+    );
+}

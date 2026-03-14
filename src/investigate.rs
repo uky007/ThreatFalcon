@@ -1595,11 +1595,29 @@ fn run_inspect(path: &Path, json: bool) -> Result<()> {
     let pe = PeHeaders::parse(&data)
         .ok_or_else(|| anyhow::anyhow!("not a valid PE file: {}", path.display()))?;
 
-    let imports = pe.parse_imports(&data).unwrap_or_default();
-    let exports = pe.parse_exports(&data).unwrap_or_default();
+    let mut warnings: Vec<String> = Vec::new();
+
+    let has_import_dir = pe.import_directory().is_some();
+    let imports = match pe.parse_imports(&data) {
+        Some(v) => v,
+        None if has_import_dir => {
+            warnings.push("Import table is present but could not be parsed (malformed data)".to_string());
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+
+    let has_export_dir = pe.export_directory().is_some();
+    let exports = match pe.parse_exports(&data) {
+        Some(v) => v,
+        None if has_export_dir => {
+            warnings.push("Export table is present but could not be parsed (malformed data)".to_string());
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
 
     // Build sections info.
-    let mut warnings: Vec<String> = Vec::new();
     let sections: Vec<InspectSection> = pe
         .sections
         .iter()
