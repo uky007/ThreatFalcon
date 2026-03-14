@@ -1544,3 +1544,141 @@ fn tree_pid_reuse_ancestors_picks_correct_parent() {
                 .and(predicate::str::contains("notepad.exe").not()),
         );
 }
+
+// ---- Inspect subcommand tests -----------------------------------------------
+
+/// Build a minimal PE64 binary for testing inspect. Contains a .text section and
+/// recognizable PE signature bytes.
+fn build_test_pe() -> Vec<u8> {
+    let pe_offset: usize = 64;
+    let coff = pe_offset + 4;
+    let opt = coff + 20;
+    let num_dd: usize = 16;
+    let opt_size = 112 + num_dd * 8;
+    let sec_start = opt + opt_size;
+    let file_align: usize = 512;
+    let headers_end = sec_start + 1 * 40; // 1 section
+    let data_start = (headers_end + file_align - 1) / file_align * file_align;
+    let text_data = [0xCCu8; 64];
+    let raw_size = (text_data.len() + file_align - 1) / file_align * file_align;
+    let total_size = data_start + raw_size;
+
+    let mut buf = vec![0u8; total_size];
+
+    // DOS header
+    buf[0] = b'M';
+    buf[1] = b'Z';
+    buf[0x3C..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+
+    // PE signature
+    buf[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+
+    // COFF header: AMD64, 1 section
+    buf[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+    buf[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
+    buf[coff + 16..coff + 18].copy_from_slice(&(opt_size as u16).to_le_bytes());
+
+    // Optional header: PE32+
+    buf[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes());
+    buf[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry point
+    buf[opt + 24..opt + 32].copy_from_slice(&0x140000000u64.to_le_bytes()); // image base
+    buf[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // section align
+    buf[opt + 36..opt + 40].copy_from_slice(&(file_align as u32).to_le_bytes());
+    buf[opt + 56..opt + 60].copy_from_slice(&0x10000u32.to_le_bytes()); // image size
+    buf[opt + 60..opt + 64].copy_from_slice(&(data_start as u32).to_le_bytes());
+    buf[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // subsystem: CUI
+    buf[opt + 108..opt + 112].copy_from_slice(&(num_dd as u32).to_le_bytes());
+
+    // Section header: .text
+    let s = sec_start;
+    buf[s..s + 8].copy_from_slice(b".text\0\0\0");
+    buf[s + 8..s + 12].copy_from_slice(&(text_data.len() as u32).to_le_bytes());
+    buf[s + 12..s + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[s + 16..s + 20].copy_from_slice(&(raw_size as u32).to_le_bytes());
+    buf[s + 20..s + 24].copy_from_slice(&(data_start as u32).to_le_bytes());
+    let code_chars: u32 = 0x60000020; // CODE | EXECUTE | READ
+    buf[s + 36..s + 40].copy_from_slice(&code_chars.to_le_bytes());
+
+    // Section data
+    buf[data_start..data_start + text_data.len()].copy_from_slice(&text_data);
+
+    buf
+}
+
+#[test]
+fn inspect_help() {
+    cmd().args(["inspect", "--help"]).assert().success().stdout(
+        predicate::str::contains("--file")
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_inspect_subcommand() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("inspect"),
+    );
+}
+
+#[test]
+fn inspect_shows_pe_info() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.exe");
+    fs::write(&path, build_test_pe()).unwrap();
+
+    cmd()
+        .args(["inspect", "--file", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("PE Inspection")
+                .and(predicate::str::contains("PE32+ (AMD64)"))
+                .and(predicate::str::contains(".text"))
+                .and(predicate::str::contains("Windows CUI"))
+                .and(predicate::str::contains("[Sections]"))
+                .and(predicate::str::contains("[Imports]"))
+                .and(predicate::str::contains("[Exports]")),
+        );
+}
+
+#[test]
+fn inspect_json_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.exe");
+    fs::write(&path, build_test_pe()).unwrap();
+
+    let output = cmd()
+        .args(["inspect", "--file", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("inspect --json should output valid JSON");
+    assert_eq!(json["architecture"], "PE32+ (AMD64)");
+    assert_eq!(json["subsystem"], "Windows CUI");
+    assert!(json["sections"].is_array());
+    assert!(json["imports"].is_array());
+    assert!(json["exports"].is_array());
+}
+
+#[test]
+fn inspect_invalid_pe() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("notape.bin");
+    fs::write(&path, b"this is not a PE file").unwrap();
+
+    cmd()
+        .args(["inspect", "--file", path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a valid PE file"));
+}
+
+#[test]
+fn inspect_missing_file() {
+    cmd()
+        .args(["inspect", "--file", "/nonexistent/path.exe"])
+        .assert()
+        .failure();
+}

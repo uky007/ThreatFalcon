@@ -8,17 +8,18 @@
 //! all functionality.
 
 /// IMAGE_SCN_CNT_CODE
-const SCN_CNT_CODE: u32 = 0x0000_0020;
+pub const SCN_CNT_CODE: u32 = 0x0000_0020;
 /// IMAGE_SCN_MEM_EXECUTE
-const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+pub const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 /// IMAGE_SCN_MEM_READ
-#[allow(dead_code)]
-const SCN_MEM_READ: u32 = 0x4000_0000;
+pub const SCN_MEM_READ: u32 = 0x4000_0000;
 /// IMAGE_SCN_MEM_WRITE
-const SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 /// Data directory index for the export table.
 const DIR_ENTRY_EXPORT: usize = 0;
+/// Data directory index for the import table.
+const DIR_ENTRY_IMPORT: usize = 1;
 
 /// COFF machine type for x86.
 #[allow(dead_code)]
@@ -71,6 +72,8 @@ pub struct PeHeaders {
     pub size_of_image: u32,
     /// AddressOfEntryPoint RVA.
     pub entry_point_rva: u32,
+    /// Windows subsystem from the optional header.
+    pub subsystem: u16,
     /// Parsed section headers.
     pub sections: Vec<SectionHeader>,
     /// Data directory entries: (rva, size).
@@ -113,7 +116,7 @@ impl SectionHeader {
 }
 
 /// A named export from a PE image.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExportEntry {
     /// Export ordinal (biased by ordinal base).
     pub ordinal: u16,
@@ -124,6 +127,28 @@ pub struct ExportEntry {
     /// True if this is a forwarder (RVA points within the export directory).
     pub is_forward: bool,
 }
+
+/// All imports from a single DLL.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportEntry {
+    /// The DLL name (e.g., "KERNEL32.dll").
+    pub dll_name: String,
+    /// Functions imported from this DLL.
+    pub functions: Vec<ImportedFunction>,
+}
+
+/// A single imported function from a DLL.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportedFunction {
+    /// Function name, if imported by name (None for ordinal-only imports).
+    pub name: Option<String>,
+    /// Ordinal value, if imported by ordinal (None for name imports).
+    pub ordinal: Option<u16>,
+    /// Hint value from the Import Lookup Table.
+    pub hint: u16,
+}
+
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -188,6 +213,7 @@ impl PeHeaders {
         };
 
         let size_of_image = read_u32(data, opt + 56)?;
+        let subsystem = read_u16(data, opt + 68)?;
 
         // Data directories
         let num_dd = read_u32(data, num_dd_off).unwrap_or(0) as usize;
@@ -230,6 +256,7 @@ impl PeHeaders {
             image_base,
             size_of_image,
             entry_point_rva,
+            subsystem,
             sections,
             data_directories,
         })
@@ -333,6 +360,129 @@ impl PeHeaders {
             .iter()
             .find(|e| e.name.as_deref() == Some(name))
             .map(|e| e.rva)
+    }
+
+    /// Return the import data directory entry `(rva, size)`, if present.
+    pub fn import_directory(&self) -> Option<(u32, u32)> {
+        self.data_directories
+            .get(DIR_ENTRY_IMPORT)
+            .copied()
+            .filter(|(rva, size)| *rva != 0 && *size != 0)
+    }
+
+    /// Parse the import directory from an on-disk PE buffer.
+    pub fn parse_imports(&self, data: &[u8]) -> Option<Vec<ImportEntry>> {
+        let (import_rva, _import_size) = self.import_directory()?;
+        let dir = self.rva_to_file_offset(import_rva)?;
+
+        let mut entries = Vec::new();
+        // Each IMAGE_IMPORT_DESCRIPTOR is 20 bytes, terminated by all-zeros.
+        // Safety cap: 4096 descriptors.
+        for i in 0..4096 {
+            let desc = dir + i * 20;
+            if desc + 20 > data.len() {
+                break;
+            }
+            let ilt_rva = read_u32(data, desc)?;
+            let name_rva = read_u32(data, desc + 12)?;
+            let iat_rva = read_u32(data, desc + 16)?;
+
+            // All-zero terminator.
+            if name_rva == 0 {
+                break;
+            }
+
+            let dll_name_off = self.rva_to_file_offset(name_rva)?;
+            let dll_name = read_cstring(data, dll_name_off)?;
+
+            // Prefer OriginalFirstThunk (ILT); fall back to FirstThunk (IAT).
+            let thunk_rva = if ilt_rva != 0 { ilt_rva } else { iat_rva };
+            if thunk_rva == 0 {
+                entries.push(ImportEntry {
+                    dll_name,
+                    functions: Vec::new(),
+                });
+                continue;
+            }
+
+            let thunk_off = self.rva_to_file_offset(thunk_rva)?;
+            let entry_size: usize = if self.is_64bit { 8 } else { 4 };
+            let ordinal_flag: u64 = if self.is_64bit {
+                1u64 << 63
+            } else {
+                1u64 << 31
+            };
+
+            let mut functions = Vec::new();
+            // Safety cap: 65536 functions per DLL.
+            for j in 0..65536usize {
+                let t = thunk_off + j * entry_size;
+                let value = if self.is_64bit {
+                    read_u64(data, t)?
+                } else {
+                    read_u32(data, t)? as u64
+                };
+                if value == 0 {
+                    break;
+                }
+                if value & ordinal_flag != 0 {
+                    // Import by ordinal.
+                    functions.push(ImportedFunction {
+                        name: None,
+                        ordinal: Some((value & 0xFFFF) as u16),
+                        hint: 0,
+                    });
+                } else {
+                    // Import by name — value is RVA to IMAGE_IMPORT_BY_NAME.
+                    let hna_rva = value as u32;
+                    let hna_off = self.rva_to_file_offset(hna_rva)?;
+                    let hint = read_u16(data, hna_off).unwrap_or(0);
+                    let func_name = read_cstring(data, hna_off + 2)?;
+                    functions.push(ImportedFunction {
+                        name: Some(func_name),
+                        ordinal: None,
+                        hint,
+                    });
+                }
+            }
+
+            entries.push(ImportEntry {
+                dll_name,
+                functions,
+            });
+        }
+
+        Some(entries)
+    }
+
+    /// Human-readable machine architecture name.
+    pub fn machine_name(&self) -> &'static str {
+        match self.machine {
+            MACHINE_I386 => "PE32 (i386)",
+            MACHINE_AMD64 => "PE32+ (AMD64)",
+            0x01C4 => "PE32 (ARM)",
+            0xAA64 => "PE32+ (ARM64)",
+            _ => "Unknown",
+        }
+    }
+
+    /// Human-readable subsystem name.
+    pub fn subsystem_name(&self) -> &'static str {
+        match self.subsystem {
+            0 => "Unknown",
+            1 => "Native",
+            2 => "Windows GUI",
+            3 => "Windows CUI",
+            5 => "OS/2 CUI",
+            7 => "POSIX CUI",
+            8 => "Native Windows",
+            9 => "Windows CE GUI",
+            10 => "EFI Application",
+            11 => "EFI Boot Service Driver",
+            12 => "EFI Runtime Driver",
+            14 => "Xbox",
+            _ => "Other",
+        }
     }
 }
 
@@ -888,5 +1038,318 @@ mod tests {
             .find(|e| e.name.as_deref() == Some("ForwardedFunc"))
             .unwrap();
         assert!(fwd.is_forward);
+    }
+
+    // ---- Import table tests ------------------------------------------------
+
+    /// Imports for the test builder: (dll_name, &[(function_name, hint)]).
+    struct TestImportDll<'a> {
+        dll_name: &'a str,
+        functions: &'a [(&'a str, u16)],
+    }
+
+    /// Build a PE64 binary with an import section for testing.
+    fn build_pe64_with_imports(imports: &[TestImportDll<'_>]) -> Vec<u8> {
+        build_pe_with_imports(true, imports)
+    }
+
+    /// Build a PE32 binary with an import section for testing.
+    fn build_pe32_with_imports(imports: &[TestImportDll<'_>]) -> Vec<u8> {
+        build_pe_with_imports(false, imports)
+    }
+
+    fn build_pe_with_imports(is_64bit: bool, imports: &[TestImportDll<'_>]) -> Vec<u8> {
+        let import_sec_va: u32 = 0x9000;
+        let import_data = build_import_section(is_64bit, imports, import_sec_va);
+
+        let text_sec = make_section(".text", &[0xCC; 64], 0x1000, CODE_CHARS);
+        let idata_sec = make_section(".idata", &import_data.data, import_sec_va, SCN_MEM_READ);
+
+        let user_sections = [text_sec, idata_sec];
+
+        // Build PE with import data directory set.
+        let pe_offset: usize = 64;
+        let coff = pe_offset + 4;
+        let opt = coff + 20;
+        let num_dd: usize = 16;
+        let opt_size = if is_64bit {
+            112 + num_dd * 8
+        } else {
+            96 + num_dd * 8
+        };
+        let sec_start = opt + opt_size;
+        let headers_end = sec_start + user_sections.len() * 40;
+        let file_align: usize = 512;
+        let data_start = (headers_end + file_align - 1) / file_align * file_align;
+
+        let mut raw_offsets = Vec::new();
+        let mut cursor = data_start;
+        for sec in &user_sections {
+            raw_offsets.push(cursor);
+            cursor += (sec.data.len() + file_align - 1) / file_align * file_align;
+        }
+
+        let total_size = cursor;
+        let mut buf = vec![0u8; total_size];
+
+        // DOS header
+        buf[0] = b'M';
+        buf[1] = b'Z';
+        buf[0x3C..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+
+        // PE signature
+        buf[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+
+        // COFF header
+        let machine: u16 = if is_64bit { MACHINE_AMD64 } else { MACHINE_I386 };
+        buf[coff..coff + 2].copy_from_slice(&machine.to_le_bytes());
+        buf[coff + 2..coff + 4]
+            .copy_from_slice(&(user_sections.len() as u16).to_le_bytes());
+        buf[coff + 16..coff + 18].copy_from_slice(&(opt_size as u16).to_le_bytes());
+
+        // Optional header
+        let magic: u16 = if is_64bit { 0x020B } else { 0x010B };
+        buf[opt..opt + 2].copy_from_slice(&magic.to_le_bytes());
+        buf[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry point
+
+        if is_64bit {
+            buf[opt + 24..opt + 32]
+                .copy_from_slice(&0x0000000180000000u64.to_le_bytes());
+            buf[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+            buf[opt + 36..opt + 40]
+                .copy_from_slice(&(file_align as u32).to_le_bytes());
+            buf[opt + 56..opt + 60].copy_from_slice(&0x10000u32.to_le_bytes());
+            buf[opt + 60..opt + 64]
+                .copy_from_slice(&(data_start as u32).to_le_bytes());
+            // Subsystem = Windows CUI (3)
+            buf[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes());
+            buf[opt + 108..opt + 112].copy_from_slice(&(num_dd as u32).to_le_bytes());
+
+            // Data directory entry 1 (import)
+            let dd = opt + 112 + 8; // entry 1 is at offset 8 from dd start
+            buf[dd..dd + 4].copy_from_slice(&import_data.dir_rva.to_le_bytes());
+            buf[dd + 4..dd + 8].copy_from_slice(&import_data.dir_size.to_le_bytes());
+        } else {
+            buf[opt + 28..opt + 32].copy_from_slice(&0x10000000u32.to_le_bytes());
+            buf[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+            buf[opt + 36..opt + 40]
+                .copy_from_slice(&(file_align as u32).to_le_bytes());
+            buf[opt + 56..opt + 60].copy_from_slice(&0x10000u32.to_le_bytes());
+            buf[opt + 60..opt + 64]
+                .copy_from_slice(&(data_start as u32).to_le_bytes());
+            buf[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes());
+            buf[opt + 92..opt + 96].copy_from_slice(&(num_dd as u32).to_le_bytes());
+
+            let dd = opt + 96 + 8;
+            buf[dd..dd + 4].copy_from_slice(&import_data.dir_rva.to_le_bytes());
+            buf[dd + 4..dd + 8].copy_from_slice(&import_data.dir_size.to_le_bytes());
+        }
+
+        // Section headers
+        for (i, sec) in user_sections.iter().enumerate() {
+            let s = sec_start + i * 40;
+            buf[s..s + 8].copy_from_slice(&sec.name);
+            buf[s + 8..s + 12]
+                .copy_from_slice(&(sec.data.len() as u32).to_le_bytes());
+            buf[s + 12..s + 16].copy_from_slice(&sec.virtual_address.to_le_bytes());
+            let raw_size =
+                (sec.data.len() + file_align - 1) / file_align * file_align;
+            buf[s + 16..s + 20].copy_from_slice(&(raw_size as u32).to_le_bytes());
+            buf[s + 20..s + 24]
+                .copy_from_slice(&(raw_offsets[i] as u32).to_le_bytes());
+            buf[s + 36..s + 40].copy_from_slice(&sec.characteristics.to_le_bytes());
+        }
+
+        // Section data
+        for (i, sec) in user_sections.iter().enumerate() {
+            let off = raw_offsets[i];
+            buf[off..off + sec.data.len()].copy_from_slice(&sec.data);
+        }
+
+        buf
+    }
+
+    struct ImportSectionData {
+        data: Vec<u8>,
+        dir_rva: u32,
+        dir_size: u32,
+    }
+
+    /// Build import section data.
+    fn build_import_section(
+        is_64bit: bool,
+        imports: &[TestImportDll<'_>],
+        section_va: u32,
+    ) -> ImportSectionData {
+        let entry_size: usize = if is_64bit { 8 } else { 4 };
+        let num_descs = imports.len();
+        // IMAGE_IMPORT_DESCRIPTOR array: num_descs + 1 (null terminator), each 20 bytes.
+        let desc_area = (num_descs + 1) * 20;
+
+        // Calculate ILT areas for each DLL.
+        let mut ilt_offsets = Vec::new();
+        let mut cursor = desc_area;
+        for imp in imports {
+            ilt_offsets.push(cursor);
+            cursor += (imp.functions.len() + 1) * entry_size; // +1 for null terminator
+        }
+
+        // Hint/Name entries and DLL name strings.
+        let mut hna_entries: Vec<(usize, u16, &str)> = Vec::new(); // (offset, hint, name)
+        let mut dll_name_offsets = Vec::new();
+        for imp in imports {
+            for &(name, hint) in imp.functions {
+                hna_entries.push((cursor, hint, name));
+                cursor += 2 + name.len() + 1; // hint(2) + name + NUL
+                // Align to 2
+                if cursor % 2 != 0 {
+                    cursor += 1;
+                }
+            }
+            dll_name_offsets.push(cursor);
+            cursor += imp.dll_name.len() + 1; // name + NUL
+        }
+
+        let total_size = cursor;
+        let mut data = vec![0u8; total_size];
+
+        // Write descriptors.
+        let mut hna_idx = 0;
+        for (i, imp) in imports.iter().enumerate() {
+            let d = i * 20;
+            let ilt_rva = section_va + ilt_offsets[i] as u32;
+            let name_rva = section_va + dll_name_offsets[i] as u32;
+
+            // OriginalFirstThunk (ILT RVA)
+            data[d..d + 4].copy_from_slice(&ilt_rva.to_le_bytes());
+            // Name RVA
+            data[d + 12..d + 16].copy_from_slice(&name_rva.to_le_bytes());
+            // FirstThunk (IAT RVA) — same as ILT for on-disk image
+            data[d + 16..d + 20].copy_from_slice(&ilt_rva.to_le_bytes());
+
+            // Write ILT entries.
+            for (j, &(_name, _hint)) in imp.functions.iter().enumerate() {
+                let t = ilt_offsets[i] + j * entry_size;
+                let (off, hint, name) = hna_entries[hna_idx];
+                hna_idx += 1;
+
+                // RVA to hint/name entry (import by name, not ordinal).
+                let hna_rva = (section_va + off as u32) as u64;
+                if is_64bit {
+                    data[t..t + 8].copy_from_slice(&hna_rva.to_le_bytes());
+                } else {
+                    data[t..t + 4]
+                        .copy_from_slice(&(hna_rva as u32).to_le_bytes());
+                }
+
+                // Write hint/name entry.
+                data[off..off + 2].copy_from_slice(&hint.to_le_bytes());
+                data[off + 2..off + 2 + name.len()].copy_from_slice(name.as_bytes());
+                data[off + 2 + name.len()] = 0; // NUL
+            }
+            // ILT null terminator is already zero.
+
+            // Write DLL name string.
+            let noff = dll_name_offsets[i];
+            data[noff..noff + imp.dll_name.len()]
+                .copy_from_slice(imp.dll_name.as_bytes());
+            data[noff + imp.dll_name.len()] = 0;
+        }
+        // Null terminator descriptor is already zeros.
+
+        ImportSectionData {
+            dir_rva: section_va,
+            dir_size: desc_area as u32,
+            data,
+        }
+    }
+
+    #[test]
+    fn parse_imports_single_dll() {
+        let pe = build_pe64_with_imports(&[TestImportDll {
+            dll_name: "KERNEL32.dll",
+            functions: &[("VirtualAlloc", 10), ("CreateFileW", 20)],
+        }]);
+
+        let headers = PeHeaders::parse(&pe).unwrap();
+        let imports = headers.parse_imports(&pe).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].dll_name, "KERNEL32.dll");
+        assert_eq!(imports[0].functions.len(), 2);
+        assert_eq!(imports[0].functions[0].name.as_deref(), Some("VirtualAlloc"));
+        assert_eq!(imports[0].functions[0].hint, 10);
+        assert_eq!(imports[0].functions[1].name.as_deref(), Some("CreateFileW"));
+        assert_eq!(imports[0].functions[1].hint, 20);
+    }
+
+    #[test]
+    fn parse_imports_multiple_dlls() {
+        let pe = build_pe64_with_imports(&[
+            TestImportDll {
+                dll_name: "KERNEL32.dll",
+                functions: &[("VirtualAlloc", 10)],
+            },
+            TestImportDll {
+                dll_name: "NTDLL.dll",
+                functions: &[("NtCreateSection", 5), ("RtlInitUnicodeString", 8)],
+            },
+        ]);
+
+        let headers = PeHeaders::parse(&pe).unwrap();
+        let imports = headers.parse_imports(&pe).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].dll_name, "KERNEL32.dll");
+        assert_eq!(imports[0].functions.len(), 1);
+        assert_eq!(imports[1].dll_name, "NTDLL.dll");
+        assert_eq!(imports[1].functions.len(), 2);
+    }
+
+    #[test]
+    fn parse_imports_pe32() {
+        let pe = build_pe32_with_imports(&[TestImportDll {
+            dll_name: "USER32.dll",
+            functions: &[("MessageBoxA", 1), ("GetWindowTextW", 2)],
+        }]);
+
+        let headers = PeHeaders::parse(&pe).unwrap();
+        assert!(!headers.is_64bit);
+        let imports = headers.parse_imports(&pe).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].dll_name, "USER32.dll");
+        assert_eq!(imports[0].functions.len(), 2);
+        assert_eq!(imports[0].functions[0].name.as_deref(), Some("MessageBoxA"));
+    }
+
+    #[test]
+    fn no_import_directory_returns_none() {
+        let pe = build_pe64(&[make_section(".text", &[0; 16], 0x1000, CODE_CHARS)]);
+        let headers = PeHeaders::parse(&pe).unwrap();
+        assert!(headers.import_directory().is_none());
+        assert!(headers.parse_imports(&pe).is_none());
+    }
+
+    #[test]
+    fn subsystem_parsed() {
+        let pe = build_pe64_with_imports(&[TestImportDll {
+            dll_name: "KERNEL32.dll",
+            functions: &[("ExitProcess", 0)],
+        }]);
+        let headers = PeHeaders::parse(&pe).unwrap();
+        assert_eq!(headers.subsystem, 3); // Windows CUI
+        assert_eq!(headers.subsystem_name(), "Windows CUI");
+    }
+
+    #[test]
+    fn machine_name_variants() {
+        let pe64 = build_pe64(&[make_section(".text", &[0; 16], 0x1000, CODE_CHARS)]);
+        let h64 = PeHeaders::parse(&pe64).unwrap();
+        assert_eq!(h64.machine_name(), "PE32+ (AMD64)");
+
+        let pe32 = build_pe32(&[make_section(".text", &[0; 16], 0x1000, CODE_CHARS)]);
+        let h32 = PeHeaders::parse(&pe32).unwrap();
+        assert_eq!(h32.machine_name(), "PE32 (i386)");
     }
 }
