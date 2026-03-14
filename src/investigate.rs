@@ -174,6 +174,25 @@ pub enum Command {
         json: bool,
     },
 
+    /// Run threat hunting rules against events
+    Hunt {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Run only a specific rule (e.g., "suspicious-parent", "lolbin", "unsigned-dll", "beaconing")
+        #[arg(long)]
+        rule: Option<String>,
+
+        /// Maximum results per rule (default: 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Extract indicators of compromise (IPs, domains, hashes) from events
     Ioc {
         /// Path to JSONL event file
@@ -311,6 +330,13 @@ pub fn run(command: Command) -> Result<()> {
         } => run_tree(&input, pid, process_key.as_deref(), ancestors, json),
 
         Command::Inspect { file, json } => run_inspect(&file, json),
+
+        Command::Hunt {
+            input,
+            rule,
+            limit,
+            json,
+        } => run_hunt(&input, rule.as_deref(), limit, json),
 
         Command::Ioc {
             input,
@@ -1417,6 +1443,322 @@ fn parse_hash_field(field: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Hunt
+// ---------------------------------------------------------------------------
+
+const HUNT_RULES: &[&str] = &["suspicious-parent", "lolbin", "unsigned-dll", "beaconing"];
+
+/// LOLBins — legitimate Windows binaries commonly abused by adversaries.
+const LOLBINS: &[&str] = &[
+    "certutil.exe",
+    "mshta.exe",
+    "regsvr32.exe",
+    "rundll32.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "msiexec.exe",
+    "bitsadmin.exe",
+    "wmic.exe",
+    "msbuild.exe",
+    "installutil.exe",
+    "regasm.exe",
+    "regsvcs.exe",
+    "cmstp.exe",
+    "esentutl.exe",
+    "expand.exe",
+    "extrac32.exe",
+    "hh.exe",
+    "ieexec.exe",
+    "makecab.exe",
+    "replace.exe",
+];
+
+/// Parent images that should not normally spawn shells/scripting engines.
+const SUSPICIOUS_PARENTS: &[&str] = &[
+    "winword.exe",
+    "excel.exe",
+    "powerpnt.exe",
+    "outlook.exe",
+    "msaccess.exe",
+    "mspub.exe",
+    "visio.exe",
+    "onenote.exe",
+    "acrobat.exe",
+    "acrord32.exe",
+];
+
+/// Children that are suspicious when spawned from office/document apps.
+const SUSPICIOUS_CHILDREN: &[&str] = &[
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+    "regsvr32.exe",
+    "rundll32.exe",
+    "certutil.exe",
+    "bitsadmin.exe",
+];
+
+#[derive(Serialize)]
+struct HuntReport {
+    total_events: u64,
+    findings: Vec<HuntFinding>,
+}
+
+#[derive(Serialize, Clone)]
+struct HuntFinding {
+    rule: String,
+    severity: String,
+    mitre: String,
+    process: String,
+    pid: u32,
+    detail: String,
+    timestamp: String,
+}
+
+fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    use std::collections::HashMap;
+
+    if let Some(r) = rule_filter {
+        if !HUNT_RULES.contains(&r) {
+            anyhow::bail!(
+                "unknown rule: {r} (available: {})",
+                HUNT_RULES.join(", ")
+            );
+        }
+    }
+
+    let run_rule = |name: &str| rule_filter.is_none() || rule_filter == Some(name);
+
+    let mut total: u64 = 0;
+    let mut findings: Vec<HuntFinding> = Vec::new();
+
+    // For beaconing detection: track (dst, process) → timestamps
+    struct BeaconAcc {
+        image: String,
+        pid: u32,
+        timestamps: Vec<DateTime<Utc>>,
+    }
+    let mut beacon_map: HashMap<String, BeaconAcc> = HashMap::new();
+
+    // First pass: collect process creates (for parent lookup) and all events
+    struct ProcInfo {
+        image_path: String,
+    }
+    let mut procs: HashMap<u32, ProcInfo> = HashMap::new();
+
+    for_each_event(input, |event| {
+        total += 1;
+        let ts = event.timestamp;
+
+        match &event.data {
+            EventData::ProcessCreate {
+                pid,
+                ppid,
+                image_path,
+                command_line,
+                ..
+            } => {
+                let child_name = basename(image_path);
+                let parent_name = procs
+                    .get(ppid)
+                    .map(|p| basename(&p.image_path))
+                    .unwrap_or_default();
+
+                procs.insert(*pid, ProcInfo {
+                    image_path: image_path.clone(),
+                });
+
+                // Rule: suspicious-parent
+                if run_rule("suspicious-parent") {
+                    let parent_lower = parent_name.to_ascii_lowercase();
+                    let child_lower = child_name.to_ascii_lowercase();
+                    if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
+                        && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+                    {
+                        findings.push(HuntFinding {
+                            rule: "suspicious-parent".into(),
+                            severity: "High".into(),
+                            mitre: "T1204.002".into(),
+                            process: image_path.clone(),
+                            pid: *pid,
+                            detail: format!(
+                                "{} spawned {} ({})",
+                                parent_name, child_name, command_line
+                            ),
+                            timestamp: ts.to_rfc3339(),
+                        });
+                    }
+                }
+
+                // Rule: lolbin
+                if run_rule("lolbin") {
+                    let child_lower = child_name.to_ascii_lowercase();
+                    if LOLBINS.iter().any(|l| child_lower == *l) {
+                        findings.push(HuntFinding {
+                            rule: "lolbin".into(),
+                            severity: "Medium".into(),
+                            mitre: "T1218".into(),
+                            process: image_path.clone(),
+                            pid: *pid,
+                            detail: format!(
+                                "LOLBin execution: {} ({})",
+                                child_name, command_line
+                            ),
+                            timestamp: ts.to_rfc3339(),
+                        });
+                    }
+                }
+            }
+
+            EventData::ImageLoad {
+                pid,
+                image_path,
+                image_name,
+                signed,
+                ..
+            } => {
+                // Rule: unsigned-dll
+                if run_rule("unsigned-dll") && !signed {
+                    findings.push(HuntFinding {
+                        rule: "unsigned-dll".into(),
+                        severity: "Low".into(),
+                        mitre: "T1574.001".into(),
+                        process: procs
+                            .get(pid)
+                            .map(|p| p.image_path.clone())
+                            .unwrap_or_else(|| format!("PID {pid}")),
+                        pid: *pid,
+                        detail: format!("Unsigned DLL loaded: {} ({})", image_name, image_path),
+                        timestamp: ts.to_rfc3339(),
+                    });
+                }
+            }
+
+            EventData::NetworkConnect {
+                pid,
+                dst_addr,
+                image_path,
+                ..
+            } => {
+                // Rule: beaconing — accumulate for post-processing
+                if run_rule("beaconing") && is_public_ip(dst_addr) {
+                    let key = format!("{dst_addr}|{pid}");
+                    let acc = beacon_map.entry(key).or_insert_with(|| BeaconAcc {
+                        image: image_path.clone(),
+                        pid: *pid,
+                        timestamps: Vec::new(),
+                    });
+                    acc.timestamps.push(ts);
+                }
+            }
+
+            _ => {}
+        }
+
+        true
+    })?;
+
+    // Post-processing: beaconing detection
+    // Flag connections to the same IP from the same process ≥ threshold
+    if run_rule("beaconing") {
+        let beacon_threshold: usize = 10;
+        for (key, acc) in &beacon_map {
+            if acc.timestamps.len() >= beacon_threshold {
+                let dst = key.split('|').next().unwrap_or("?");
+                let earliest = acc
+                    .timestamps
+                    .iter()
+                    .min()
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default();
+                findings.push(HuntFinding {
+                    rule: "beaconing".into(),
+                    severity: "Medium".into(),
+                    mitre: "T1071.001".into(),
+                    process: acc.image.clone(),
+                    pid: acc.pid,
+                    detail: format!(
+                        "{} connections to {} from {}",
+                        acc.timestamps.len(),
+                        dst,
+                        basename(&acc.image)
+                    ),
+                    timestamp: earliest,
+                });
+            }
+        }
+    }
+
+    // Sort by severity descending, then by timestamp
+    let sev_rank = |s: &str| -> u8 {
+        match s {
+            "Critical" => 4,
+            "High" => 3,
+            "Medium" => 2,
+            "Low" => 1,
+            _ => 0,
+        }
+    };
+    findings.sort_by(|a, b| {
+        sev_rank(&b.severity)
+            .cmp(&sev_rank(&a.severity))
+            .then_with(|| a.timestamp.cmp(&b.timestamp))
+    });
+    findings.truncate(limit);
+
+    let report = HuntReport {
+        total_events: total,
+        findings,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human-readable output
+    let mut out = std::io::stdout().lock();
+
+    writeln!(
+        out,
+        "=== Threat Hunt ({} events scanned, {} findings) ===",
+        report.total_events,
+        report.findings.len()
+    )?;
+
+    if report.findings.is_empty() {
+        writeln!(out, "\nNo findings.")?;
+        return Ok(());
+    }
+
+    writeln!(out)?;
+    for f in &report.findings {
+        writeln!(
+            out,
+            "[{}] {} ({})",
+            f.severity, f.rule, f.mitre
+        )?;
+        writeln!(out, "  PID:     {}", f.pid)?;
+        writeln!(out, "  Process: {}", f.process)?;
+        writeln!(out, "  Detail:  {}", f.detail)?;
+        writeln!(out, "  Time:    {}", f.timestamp)?;
+        writeln!(out)?;
+    }
+
+    Ok(())
+}
+
+fn basename(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------

