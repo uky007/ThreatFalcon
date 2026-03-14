@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -161,6 +161,7 @@ Commands:
   tail     Follow new events appended to a JSONL file (like tail -f)
   tree     Show process tree (parent-child relationships)
   inspect  Inspect a PE file: headers, sections, imports, and exports
+  ioc      Extract indicators of compromise (IPs, domains, hashes)
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -762,6 +763,56 @@ Suspicious API categories:
 Sections with both writable and executable characteristics are flagged as suspicious (common in packed or self-modifying code).
 
 The `inspect` command works cross-platform — PE files can be analyzed on macOS or Linux (e.g., for post-collection forensic analysis).
+
+### IOC Extraction
+
+Extract indicators of compromise (IPs, domains, file hashes) from telemetry events:
+
+```bash
+# Extract all IOCs from an event file
+threatfalcon ioc --input events.jsonl
+
+# Show only external IPs
+threatfalcon ioc --input events.jsonl --type ip
+
+# Show only domains
+threatfalcon ioc --input events.jsonl --type domain
+
+# JSON output for integration with other tools
+threatfalcon ioc --input events.jsonl --json
+```
+
+Example output:
+
+```
+=== IOC Extraction (1523 events scanned) ===
+
+[External IPs] (4)
+       8x  93.184.216.34                            (explorer.exe)
+       3x  8.8.8.8                                  (svchost.exe)
+       2x  185.199.108.133                           (DNS/github.com)
+       1x  104.16.132.229                            (chrome.exe)
+
+[Domains] (3)
+       5x  evil.example.com
+       2x  github.com
+       1x  api.example.org
+
+[File Hashes] (2)
+       1x  SHA256=abcdef1234567890... (malware.exe)
+       1x  MD5=d41d8cd98f00b204...   (rundll32.exe)
+```
+
+The IOC extraction covers:
+
+| IOC Type | Source Events | Notes |
+|----------|--------------|-------|
+| External IPs | `NetworkConnect` | Private, loopback, and link-local addresses excluded |
+| External IPs | `DnsQuery` response | IPs resolved from DNS answers |
+| Domains | `DnsQuery` | Queried domain names |
+| File Hashes | `ProcessCreate`, `ImageLoad` | `SHA256=...`, `MD5=...` format preserved |
+
+Results are deduplicated and sorted by frequency (descending). Use `--limit` to control the number of results per type (default: 50).
 
 ## Evasion Detection Rules
 

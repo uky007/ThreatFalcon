@@ -174,6 +174,25 @@ pub enum Command {
         json: bool,
     },
 
+    /// Extract indicators of compromise (IPs, domains, hashes) from events
+    Ioc {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Show only IOCs of a specific type (ip, domain, hash)
+        #[arg(long)]
+        r#type: Option<String>,
+
+        /// Maximum number of results per type (default: 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Follow new events appended to a JSONL file (like tail -f)
     Tail {
         /// Path to JSONL event file
@@ -292,6 +311,13 @@ pub fn run(command: Command) -> Result<()> {
         } => run_tree(&input, pid, process_key.as_deref(), ancestors, json),
 
         Command::Inspect { file, json } => run_inspect(&file, json),
+
+        Command::Ioc {
+            input,
+            r#type,
+            limit,
+            json,
+        } => run_ioc(&input, r#type.as_deref(), limit, json),
 
         Command::Tail {
             input,
@@ -1142,6 +1168,243 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IOC extraction
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct IocReport {
+    total_events: u64,
+    ips: Vec<IocEntry>,
+    domains: Vec<IocEntry>,
+    hashes: Vec<IocEntry>,
+}
+
+#[derive(Serialize)]
+struct IocEntry {
+    value: String,
+    count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_seen: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<String>,
+}
+
+/// Returns true if the address is a public (non-private, non-loopback,
+/// non-link-local) IPv4 or IPv6 address.
+fn is_public_ip(addr: &str) -> bool {
+    use std::net::IpAddr;
+    let Ok(ip) = addr.parse::<IpAddr>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_unspecified()
+                && !v4.is_documentation()
+        }
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+    }
+}
+
+fn run_ioc(input: &Path, type_filter: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    use std::collections::HashMap;
+
+    // Validate --type early
+    if let Some(t) = type_filter {
+        if !["ip", "domain", "hash"].contains(&t) {
+            anyhow::bail!("invalid --type value: {t} (expected: ip, domain, hash)");
+        }
+    }
+
+    struct IocAcc {
+        count: u64,
+        first_seen: DateTime<Utc>,
+        sources: std::collections::HashSet<String>,
+    }
+
+    let mut total: u64 = 0;
+    let mut ips: HashMap<String, IocAcc> = HashMap::new();
+    let mut domains: HashMap<String, IocAcc> = HashMap::new();
+    let mut hashes: HashMap<String, IocAcc> = HashMap::new();
+
+    let record = |map: &mut HashMap<String, IocAcc>,
+                  key: String,
+                  ts: DateTime<Utc>,
+                  source: String| {
+        let acc = map.entry(key).or_insert_with(|| IocAcc {
+            count: 0,
+            first_seen: ts,
+            sources: std::collections::HashSet::new(),
+        });
+        acc.count += 1;
+        if ts < acc.first_seen {
+            acc.first_seen = ts;
+        }
+        acc.sources.insert(source);
+    };
+
+    for_each_event(input, |event| {
+        total += 1;
+        let ts = event.timestamp;
+
+        match &event.data {
+            EventData::NetworkConnect {
+                dst_addr,
+                image_path,
+                ..
+            } => {
+                if is_public_ip(dst_addr) {
+                    let src = image_path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(image_path)
+                        .to_string();
+                    record(&mut ips, dst_addr.clone(), ts, src);
+                }
+            }
+            EventData::DnsQuery {
+                query_name,
+                response,
+                ..
+            } => {
+                if !query_name.is_empty() {
+                    let src = format!("DNS/{}", query_name);
+                    record(&mut domains, query_name.clone(), ts, "DnsQuery".into());
+                    // Also extract IPs from DNS responses
+                    if let Some(resp) = response {
+                        for part in resp.split(';') {
+                            let part = part.trim();
+                            if is_public_ip(part) {
+                                record(&mut ips, part.to_string(), ts, src.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            EventData::ProcessCreate {
+                hashes: Some(h),
+                image_path,
+                ..
+            } => {
+                for hash_str in parse_hash_field(h) {
+                    let src = image_path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(image_path)
+                        .to_string();
+                    record(&mut hashes, hash_str, ts, src);
+                }
+            }
+            EventData::ImageLoad {
+                hashes: Some(h),
+                image_name,
+                ..
+            } => {
+                for hash_str in parse_hash_field(h) {
+                    record(&mut hashes, hash_str, ts, image_name.clone());
+                }
+            }
+            _ => {}
+        }
+
+        true
+    })?;
+
+    // Convert to sorted vecs (descending by count)
+    let to_entries = |map: HashMap<String, IocAcc>, limit: usize| -> Vec<IocEntry> {
+        let mut vec: Vec<_> = map.into_iter().collect();
+        vec.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        vec.into_iter()
+            .take(limit)
+            .map(|(value, acc)| {
+                let mut sources: Vec<String> = acc.sources.into_iter().collect();
+                sources.sort();
+                IocEntry {
+                    value,
+                    count: acc.count,
+                    first_seen: Some(acc.first_seen.to_rfc3339()),
+                    sources,
+                }
+            })
+            .collect()
+    };
+
+    let show_ip = type_filter.is_none() || type_filter == Some("ip");
+    let show_domain = type_filter.is_none() || type_filter == Some("domain");
+    let show_hash = type_filter.is_none() || type_filter == Some("hash");
+
+    let report = IocReport {
+        total_events: total,
+        ips: if show_ip { to_entries(ips, limit) } else { Vec::new() },
+        domains: if show_domain { to_entries(domains, limit) } else { Vec::new() },
+        hashes: if show_hash { to_entries(hashes, limit) } else { Vec::new() },
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human-readable output
+    let mut out = std::io::stdout().lock();
+
+    writeln!(out, "=== IOC Extraction ({} events scanned) ===", report.total_events)?;
+
+    if show_ip {
+        writeln!(out)?;
+        if report.ips.is_empty() {
+            writeln!(out, "[External IPs] (none)")?;
+        } else {
+            writeln!(out, "[External IPs] ({})", report.ips.len())?;
+            for entry in &report.ips {
+                let sources = entry.sources.join(", ");
+                writeln!(out, "  {:>6}x  {:<40} ({})", entry.count, entry.value, sources)?;
+            }
+        }
+    }
+
+    if show_domain {
+        writeln!(out)?;
+        if report.domains.is_empty() {
+            writeln!(out, "[Domains] (none)")?;
+        } else {
+            writeln!(out, "[Domains] ({})", report.domains.len())?;
+            for entry in &report.domains {
+                writeln!(out, "  {:>6}x  {}", entry.count, entry.value)?;
+            }
+        }
+    }
+
+    if show_hash {
+        writeln!(out)?;
+        if report.hashes.is_empty() {
+            writeln!(out, "[File Hashes] (none)")?;
+        } else {
+            writeln!(out, "[File Hashes] ({})", report.hashes.len())?;
+            for entry in &report.hashes {
+                let sources = entry.sources.join(", ");
+                writeln!(out, "  {:>6}x  {} ({})", entry.count, entry.value, sources)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a hash field like "SHA256=abc123,MD5=def456" into individual values
+/// preserving the algorithm prefix.
+fn parse_hash_field(field: &str) -> Vec<String> {
+    field
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
