@@ -4,7 +4,7 @@ mod events;
 mod index;
 mod investigate;
 mod output;
-#[allow(dead_code)] // used by evasion collector on Windows; tested cross-platform
+#[allow(dead_code)] // some methods only used by evasion collector on Windows
 mod pe;
 mod process_cache;
 mod sensor;

@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -110,7 +110,7 @@ ThreatFalcon is split into a small number of clear components:
 - `src/collectors/etw.rs`: ETW real-time session and event mapping
 - `src/collectors/sysmon.rs`: Sysmon Event Log subscription
 - `src/collectors/sysmon_parser.rs`: Sysmon XML parsing and mapping
-- `src/pe.rs`: cross-platform PE header parser (sections, exports)
+- `src/pe.rs`: cross-platform PE header parser (sections, imports, exports)
 - `src/investigate.rs`: local investigation CLI (query, explain, bundle)
 - `src/collectors/evasion.rs`: evasion-oriented process inspection
 
@@ -160,6 +160,7 @@ Commands:
   stats    Show summary statistics for a JSONL telemetry file
   tail     Follow new events appended to a JSONL file (like tail -f)
   tree     Show process tree (parent-child relationships)
+  inspect  Inspect a PE file: headers, sections, imports, and exports
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -691,6 +692,76 @@ wininit.exe [PID 600, PPID 0] NT AUTHORITY\SYSTEM  [600:133579280000000000]
 When a PID appears in multiple `ProcessCreate` events (PID reuse), the tree selects the most recent instance by default. Use `--process-key` to select a specific instance. Parent-child relationships are resolved using temporal ordering: a child is assigned to the parent instance whose creation time is closest before the child's.
 
 The `--json` flag outputs a nested JSON tree structure where each node contains `pid`, `ppid`, `image_path`, `command_line`, `user`, `timestamp`, `process_key`, and `children`.
+
+### Inspect
+
+Analyze a PE (Portable Executable) file on disk — show headers, sections, imports with suspicious API classification, and exports:
+
+```bash
+# Inspect a binary found in events
+threatfalcon inspect --file C:\Windows\System32\cmd.exe
+
+# JSON output for programmatic analysis
+threatfalcon inspect --file suspicious.exe --json
+```
+
+Example output:
+
+```
+=== PE Inspection: suspicious.exe ===
+
+[Basic Info]
+  Architecture:    PE32+ (AMD64)
+  Entry Point:     0x00001000
+  Image Base:      0x0000000140000000
+  Image Size:      0x00020000
+  Subsystem:       Windows CUI
+
+[Sections] (3)
+  Name         VirtSize    RawSize  Flags
+  .text      0x0000A000 0x0000A000  R-X
+  .rdata     0x00003000 0x00003000  R--
+  .data      0x00001000 0x00000800  RW-
+
+[Imports] (2 DLLs, 12 functions)
+  KERNEL32.dll (8 functions)
+    VirtualAllocEx                           [!] Process Injection, Memory Manipulation
+    WriteProcessMemory                       [!] Process Injection
+    CreateRemoteThread                       [!] Process Injection
+    GetProcAddress                           [!] Hooking / Dynamic Resolution
+    ...4 more
+
+  NTDLL.dll (4 functions)
+    NtUnmapViewOfSection                     [!] Defense Evasion
+    ...3 more
+
+[Suspicious API Summary]
+  Process Injection                         3 API(s)
+  Memory Manipulation                       1 API(s)
+  Hooking / Dynamic Resolution              1 API(s)
+  Defense Evasion                           1 API(s)
+
+[Exports] (0)
+  (none)
+
+[Warnings]
+  [!] Section .rwx is writable + executable (RWX)
+```
+
+Suspicious API categories:
+
+| Category | Example APIs |
+|----------|-------------|
+| Process Injection | `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`, `NtCreateThreadEx` |
+| Code Execution | `CreateProcessW`, `ShellExecuteW`, `WinExec` |
+| Memory Manipulation | `VirtualProtect`, `VirtualAlloc`, `NtAllocateVirtualMemory` |
+| Hooking / Dynamic Resolution | `GetProcAddress`, `LoadLibraryW`, `SetWindowsHookExW` |
+| Credential Access | `CredReadW`, `LsaRetrievePrivateData`, `CryptUnprotectData` |
+| Defense Evasion | `NtUnmapViewOfSection`, `NtSetContextThread`, `EtwEventWrite` |
+
+Sections with both writable and executable characteristics are flagged as suspicious (common in packed or self-modifying code).
+
+The `inspect` command works cross-platform — PE files can be analyzed on macOS or Linux (e.g., for post-collection forensic analysis).
 
 ## Evasion Detection Rules
 

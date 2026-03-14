@@ -163,6 +163,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Inspect a PE file: headers, sections, imports, and exports
+    Inspect {
+        /// Path to PE file to inspect
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Follow new events appended to a JSONL file (like tail -f)
     Tail {
         /// Path to JSONL event file
@@ -279,6 +290,8 @@ pub fn run(command: Command) -> Result<()> {
             ancestors,
             json,
         } => run_tree(&input, pid, process_key.as_deref(), ancestors, json),
+
+        Command::Inspect { file, json } => run_inspect(&file, json),
 
         Command::Tail {
             input,
@@ -1425,6 +1438,362 @@ fn print_tree_node(
 
 fn short_image(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+// ---------------------------------------------------------------------------
+// Inspect
+// ---------------------------------------------------------------------------
+
+use crate::pe::{self, PeHeaders};
+
+/// Suspicious API categories for import classification.
+struct SuspiciousCategory {
+    name: &'static str,
+    apis: &'static [&'static str],
+}
+
+const SUSPICIOUS_APIS: &[SuspiciousCategory] = &[
+    SuspiciousCategory {
+        name: "Process Injection",
+        apis: &[
+            "VirtualAllocEx",
+            "WriteProcessMemory",
+            "CreateRemoteThread",
+            "CreateRemoteThreadEx",
+            "NtCreateThreadEx",
+            "NtWriteVirtualMemory",
+            "NtMapViewOfSection",
+            "QueueUserAPC",
+            "RtlCreateUserThread",
+        ],
+    },
+    SuspiciousCategory {
+        name: "Code Execution",
+        apis: &[
+            "CreateProcessA",
+            "CreateProcessW",
+            "CreateProcessAsUserA",
+            "CreateProcessAsUserW",
+            "ShellExecuteA",
+            "ShellExecuteW",
+            "ShellExecuteExA",
+            "ShellExecuteExW",
+            "WinExec",
+        ],
+    },
+    SuspiciousCategory {
+        name: "Memory Manipulation",
+        apis: &[
+            "VirtualProtect",
+            "VirtualProtectEx",
+            "VirtualAlloc",
+            "VirtualAllocEx",
+            "NtAllocateVirtualMemory",
+            "NtProtectVirtualMemory",
+        ],
+    },
+    SuspiciousCategory {
+        name: "Hooking / Dynamic Resolution",
+        apis: &[
+            "SetWindowsHookExA",
+            "SetWindowsHookExW",
+            "GetProcAddress",
+            "LoadLibraryA",
+            "LoadLibraryW",
+            "LoadLibraryExA",
+            "LoadLibraryExW",
+            "LdrLoadDll",
+        ],
+    },
+    SuspiciousCategory {
+        name: "Credential Access",
+        apis: &[
+            "CredReadA",
+            "CredReadW",
+            "LsaRetrievePrivateData",
+            "CryptUnprotectData",
+        ],
+    },
+    SuspiciousCategory {
+        name: "Defense Evasion",
+        apis: &[
+            "NtUnmapViewOfSection",
+            "NtCreateSection",
+            "NtSetContextThread",
+            "NtResumeThread",
+            "NtSuspendThread",
+            "EtwEventWrite",
+        ],
+    },
+];
+
+fn classify_api(name: &str) -> Vec<&'static str> {
+    let mut cats = Vec::new();
+    for cat in SUSPICIOUS_APIS {
+        if cat.apis.contains(&name) {
+            cats.push(cat.name);
+        }
+    }
+    cats
+}
+
+fn section_rwx(chars: u32) -> String {
+    let r = if chars & pe::SCN_MEM_READ != 0 { 'R' } else { '-' };
+    let w = if chars & pe::SCN_MEM_WRITE != 0 { 'W' } else { '-' };
+    let x = if chars & pe::SCN_MEM_EXECUTE != 0 { 'X' } else { '-' };
+    format!("{r}{w}{x}")
+}
+
+#[derive(Serialize)]
+struct InspectReport {
+    file: String,
+    architecture: String,
+    entry_point_rva: String,
+    image_base: String,
+    image_size: String,
+    subsystem: String,
+    sections: Vec<InspectSection>,
+    imports: Vec<InspectImportDll>,
+    exports: Vec<pe::ExportEntry>,
+    suspicious_summary: Vec<SuspiciousSummary>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct InspectSection {
+    name: String,
+    virtual_size: u32,
+    raw_size: u32,
+    characteristics: String,
+    suspicious: bool,
+}
+
+#[derive(Serialize)]
+struct InspectImportDll {
+    dll_name: String,
+    functions: Vec<InspectImportFunc>,
+}
+
+#[derive(Serialize)]
+struct InspectImportFunc {
+    name: Option<String>,
+    ordinal: Option<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    suspicious_categories: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SuspiciousSummary {
+    category: String,
+    count: usize,
+    apis: Vec<String>,
+}
+
+fn run_inspect(path: &Path, json: bool) -> Result<()> {
+    let data =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let pe = PeHeaders::parse(&data)
+        .ok_or_else(|| anyhow::anyhow!("not a valid PE file: {}", path.display()))?;
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    let has_import_dir = pe.import_directory().is_some();
+    let imports = match pe.parse_imports(&data) {
+        Some(v) => v,
+        None if has_import_dir => {
+            warnings.push("Import table is present but could not be parsed (malformed data)".to_string());
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+
+    let has_export_dir = pe.export_directory().is_some();
+    let exports = match pe.parse_exports(&data) {
+        Some(v) => v,
+        None if has_export_dir => {
+            warnings.push("Export table is present but could not be parsed (malformed data)".to_string());
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+
+    // Build sections info.
+    let sections: Vec<InspectSection> = pe
+        .sections
+        .iter()
+        .map(|s| {
+            let rwx = section_rwx(s.characteristics);
+            let suspicious = s.is_writable() && s.is_executable();
+            if suspicious {
+                warnings.push(format!(
+                    "Section {} is writable + executable ({})",
+                    s.name, rwx
+                ));
+            }
+            InspectSection {
+                name: s.name.clone(),
+                virtual_size: s.virtual_size,
+                raw_size: s.raw_data_size,
+                characteristics: rwx,
+                suspicious,
+            }
+        })
+        .collect();
+
+    // Build imports with suspicious classification.
+    let mut suspicious_map: std::collections::HashMap<&str, Vec<String>> =
+        std::collections::HashMap::new();
+    let inspect_imports: Vec<InspectImportDll> = imports
+        .iter()
+        .map(|dll| InspectImportDll {
+            dll_name: dll.dll_name.clone(),
+            functions: dll
+                .functions
+                .iter()
+                .map(|f| {
+                    let cats = f
+                        .name
+                        .as_deref()
+                        .map(|n| {
+                            let c = classify_api(n);
+                            for &cat in &c {
+                                suspicious_map
+                                    .entry(cat)
+                                    .or_default()
+                                    .push(n.to_string());
+                            }
+                            c
+                        })
+                        .unwrap_or_default();
+                    InspectImportFunc {
+                        name: f.name.clone(),
+                        ordinal: f.ordinal,
+                        suspicious_categories: cats.iter().map(|s| s.to_string()).collect(),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+
+    // Build suspicious summary, sorted by count descending.
+    let mut suspicious_summary: Vec<SuspiciousSummary> = suspicious_map
+        .into_iter()
+        .map(|(cat, apis)| SuspiciousSummary {
+            category: cat.to_string(),
+            count: apis.len(),
+            apis,
+        })
+        .collect();
+    suspicious_summary.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let report = InspectReport {
+        file: path.display().to_string(),
+        architecture: pe.machine_name().to_string(),
+        entry_point_rva: format!("0x{:08X}", pe.entry_point_rva),
+        image_base: format!("0x{:016X}", pe.image_base),
+        image_size: format!("0x{:08X}", pe.size_of_image),
+        subsystem: pe.subsystem_name().to_string(),
+        sections,
+        imports: inspect_imports,
+        exports,
+        suspicious_summary,
+        warnings,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human-readable output.
+    let mut out = std::io::stdout().lock();
+
+    writeln!(out, "=== PE Inspection: {} ===", path.display())?;
+    writeln!(out)?;
+
+    // Basic info.
+    writeln!(out, "[Basic Info]")?;
+    writeln!(out, "  Architecture:    {}", report.architecture)?;
+    writeln!(out, "  Entry Point:     {}", report.entry_point_rva)?;
+    writeln!(out, "  Image Base:      {}", report.image_base)?;
+    writeln!(out, "  Image Size:      {}", report.image_size)?;
+    writeln!(out, "  Subsystem:       {}", report.subsystem)?;
+    writeln!(out)?;
+
+    // Sections.
+    writeln!(out, "[Sections] ({})", report.sections.len())?;
+    writeln!(out, "  {:<10} {:>10} {:>10}  Flags", "Name", "VirtSize", "RawSize")?;
+    for s in &report.sections {
+        let flag = if s.suspicious { " [!] W+X" } else { "" };
+        writeln!(
+            out,
+            "  {:<10} 0x{:08X} 0x{:08X}  {}{}",
+            s.name, s.virtual_size, s.raw_size, s.characteristics, flag
+        )?;
+    }
+    writeln!(out)?;
+
+    // Imports.
+    let total_funcs: usize = report.imports.iter().map(|d| d.functions.len()).sum();
+    writeln!(
+        out,
+        "[Imports] ({} DLLs, {} functions)",
+        report.imports.len(),
+        total_funcs
+    )?;
+    for dll in &report.imports {
+        writeln!(out, "  {} ({} functions)", dll.dll_name, dll.functions.len())?;
+        for f in &dll.functions {
+            let ord_fallback = format!("ordinal #{}", f.ordinal.unwrap_or(0));
+            let name_str = f.name.as_deref().unwrap_or(&ord_fallback);
+            if f.suspicious_categories.is_empty() {
+                writeln!(out, "    {name_str}")?;
+            } else {
+                writeln!(
+                    out,
+                    "    {name_str:<40} [!] {}",
+                    f.suspicious_categories.join(", ")
+                )?;
+            }
+        }
+    }
+    writeln!(out)?;
+
+    // Suspicious summary.
+    if !report.suspicious_summary.is_empty() {
+        writeln!(out, "[Suspicious API Summary]")?;
+        for s in &report.suspicious_summary {
+            writeln!(out, "  {:<35} {} API(s)", s.category, s.count)?;
+        }
+        writeln!(out)?;
+    }
+
+    // Exports.
+    writeln!(out, "[Exports] ({})", report.exports.len())?;
+    if report.exports.is_empty() {
+        writeln!(out, "  (none)")?;
+    } else {
+        for e in &report.exports {
+            let name_str = e.name.as_deref().unwrap_or("(ordinal)");
+            let fwd = if e.is_forward { " [forwarder]" } else { "" };
+            writeln!(
+                out,
+                "  #{:<5} 0x{:08X}  {}{fwd}",
+                e.ordinal, e.rva, name_str
+            )?;
+        }
+    }
+
+    // Warnings.
+    if !report.warnings.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "[Warnings]")?;
+        for w in &report.warnings {
+            writeln!(out, "  [!] {w}")?;
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
