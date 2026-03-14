@@ -174,6 +174,21 @@ pub enum Command {
         json: bool,
     },
 
+    /// Score processes by threat signals (detections, network, LOLBins, etc.)
+    Score {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Maximum number of processes to display (default: 20)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run threat hunting rules against events
     Hunt {
         /// Path to JSONL event file
@@ -330,6 +345,8 @@ pub fn run(command: Command) -> Result<()> {
         } => run_tree(&input, pid, process_key.as_deref(), ancestors, json),
 
         Command::Inspect { file, json } => run_inspect(&file, json),
+
+        Command::Score { input, limit, json } => run_score(&input, limit, json),
 
         Command::Hunt {
             input,
@@ -1191,6 +1208,333 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
         for entry in &stats.top_rules {
             writeln!(out, "  {:20} {:>6}", entry.label, entry.count)?;
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Score
+// ---------------------------------------------------------------------------
+
+/// Point values for each signal type.
+const SCORE_DETECTION: u32 = 40;
+const SCORE_SUSPICIOUS_PARENT: u32 = 20;
+const SCORE_LOLBIN: u32 = 20;
+const SCORE_UNSIGNED_DLL: u32 = 5;
+const SCORE_EXTERNAL_IP: u32 = 2;
+const SCORE_DNS_QUERY: u32 = 1;
+
+#[derive(Serialize)]
+struct ScoreReport {
+    total_events: u64,
+    scored_processes: Vec<ScoredProcess>,
+}
+
+#[derive(Serialize)]
+struct ScoredProcess {
+    process_key: String,
+    pid: u32,
+    image: String,
+    score: u32,
+    breakdown: ScoreBreakdown,
+}
+
+#[derive(Serialize, Default)]
+struct ScoreBreakdown {
+    detections: u32,
+    suspicious_parent: bool,
+    lolbin: bool,
+    unsigned_dlls: u32,
+    external_ips: u32,
+    dns_queries: u32,
+}
+
+impl ScoreBreakdown {
+    fn total(&self) -> u32 {
+        self.detections * SCORE_DETECTION
+            + if self.suspicious_parent { SCORE_SUSPICIOUS_PARENT } else { 0 }
+            + if self.lolbin { SCORE_LOLBIN } else { 0 }
+            + self.unsigned_dlls * SCORE_UNSIGNED_DLL
+            + self.external_ips * SCORE_EXTERNAL_IP
+            + self.dns_queries * SCORE_DNS_QUERY
+    }
+}
+
+fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    struct ProcAcc {
+        pid: u32,
+        image: String,
+        breakdown: ScoreBreakdown,
+        unique_ips: HashSet<String>,
+        unique_domains: HashSet<String>,
+    }
+
+    let mut total: u64 = 0;
+    let mut acc_map: HashMap<String, ProcAcc> = HashMap::new();
+
+    // Collect ProcessCreate events for parent lookup (sorted by timestamp).
+    struct ProcCreate {
+        pid: u32,
+        ppid: u32,
+        image_path: String,
+        process_key: Option<String>,
+        timestamp: DateTime<Utc>,
+    }
+    let mut proc_creates: Vec<ProcCreate> = Vec::new();
+
+    for_each_event(input, |event| {
+        total += 1;
+
+        let event_key = event
+            .process_context
+            .as_ref()
+            .map(|c| c.process_key.clone());
+
+        match &event.data {
+            EventData::ProcessCreate {
+                pid,
+                ppid,
+                image_path,
+                ..
+            } => {
+                let key = event_key.clone().unwrap_or_else(|| format!("pid:{pid}"));
+                proc_creates.push(ProcCreate {
+                    pid: *pid,
+                    ppid: *ppid,
+                    image_path: image_path.clone(),
+                    process_key: event_key,
+                    timestamp: event.timestamp,
+                });
+                let acc = acc_map.entry(key).or_insert_with(|| ProcAcc {
+                    pid: *pid,
+                    image: image_path.clone(),
+                    breakdown: ScoreBreakdown::default(),
+                    unique_ips: HashSet::new(),
+                    unique_domains: HashSet::new(),
+                });
+                // LOLBin check
+                let child_lower = basename(image_path).to_ascii_lowercase();
+                if LOLBINS.iter().any(|l| child_lower == *l) {
+                    acc.breakdown.lolbin = true;
+                }
+            }
+
+            EventData::EvasionDetected { .. } => {
+                if event.rule.is_some() {
+                    if let Some(ref key) = event_key {
+                        let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
+                            pid: event.data.acting_pid().unwrap_or(0),
+                            image: event
+                                .process_context
+                                .as_ref()
+                                .and_then(|c| c.image_path.clone())
+                                .unwrap_or_default(),
+                            breakdown: ScoreBreakdown::default(),
+                            unique_ips: HashSet::new(),
+                            unique_domains: HashSet::new(),
+                        });
+                        acc.breakdown.detections += 1;
+                    }
+                }
+            }
+
+            EventData::ImageLoad {
+                pid,
+                signed,
+                ..
+            } => {
+                if !signed {
+                    let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
+                    let acc = acc_map.entry(key).or_insert_with(|| ProcAcc {
+                        pid: *pid,
+                        image: event
+                            .process_context
+                            .as_ref()
+                            .and_then(|c| c.image_path.clone())
+                            .unwrap_or_else(|| format!("PID {pid}")),
+                        breakdown: ScoreBreakdown::default(),
+                        unique_ips: HashSet::new(),
+                        unique_domains: HashSet::new(),
+                    });
+                    acc.breakdown.unsigned_dlls += 1;
+                }
+            }
+
+            EventData::NetworkConnect {
+                pid,
+                dst_addr,
+                ..
+            } => {
+                if is_public_ip(dst_addr) {
+                    let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
+                    let acc = acc_map.entry(key).or_insert_with(|| ProcAcc {
+                        pid: *pid,
+                        image: event
+                            .process_context
+                            .as_ref()
+                            .and_then(|c| c.image_path.clone())
+                            .unwrap_or_else(|| format!("PID {pid}")),
+                        breakdown: ScoreBreakdown::default(),
+                        unique_ips: HashSet::new(),
+                        unique_domains: HashSet::new(),
+                    });
+                    acc.unique_ips.insert(dst_addr.clone());
+                }
+            }
+
+            EventData::DnsQuery {
+                pid,
+                query_name,
+                ..
+            } => {
+                if !query_name.is_empty() {
+                    let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
+                    let acc = acc_map.entry(key).or_insert_with(|| ProcAcc {
+                        pid: *pid,
+                        image: event
+                            .process_context
+                            .as_ref()
+                            .and_then(|c| c.image_path.clone())
+                            .unwrap_or_else(|| format!("PID {pid}")),
+                        breakdown: ScoreBreakdown::default(),
+                        unique_ips: HashSet::new(),
+                        unique_domains: HashSet::new(),
+                    });
+                    acc.unique_domains.insert(query_name.clone());
+                }
+            }
+
+            _ => {}
+        }
+
+        true
+    })?;
+
+    // Suspicious-parent: sort ProcessCreate by timestamp, build parent map.
+    proc_creates.sort_by_key(|p| p.timestamp);
+    let mut parent_procs: HashMap<String, String> = HashMap::new(); // key → image
+    let mut pid_to_key: HashMap<u32, String> = HashMap::new();
+
+    for pc in &proc_creates {
+        let child_key = pc
+            .process_key
+            .clone()
+            .unwrap_or_else(|| format!("pid:{}", pc.pid));
+
+        let parent_name = pid_to_key
+            .get(&pc.ppid)
+            .and_then(|k| parent_procs.get(k))
+            .map(|img| basename(img))
+            .unwrap_or_default();
+
+        pid_to_key.insert(pc.pid, child_key.clone());
+        parent_procs.insert(child_key.clone(), pc.image_path.clone());
+
+        let child_lower = basename(&pc.image_path).to_ascii_lowercase();
+        let parent_lower = parent_name.to_ascii_lowercase();
+        if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
+            && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+        {
+            if let Some(acc) = acc_map.get_mut(&child_key) {
+                acc.breakdown.suspicious_parent = true;
+            }
+        }
+    }
+
+    // Finalize counts and scores.
+    let mut scored: Vec<ScoredProcess> = acc_map
+        .into_iter()
+        .map(|(key, mut acc)| {
+            acc.breakdown.external_ips = acc.unique_ips.len() as u32;
+            acc.breakdown.dns_queries = acc.unique_domains.len() as u32;
+            let score = acc.breakdown.total();
+            ScoredProcess {
+                process_key: key,
+                pid: acc.pid,
+                image: acc.image,
+                score,
+                breakdown: acc.breakdown,
+            }
+        })
+        .filter(|p| p.score > 0)
+        .collect();
+
+    scored.sort_by(|a, b| b.score.cmp(&a.score));
+    scored.truncate(limit);
+
+    let report = ScoreReport {
+        total_events: total,
+        scored_processes: scored,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human-readable output.
+    let mut out = std::io::stdout().lock();
+
+    writeln!(
+        out,
+        "=== Process Threat Scores ({} events scanned) ===",
+        report.total_events
+    )?;
+
+    if report.scored_processes.is_empty() {
+        writeln!(out, "\nNo scored processes.")?;
+        return Ok(());
+    }
+
+    writeln!(out)?;
+    for p in &report.scored_processes {
+        writeln!(
+            out,
+            "[Score: {:>4}]  PID {:>6}  {}",
+            p.score, p.pid, p.image
+        )?;
+        writeln!(out, "              key: {}", p.process_key)?;
+
+        let mut signals = Vec::new();
+        if p.breakdown.detections > 0 {
+            signals.push(format!(
+                "{}x detection (+{})",
+                p.breakdown.detections,
+                p.breakdown.detections * SCORE_DETECTION
+            ));
+        }
+        if p.breakdown.suspicious_parent {
+            signals.push(format!("suspicious parent (+{SCORE_SUSPICIOUS_PARENT})"));
+        }
+        if p.breakdown.lolbin {
+            signals.push(format!("LOLBin (+{SCORE_LOLBIN})"));
+        }
+        if p.breakdown.unsigned_dlls > 0 {
+            signals.push(format!(
+                "{}x unsigned DLL (+{})",
+                p.breakdown.unsigned_dlls,
+                p.breakdown.unsigned_dlls * SCORE_UNSIGNED_DLL
+            ));
+        }
+        if p.breakdown.external_ips > 0 {
+            signals.push(format!(
+                "{} external IP(s) (+{})",
+                p.breakdown.external_ips,
+                p.breakdown.external_ips * SCORE_EXTERNAL_IP
+            ));
+        }
+        if p.breakdown.dns_queries > 0 {
+            signals.push(format!(
+                "{} DNS query(s) (+{})",
+                p.breakdown.dns_queries,
+                p.breakdown.dns_queries * SCORE_DNS_QUERY
+            ));
+        }
+        writeln!(out, "              {}", signals.join(", "))?;
+        writeln!(out)?;
     }
 
     Ok(())
