@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -157,6 +157,9 @@ Commands:
   explain  Explain an event with its process context timeline
   bundle   Bundle an event and related context into a single JSON document
   index    Build or manage the SQLite index for fast event lookups
+  stats    Show summary statistics for a JSONL telemetry file
+  tail     Follow new events appended to a JSONL file (like tail -f)
+  tree     Show process tree (parent-child relationships)
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -646,6 +649,48 @@ threatfalcon tail --input events.jsonl --json | jq '.severity'
 ```
 
 The human-readable format shows timestamp, severity, category, PID, and a one-line event summary. Press Ctrl+C to stop.
+
+### Tree
+
+Reconstruct and display process trees from `ProcessCreate` events. Show the descendant tree (children, grandchildren, ...) or the ancestor chain (parent, grandparent, ...) of a given process:
+
+```bash
+# Show descendants of PID 1234
+threatfalcon tree --input events.jsonl --pid 1234
+
+# Show ancestor chain leading to PID 5678
+threatfalcon tree --input events.jsonl --pid 5678 --ancestors
+
+# Disambiguate PID reuse with --process-key
+threatfalcon tree --input events.jsonl --pid 1234 --process-key "1234:133579284000000000"
+
+# JSON output for programmatic use
+threatfalcon tree --input events.jsonl --pid 1234 --json
+```
+
+Example output (descendants):
+
+```
+=== Process Tree for PID 892 (3 descendants) ===
+svchost.exe [PID 892, PPID 600] NT AUTHORITY\SYSTEM  [892:133579284000000000]
+├─ taskhostw.exe [PID 3120, PPID 892] DESKTOP\user  [3120:133579285000000000]
+└─ RuntimeBroker.exe [PID 4200, PPID 892] DESKTOP\user  [4200:133579286000000000]
+   └─ cmd.exe [PID 5100, PPID 4200] DESKTOP\user  [5100:133579287000000000]
+```
+
+Example output (ancestors):
+
+```
+=== Ancestor Chain for PID 5100 (4 levels) ===
+wininit.exe [PID 600, PPID 0] NT AUTHORITY\SYSTEM  [600:133579280000000000]
+└─ svchost.exe [PID 892, PPID 600] NT AUTHORITY\SYSTEM  [892:133579284000000000]
+   └─ RuntimeBroker.exe [PID 4200, PPID 892] DESKTOP\user  [4200:133579286000000000]
+      └─ cmd.exe [PID 5100, PPID 4200] DESKTOP\user  [5100:133579287000000000]
+```
+
+When a PID appears in multiple `ProcessCreate` events (PID reuse), the tree selects the most recent instance by default. Use `--process-key` to select a specific instance. Parent-child relationships are resolved using temporal ordering: a child is assigned to the parent instance whose creation time is closest before the child's.
+
+The `--json` flag outputs a nested JSON tree structure where each node contains `pid`, `ppid`, `image_path`, `command_line`, `user`, `timestamp`, `process_key`, and `children`.
 
 ## Evasion Detection Rules
 
