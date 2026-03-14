@@ -1338,8 +1338,12 @@ fn tail_survives_file_rotation() {
 // ---- Tree subcommand tests --------------------------------------------------
 
 fn sample_process_create(id: &str, pid: u32, ppid: u32, image: &str, cmdline: &str, timestamp: &str) -> String {
+    sample_process_create_key(id, pid, ppid, image, cmdline, timestamp, &format!("{pid}:42"))
+}
+
+fn sample_process_create_key(id: &str, pid: u32, ppid: u32, image: &str, cmdline: &str, timestamp: &str, process_key: &str) -> String {
     format!(
-        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"Process","severity":"Info","data":{{"type":"ProcessCreate","pid":{pid},"ppid":{ppid},"image_path":"{image}","command_line":"{cmdline}","user":"TEST\\\\user","integrity_level":"Medium","hashes":null}},"process_context":{{"process_key":"{pid}:42"}}}}"#
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"Process","severity":"Info","data":{{"type":"ProcessCreate","pid":{pid},"ppid":{ppid},"image_path":"{image}","command_line":"{cmdline}","user":"TEST\\\\user","integrity_level":"Medium","hashes":null}},"process_context":{{"process_key":"{process_key}"}}}}"#
     )
 }
 
@@ -1348,6 +1352,7 @@ fn tree_help() {
     cmd().args(["tree", "--help"]).assert().success().stdout(
         predicate::str::contains("--input")
             .and(predicate::str::contains("--pid"))
+            .and(predicate::str::contains("--process-key"))
             .and(predicate::str::contains("--ancestors"))
             .and(predicate::str::contains("--json")),
     );
@@ -1373,17 +1378,23 @@ fn tree_shows_descendants() {
     ];
     fs::write(&path, lines.join("\n")).unwrap();
 
-    cmd()
+    let output = cmd()
         .args(["tree", "--input", path.to_str().unwrap(), "--pid", "1"])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("Process Tree for PID 1")
-                .and(predicate::str::contains("2 descendants"))
-                .and(predicate::str::contains("explorer.exe"))
-                .and(predicate::str::contains("cmd.exe"))
-                .and(predicate::str::contains("powershell.exe")),
-        );
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("Process Tree for PID 1"), "header missing");
+    assert!(stdout.contains("2 descendants"), "descendant count missing");
+    assert!(stdout.contains("explorer.exe"), "root process missing");
+    assert!(stdout.contains("cmd.exe"), "child process missing");
+    assert!(stdout.contains("powershell.exe"), "grandchild process missing");
+    // Verify tree connectors are present (not flat output)
+    assert!(
+        stdout.contains("└─") || stdout.contains("├─"),
+        "tree connectors missing — output is flat: {stdout}"
+    );
 }
 
 #[test]
@@ -1467,5 +1478,69 @@ fn tree_leaf_process_has_no_descendants() {
         .stdout(
             predicate::str::contains("0 descendants")
                 .and(predicate::str::contains("cmd.exe")),
+        );
+}
+
+#[test]
+fn tree_pid_reuse_descendants_picks_correct_instance() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // PID 100 used twice: first as cmd.exe, then later as notepad.exe.
+    // PID 200 (child of PID 100) was created after cmd.exe but before notepad.exe.
+    let lines = [
+        sample_process_create_key("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 100, 0, "cmd.exe", "cmd.exe", "2026-03-13T10:00:00Z", "100:1000"),
+        sample_process_create_key("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 200, 100, "child.exe", "child.exe", "2026-03-13T10:01:00Z", "200:42"),
+        sample_process_create_key("cccccccc-cccc-cccc-cccc-cccccccccccc", 100, 0, "notepad.exe", "notepad.exe", "2026-03-13T10:05:00Z", "100:2000"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Without --process-key, tree picks the latest PID 100 (notepad.exe)
+    // and child.exe should NOT appear as its descendant (created before notepad.exe)
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "100"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("notepad.exe")
+                .and(predicate::str::contains("0 descendants")),
+        );
+
+    // With --process-key, tree picks the cmd.exe instance and child.exe IS its descendant
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "100", "--process-key", "100:1000"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("cmd.exe")
+                .and(predicate::str::contains("1 descendants"))
+                .and(predicate::str::contains("child.exe")),
+        );
+}
+
+#[test]
+fn tree_pid_reuse_ancestors_picks_correct_parent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // PID 50 used twice: first as svchost.exe (T1), then as notepad.exe (T3).
+    // PID 100 (child) has ppid=50, created at T2 (between T1 and T3).
+    // Ancestor chain should pick svchost.exe (T1), not notepad.exe (T3).
+    let lines = [
+        sample_process_create_key("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 50, 0, "svchost.exe", "svchost.exe", "2026-03-13T10:00:00Z", "50:1000"),
+        sample_process_create_key("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, 50, "cmd.exe", "cmd.exe", "2026-03-13T10:01:00Z", "100:42"),
+        sample_process_create_key("cccccccc-cccc-cccc-cccc-cccccccccccc", 50, 0, "notepad.exe", "notepad.exe", "2026-03-13T10:05:00Z", "50:2000"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Ancestor chain for PID 100 should show svchost.exe as parent (created before cmd.exe)
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "100", "--ancestors"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("svchost.exe")
+                .and(predicate::str::contains("cmd.exe"))
+                .and(predicate::str::contains("notepad.exe").not()),
         );
 }

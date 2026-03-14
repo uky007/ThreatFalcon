@@ -661,6 +661,9 @@ threatfalcon tree --input events.jsonl --pid 1234
 # Show ancestor chain leading to PID 5678
 threatfalcon tree --input events.jsonl --pid 5678 --ancestors
 
+# Disambiguate PID reuse with --process-key
+threatfalcon tree --input events.jsonl --pid 1234 --process-key "1234:133579284000000000"
+
 # JSON output for programmatic use
 threatfalcon tree --input events.jsonl --pid 1234 --json
 ```
@@ -668,22 +671,24 @@ threatfalcon tree --input events.jsonl --pid 1234 --json
 Example output (descendants):
 
 ```
-=== Process Tree for PID 892 (2 descendants) ===
-svchost.exe [PID 892, PPID 600] NT AUTHORITY\SYSTEM
-├─ taskhostw.exe [PID 3120, PPID 892] DESKTOP\user
-└─ RuntimeBroker.exe [PID 4200, PPID 892] DESKTOP\user
-   └─ cmd.exe [PID 5100, PPID 4200] DESKTOP\user
+=== Process Tree for PID 892 (3 descendants) ===
+svchost.exe [PID 892, PPID 600] NT AUTHORITY\SYSTEM  [892:133579284000000000]
+├─ taskhostw.exe [PID 3120, PPID 892] DESKTOP\user  [3120:133579285000000000]
+└─ RuntimeBroker.exe [PID 4200, PPID 892] DESKTOP\user  [4200:133579286000000000]
+   └─ cmd.exe [PID 5100, PPID 4200] DESKTOP\user  [5100:133579287000000000]
 ```
 
 Example output (ancestors):
 
 ```
 === Ancestor Chain for PID 5100 (4 levels) ===
-wininit.exe [PID 600, PPID 0]
-└─ svchost.exe [PID 892, PPID 600]
-   └─ RuntimeBroker.exe [PID 4200, PPID 892]
-      └─ cmd.exe [PID 5100, PPID 4200]
+wininit.exe [PID 600, PPID 0] NT AUTHORITY\SYSTEM  [600:133579280000000000]
+└─ svchost.exe [PID 892, PPID 600] NT AUTHORITY\SYSTEM  [892:133579284000000000]
+   └─ RuntimeBroker.exe [PID 4200, PPID 892] DESKTOP\user  [4200:133579286000000000]
+      └─ cmd.exe [PID 5100, PPID 4200] DESKTOP\user  [5100:133579287000000000]
 ```
+
+When a PID appears in multiple `ProcessCreate` events (PID reuse), the tree selects the most recent instance by default. Use `--process-key` to select a specific instance. Parent-child relationships are resolved using temporal ordering: a child is assigned to the parent instance whose creation time is closest before the child's.
 
 The `--json` flag outputs a nested JSON tree structure where each node contains `pid`, `ppid`, `image_path`, `command_line`, `user`, `timestamp`, `process_key`, and `children`.
 

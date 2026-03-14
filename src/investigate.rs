@@ -150,6 +150,10 @@ pub enum Command {
         #[arg(long)]
         pid: u32,
 
+        /// Select a specific process instance by process_key (disambiguates PID reuse)
+        #[arg(long)]
+        process_key: Option<String>,
+
         /// Show ancestors (parent chain) instead of descendants
         #[arg(long)]
         ancestors: bool,
@@ -271,9 +275,10 @@ pub fn run(command: Command) -> Result<()> {
         Command::Tree {
             input,
             pid,
+            process_key,
             ancestors,
             json,
-        } => run_tree(&input, pid, ancestors, json),
+        } => run_tree(&input, pid, process_key.as_deref(), ancestors, json),
 
         Command::Tail {
             input,
@@ -1156,7 +1161,13 @@ struct ProcInfo {
     process_key: Option<String>,
 }
 
-fn run_tree(input: &Path, target_pid: u32, ancestors: bool, json: bool) -> Result<()> {
+fn run_tree(
+    input: &Path,
+    target_pid: u32,
+    target_key: Option<&str>,
+    ancestors: bool,
+    json: bool,
+) -> Result<()> {
     use std::collections::HashMap;
 
     let mut procs: Vec<ProcInfo> = Vec::new();
@@ -1189,40 +1200,53 @@ fn run_tree(input: &Path, target_pid: u32, ancestors: bool, json: bool) -> Resul
         return Ok(());
     }
 
+    // Group by PID for efficient lookup (indices are in chronological order).
+    let mut by_pid: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, p) in procs.iter().enumerate() {
+        by_pid.entry(p.pid).or_default().push(i);
+    }
+
+    // Resolve target process — by process_key if given, else latest instance.
+    let target_idx = resolve_target(&procs, &by_pid, target_pid, target_key)?;
+
     if ancestors {
         // Build ancestor chain: target → parent → grandparent → root
-        let mut by_pid: HashMap<u32, &ProcInfo> = HashMap::new();
-        for p in &procs {
-            by_pid.insert(p.pid, p);
-        }
-
-        if !by_pid.contains_key(&target_pid) {
-            return Err(anyhow::anyhow!(
-                "PID {target_pid} not found in ProcessCreate events"
-            ));
-        }
-
-        let mut chain: Vec<&ProcInfo> = Vec::new();
-        let mut current_pid = target_pid;
+        let mut chain: Vec<usize> = vec![target_idx];
         let mut visited = std::collections::HashSet::new();
-        while let Some(proc) = by_pid.get(&current_pid) {
-            if !visited.insert(current_pid) {
-                break; // cycle guard
-            }
-            chain.push(proc);
-            if proc.ppid == 0 || proc.ppid == proc.pid {
+        visited.insert(target_idx);
+        let mut current_idx = target_idx;
+        loop {
+            let current = &procs[current_idx];
+            if current.ppid == 0 || current.ppid == current.pid {
                 break;
             }
-            current_pid = proc.ppid;
+            // Find parent: the instance of ppid created most recently before this child.
+            let parent_idx = by_pid.get(&current.ppid).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .rev()
+                    .find(|&&ci| procs[ci].timestamp <= current.timestamp)
+                    .copied()
+            });
+            match parent_idx {
+                Some(pi) if visited.insert(pi) => {
+                    chain.push(pi);
+                    current_idx = pi;
+                }
+                _ => break,
+            }
         }
         chain.reverse(); // root first
 
+        let chain_refs: Vec<&ProcInfo> = chain.iter().map(|&i| &procs[i]).collect();
+
         if json {
-            let tree = build_chain_tree(&chain);
+            let tree = build_chain_tree(&chain_refs);
             println!("{}", serde_json::to_string_pretty(&tree)?);
             return Ok(());
         }
 
+        let tree = build_chain_tree(&chain_refs);
         let mut stdout = std::io::stdout().lock();
         writeln!(
             stdout,
@@ -1230,39 +1254,23 @@ fn run_tree(input: &Path, target_pid: u32, ancestors: bool, json: bool) -> Resul
             target_pid,
             chain.len()
         )?;
-        for (depth, p) in chain.iter().enumerate() {
-            let indent = "  ".repeat(depth);
-            let marker = if p.pid == target_pid { ">" } else { " " };
-            let key_str = p
-                .process_key
-                .as_deref()
-                .map(|k| format!("  [{k}]"))
-                .unwrap_or_default();
-            writeln!(
-                stdout,
-                "{marker}{indent}PID {:<6} {}  {}{key_str}",
-                p.pid,
-                p.timestamp.format("%H:%M:%S%.3fZ"),
-                short_image(&p.image_path),
-            )?;
-            if !p.command_line.is_empty() {
-                writeln!(stdout, " {indent}       cmd: {}", p.command_line)?;
-            }
-        }
+        print_tree_node(&mut stdout, &tree, "", true, true)?;
     } else {
-        // Descendant tree rooted at target_pid
-        let mut children_of: HashMap<u32, Vec<usize>> = HashMap::new();
-        let mut target_idx: Option<usize> = None;
+        // Descendant tree rooted at target.
+        // Assign each child to the correct parent instance using temporal ordering.
+        let mut children_of: HashMap<usize, Vec<usize>> = HashMap::new();
         for (i, p) in procs.iter().enumerate() {
-            children_of.entry(p.ppid).or_default().push(i);
-            if p.pid == target_pid && target_idx.is_none() {
-                target_idx = Some(i);
+            if let Some(candidates) = by_pid.get(&p.ppid) {
+                // Parent = latest instance of ppid created before this child.
+                if let Some(&parent_idx) = candidates
+                    .iter()
+                    .rev()
+                    .find(|&&ci| procs[ci].timestamp <= p.timestamp && ci != i)
+                {
+                    children_of.entry(parent_idx).or_default().push(i);
+                }
             }
         }
-
-        let target_idx = target_idx.ok_or_else(|| {
-            anyhow::anyhow!("PID {target_pid} not found in ProcessCreate events")
-        })?;
 
         let tree = build_descendant_tree(&procs, &children_of, target_idx);
 
@@ -1278,10 +1286,38 @@ fn run_tree(input: &Path, target_pid: u32, ancestors: bool, json: bool) -> Resul
             "=== Process Tree for PID {} ({} descendants) ===",
             target_pid, desc_count
         )?;
-        print_tree_node(&mut stdout, &tree, "", true)?;
+        print_tree_node(&mut stdout, &tree, "", true, true)?;
     }
 
     Ok(())
+}
+
+/// Resolve the target process index by PID and optional process_key.
+/// When multiple instances share the same PID, `target_key` disambiguates.
+/// Without it, the latest (most recent) instance is chosen.
+fn resolve_target(
+    procs: &[ProcInfo],
+    by_pid: &std::collections::HashMap<u32, Vec<usize>>,
+    target_pid: u32,
+    target_key: Option<&str>,
+) -> Result<usize> {
+    let candidates = by_pid.get(&target_pid).ok_or_else(|| {
+        anyhow::anyhow!("PID {target_pid} not found in ProcessCreate events")
+    })?;
+    if let Some(key) = target_key {
+        candidates
+            .iter()
+            .find(|&&i| procs[i].process_key.as_deref() == Some(key))
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "process_key \"{key}\" not found for PID {target_pid}"
+                )
+            })
+    } else {
+        // Latest instance (last in chronological order).
+        Ok(*candidates.last().unwrap())
+    }
 }
 
 fn proc_to_node(p: &ProcInfo) -> TreeNode {
@@ -1299,15 +1335,14 @@ fn proc_to_node(p: &ProcInfo) -> TreeNode {
 
 fn build_descendant_tree(
     procs: &[ProcInfo],
-    children_of: &std::collections::HashMap<u32, Vec<usize>>,
+    children_of: &std::collections::HashMap<usize, Vec<usize>>,
     idx: usize,
 ) -> TreeNode {
     let mut node = proc_to_node(&procs[idx]);
-    if let Some(child_indices) = children_of.get(&procs[idx].pid) {
+    if let Some(child_indices) = children_of.get(&idx) {
         for &ci in child_indices {
-            if ci != idx {
-                node.children.push(build_descendant_tree(procs, children_of, ci));
-            }
+            node.children
+                .push(build_descendant_tree(procs, children_of, ci));
         }
         node.children.sort_by_key(|c| c.timestamp);
     }
@@ -1351,8 +1386,9 @@ fn print_tree_node(
     node: &TreeNode,
     prefix: &str,
     is_last: bool,
+    is_root: bool,
 ) -> Result<()> {
-    let connector = if prefix.is_empty() {
+    let connector = if is_root {
         ""
     } else if is_last {
         "└─ "
@@ -1366,14 +1402,14 @@ fn print_tree_node(
         .unwrap_or_default();
     writeln!(
         out,
-        "{prefix}{connector}PID {:<6} {}  {} ({}){key_str}",
-        node.pid,
-        node.timestamp.format("%H:%M:%S%.3fZ"),
+        "{prefix}{connector}{} [PID {}, PPID {}] {}{key_str}",
         short_image(&node.image_path),
+        node.pid,
+        node.ppid,
         node.user,
     )?;
 
-    let child_prefix = if prefix.is_empty() {
+    let child_prefix = if is_root {
         String::new()
     } else if is_last {
         format!("{prefix}   ")
@@ -1382,7 +1418,7 @@ fn print_tree_node(
     };
     for (i, child) in node.children.iter().enumerate() {
         let last = i == node.children.len() - 1;
-        print_tree_node(out, child, &child_prefix, last)?;
+        print_tree_node(out, child, &child_prefix, last, false)?;
     }
     Ok(())
 }
