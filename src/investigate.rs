@@ -1549,18 +1549,20 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
     }
     let mut beacon_map: HashMap<String, BeaconAcc> = HashMap::new();
 
-    // Process registry keyed by process_key for stable identity.
-    // Falls back to "pid:{pid}" when no process_key is available.
-    struct ProcInfo {
+    // Collected ProcessCreate events — sorted by timestamp after the scan
+    // so that parent lookup is temporal, not file-order dependent.
+    struct ProcCreate {
+        pid: u32,
+        ppid: u32,
         image_path: String,
+        command_line: String,
+        process_key: Option<String>,
+        timestamp: DateTime<Utc>,
     }
-    let mut procs: HashMap<String, ProcInfo> = HashMap::new();
+    let mut proc_creates: Vec<ProcCreate> = Vec::new();
 
-    // Reverse map: find the most recent process_key for a given PID.
-    // Updated on each ProcessCreate so parent lookup resolves to the
-    // temporally-correct instance (the one alive when the child was created).
-    let mut pid_to_key: HashMap<u32, String> = HashMap::new();
-
+    // Single pass: collect ProcessCreate events and handle streaming rules
+    // (unsigned-dll, beaconing, lolbin) that don't depend on parent lookup.
     for_each_event(input, |event| {
         total += 1;
         let ts = event.timestamp;
@@ -1579,48 +1581,18 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                 command_line,
                 ..
             } => {
-                let child_name = basename(image_path);
-                let child_key = event_key.clone().unwrap_or_else(|| format!("pid:{pid}"));
-
-                // Look up parent by its process_key (via pid_to_key for the
-                // most recent instance of the PPID).
-                let parent_key = pid_to_key.get(ppid);
-                let parent_name = parent_key
-                    .and_then(|k| procs.get(k))
-                    .map(|p| basename(&p.image_path))
-                    .unwrap_or_default();
-
-                // Register this process instance.
-                pid_to_key.insert(*pid, child_key.clone());
-                procs.insert(child_key.clone(), ProcInfo {
+                proc_creates.push(ProcCreate {
+                    pid: *pid,
+                    ppid: *ppid,
                     image_path: image_path.clone(),
+                    command_line: command_line.clone(),
+                    process_key: event_key.clone(),
+                    timestamp: ts,
                 });
 
-                // Rule: suspicious-parent
-                if run_rule("suspicious-parent") {
-                    let parent_lower = parent_name.to_ascii_lowercase();
-                    let child_lower = child_name.to_ascii_lowercase();
-                    if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
-                        && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
-                    {
-                        findings.push(HuntFinding {
-                            rule: "suspicious-parent".into(),
-                            severity: "High".into(),
-                            mitre: "T1204.002".into(),
-                            process: image_path.clone(),
-                            pid: *pid,
-                            process_key: event_key.clone(),
-                            detail: format!(
-                                "{} spawned {} ({})",
-                                parent_name, child_name, command_line
-                            ),
-                            timestamp: ts.to_rfc3339(),
-                        });
-                    }
-                }
-
-                // Rule: lolbin
+                // Rule: lolbin (no parent dependency)
                 if run_rule("lolbin") {
+                    let child_name = basename(image_path);
                     let child_lower = child_name.to_ascii_lowercase();
                     if LOLBINS.iter().any(|l| child_lower == *l) {
                         findings.push(HuntFinding {
@@ -1648,18 +1620,12 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                 ..
             } => {
                 // Rule: unsigned-dll
-                // Use the event's own process_context for process identity.
+                // Uses the event's own process_context — no parent dependency.
                 if run_rule("unsigned-dll") && !signed {
                     let proc_image = event
                         .process_context
                         .as_ref()
                         .and_then(|c| c.image_path.clone())
-                        .or_else(|| {
-                            event_key
-                                .as_ref()
-                                .and_then(|k| procs.get(k))
-                                .map(|p| p.image_path.clone())
-                        })
                         .unwrap_or_else(|| format!("PID {pid}"));
                     findings.push(HuntFinding {
                         rule: "unsigned-dll".into(),
@@ -1702,6 +1668,58 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
 
         true
     })?;
+
+    // Post-processing: suspicious-parent rule.
+    // Sort ProcessCreate events by timestamp so parent lookup is temporal,
+    // regardless of file order.
+    if run_rule("suspicious-parent") {
+        proc_creates.sort_by_key(|p| p.timestamp);
+
+        struct ProcInfo {
+            image_path: String,
+        }
+        let mut procs: HashMap<String, ProcInfo> = HashMap::new();
+        let mut pid_to_key: HashMap<u32, String> = HashMap::new();
+
+        for pc in &proc_creates {
+            let child_key = pc
+                .process_key
+                .clone()
+                .unwrap_or_else(|| format!("pid:{}", pc.pid));
+
+            let parent_name = pid_to_key
+                .get(&pc.ppid)
+                .and_then(|k| procs.get(k))
+                .map(|p| basename(&p.image_path))
+                .unwrap_or_default();
+
+            pid_to_key.insert(pc.pid, child_key.clone());
+            procs.insert(child_key, ProcInfo {
+                image_path: pc.image_path.clone(),
+            });
+
+            let child_name = basename(&pc.image_path);
+            let parent_lower = parent_name.to_ascii_lowercase();
+            let child_lower = child_name.to_ascii_lowercase();
+            if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
+                && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+            {
+                findings.push(HuntFinding {
+                    rule: "suspicious-parent".into(),
+                    severity: "High".into(),
+                    mitre: "T1204.002".into(),
+                    process: pc.image_path.clone(),
+                    pid: pc.pid,
+                    process_key: pc.process_key.clone(),
+                    detail: format!(
+                        "{} spawned {} ({})",
+                        parent_name, child_name, pc.command_line
+                    ),
+                    timestamp: pc.timestamp.to_rfc3339(),
+                });
+            }
+        }
+    }
 
     // Post-processing: beaconing detection
     // Flag connections to the same IP from the same process ≥ threshold

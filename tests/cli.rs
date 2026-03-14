@@ -2336,3 +2336,44 @@ fn hunt_pid_reuse_beaconing_separate_instances() {
         "should not merge traffic across PID reuse — each instance has only 6 connections (below 10 threshold)"
     );
 }
+
+#[test]
+fn hunt_suspicious_parent_out_of_order_events() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Child (cmd.exe) appears BEFORE its parent (winword.exe) in the file,
+    // but timestamps show the parent was created first. The rule must use
+    // temporal ordering, not file ordering.
+    let lines = [
+        sample_process_create_key(
+            "90000000-0000-0000-0000-000000000002", 200, 100,
+            "C:/Windows/System32/cmd.exe", "cmd.exe /c whoami",
+            "2026-03-13T10:00:01Z", "200:2000",
+        ),
+        sample_process_create_key(
+            "90000000-0000-0000-0000-000000000001", 100, 1,
+            "C:/Program Files/Microsoft Office/winword.exe", "winword.exe doc.docx",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "suspicious-parent", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert_eq!(
+        findings.len(), 1,
+        "should detect suspicious-parent even when events are out of file order"
+    );
+    assert!(
+        findings[0]["detail"].as_str().unwrap().contains("winword.exe"),
+        "should correctly identify winword.exe as the parent"
+    );
+}
