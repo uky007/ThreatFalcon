@@ -140,6 +140,25 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show process tree (parent-child relationships) from ProcessCreate events
+    Tree {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Root process ID to display the tree for
+        #[arg(long)]
+        pid: u32,
+
+        /// Show ancestors (parent chain) instead of descendants
+        #[arg(long)]
+        ancestors: bool,
+
+        /// Output as structured JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Follow new events appended to a JSONL file (like tail -f)
     Tail {
         /// Path to JSONL event file
@@ -248,6 +267,13 @@ pub fn run(command: Command) -> Result<()> {
         } => run_index(&input, rebuild, status),
 
         Command::Stats { input, json } => run_stats(&input, json),
+
+        Command::Tree {
+            input,
+            pid,
+            ancestors,
+            json,
+        } => run_tree(&input, pid, ancestors, json),
 
         Command::Tail {
             input,
@@ -1098,6 +1124,271 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tree
+// ---------------------------------------------------------------------------
+
+/// A node in the process tree (for JSON output and tree construction).
+#[derive(Serialize, Clone)]
+struct TreeNode {
+    pid: u32,
+    ppid: u32,
+    image_path: String,
+    command_line: String,
+    user: String,
+    timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_key: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<TreeNode>,
+}
+
+/// Intermediate storage for ProcessCreate data.
+struct ProcInfo {
+    pid: u32,
+    ppid: u32,
+    image_path: String,
+    command_line: String,
+    user: String,
+    timestamp: DateTime<Utc>,
+    process_key: Option<String>,
+}
+
+fn run_tree(input: &Path, target_pid: u32, ancestors: bool, json: bool) -> Result<()> {
+    use std::collections::HashMap;
+
+    let mut procs: Vec<ProcInfo> = Vec::new();
+
+    for_each_event(input, |event| {
+        if let EventData::ProcessCreate {
+            pid,
+            ppid,
+            ref image_path,
+            ref command_line,
+            ref user,
+            ..
+        } = event.data
+        {
+            procs.push(ProcInfo {
+                pid,
+                ppid,
+                image_path: image_path.clone(),
+                command_line: command_line.clone(),
+                user: user.clone(),
+                timestamp: event.timestamp,
+                process_key: event.process_context.as_ref().map(|c| c.process_key.clone()),
+            });
+        }
+        true
+    })?;
+
+    if procs.is_empty() {
+        eprintln!("No ProcessCreate events found.");
+        return Ok(());
+    }
+
+    if ancestors {
+        // Build ancestor chain: target → parent → grandparent → root
+        let mut by_pid: HashMap<u32, &ProcInfo> = HashMap::new();
+        for p in &procs {
+            by_pid.insert(p.pid, p);
+        }
+
+        if !by_pid.contains_key(&target_pid) {
+            return Err(anyhow::anyhow!(
+                "PID {target_pid} not found in ProcessCreate events"
+            ));
+        }
+
+        let mut chain: Vec<&ProcInfo> = Vec::new();
+        let mut current_pid = target_pid;
+        let mut visited = std::collections::HashSet::new();
+        while let Some(proc) = by_pid.get(&current_pid) {
+            if !visited.insert(current_pid) {
+                break; // cycle guard
+            }
+            chain.push(proc);
+            if proc.ppid == 0 || proc.ppid == proc.pid {
+                break;
+            }
+            current_pid = proc.ppid;
+        }
+        chain.reverse(); // root first
+
+        if json {
+            let tree = build_chain_tree(&chain);
+            println!("{}", serde_json::to_string_pretty(&tree)?);
+            return Ok(());
+        }
+
+        let mut stdout = std::io::stdout().lock();
+        writeln!(
+            stdout,
+            "=== Ancestor Chain for PID {} ({} levels) ===",
+            target_pid,
+            chain.len()
+        )?;
+        for (depth, p) in chain.iter().enumerate() {
+            let indent = "  ".repeat(depth);
+            let marker = if p.pid == target_pid { ">" } else { " " };
+            let key_str = p
+                .process_key
+                .as_deref()
+                .map(|k| format!("  [{k}]"))
+                .unwrap_or_default();
+            writeln!(
+                stdout,
+                "{marker}{indent}PID {:<6} {}  {}{key_str}",
+                p.pid,
+                p.timestamp.format("%H:%M:%S%.3fZ"),
+                short_image(&p.image_path),
+            )?;
+            if !p.command_line.is_empty() {
+                writeln!(stdout, " {indent}       cmd: {}", p.command_line)?;
+            }
+        }
+    } else {
+        // Descendant tree rooted at target_pid
+        let mut children_of: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut target_idx: Option<usize> = None;
+        for (i, p) in procs.iter().enumerate() {
+            children_of.entry(p.ppid).or_default().push(i);
+            if p.pid == target_pid && target_idx.is_none() {
+                target_idx = Some(i);
+            }
+        }
+
+        let target_idx = target_idx.ok_or_else(|| {
+            anyhow::anyhow!("PID {target_pid} not found in ProcessCreate events")
+        })?;
+
+        let tree = build_descendant_tree(&procs, &children_of, target_idx);
+
+        if json {
+            println!("{}", serde_json::to_string_pretty(&tree)?);
+            return Ok(());
+        }
+
+        let mut stdout = std::io::stdout().lock();
+        let desc_count = count_descendants(&tree);
+        writeln!(
+            stdout,
+            "=== Process Tree for PID {} ({} descendants) ===",
+            target_pid, desc_count
+        )?;
+        print_tree_node(&mut stdout, &tree, "", true)?;
+    }
+
+    Ok(())
+}
+
+fn proc_to_node(p: &ProcInfo) -> TreeNode {
+    TreeNode {
+        pid: p.pid,
+        ppid: p.ppid,
+        image_path: p.image_path.clone(),
+        command_line: p.command_line.clone(),
+        user: p.user.clone(),
+        timestamp: p.timestamp,
+        process_key: p.process_key.clone(),
+        children: Vec::new(),
+    }
+}
+
+fn build_descendant_tree(
+    procs: &[ProcInfo],
+    children_of: &std::collections::HashMap<u32, Vec<usize>>,
+    idx: usize,
+) -> TreeNode {
+    let mut node = proc_to_node(&procs[idx]);
+    if let Some(child_indices) = children_of.get(&procs[idx].pid) {
+        for &ci in child_indices {
+            if ci != idx {
+                node.children.push(build_descendant_tree(procs, children_of, ci));
+            }
+        }
+        node.children.sort_by_key(|c| c.timestamp);
+    }
+    node
+}
+
+fn build_chain_tree(chain: &[&ProcInfo]) -> TreeNode {
+    if chain.is_empty() {
+        // Should not happen — caller checks. Return a placeholder.
+        return TreeNode {
+            pid: 0,
+            ppid: 0,
+            image_path: String::new(),
+            command_line: String::new(),
+            user: String::new(),
+            timestamp: Utc::now(),
+            process_key: None,
+            children: Vec::new(),
+        };
+    }
+    let mut node = proc_to_node(chain[0]);
+    let mut current = &mut node;
+    for p in &chain[1..] {
+        let child = proc_to_node(p);
+        current.children.push(child);
+        current = current.children.last_mut().unwrap();
+    }
+    node
+}
+
+fn count_descendants(node: &TreeNode) -> usize {
+    let mut count = 0;
+    for child in &node.children {
+        count += 1 + count_descendants(child);
+    }
+    count
+}
+
+fn print_tree_node(
+    out: &mut impl Write,
+    node: &TreeNode,
+    prefix: &str,
+    is_last: bool,
+) -> Result<()> {
+    let connector = if prefix.is_empty() {
+        ""
+    } else if is_last {
+        "└─ "
+    } else {
+        "├─ "
+    };
+    let key_str = node
+        .process_key
+        .as_deref()
+        .map(|k| format!("  [{k}]"))
+        .unwrap_or_default();
+    writeln!(
+        out,
+        "{prefix}{connector}PID {:<6} {}  {} ({}){key_str}",
+        node.pid,
+        node.timestamp.format("%H:%M:%S%.3fZ"),
+        short_image(&node.image_path),
+        node.user,
+    )?;
+
+    let child_prefix = if prefix.is_empty() {
+        String::new()
+    } else if is_last {
+        format!("{prefix}   ")
+    } else {
+        format!("{prefix}│  ")
+    };
+    for (i, child) in node.children.iter().enumerate() {
+        let last = i == node.children.len() - 1;
+        print_tree_node(out, child, &child_prefix, last)?;
+    }
+    Ok(())
+}
+
+fn short_image(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
 // ---------------------------------------------------------------------------

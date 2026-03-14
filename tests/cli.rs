@@ -1334,3 +1334,138 @@ fn tail_survives_file_rotation() {
         "tail should pick up events from the new file after rotation, got: {stdout}"
     );
 }
+
+// ---- Tree subcommand tests --------------------------------------------------
+
+fn sample_process_create(id: &str, pid: u32, ppid: u32, image: &str, cmdline: &str, timestamp: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"Process","severity":"Info","data":{{"type":"ProcessCreate","pid":{pid},"ppid":{ppid},"image_path":"{image}","command_line":"{cmdline}","user":"TEST\\\\user","integrity_level":"Medium","hashes":null}},"process_context":{{"process_key":"{pid}:42"}}}}"#
+    )
+}
+
+#[test]
+fn tree_help() {
+    cmd().args(["tree", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--pid"))
+            .and(predicate::str::contains("--ancestors"))
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_tree_subcommand() {
+    cmd().arg("--help").assert().success().stdout(
+        predicate::str::contains("tree"),
+    );
+}
+
+#[test]
+fn tree_shows_descendants() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // explorer (PID 1) → cmd (PID 100) → powershell (PID 200)
+    let lines = [
+        sample_process_create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1, 0, "C:/Windows/explorer.exe", "explorer.exe", "2026-03-13T10:00:00Z"),
+        sample_process_create("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, 1, "C:/Windows/System32/cmd.exe", "cmd.exe /c whoami", "2026-03-13T10:01:00Z"),
+        sample_process_create("cccccccc-cccc-cccc-cccc-cccccccccccc", 200, 100, "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "powershell.exe -ep bypass", "2026-03-13T10:02:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "1"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Process Tree for PID 1")
+                .and(predicate::str::contains("2 descendants"))
+                .and(predicate::str::contains("explorer.exe"))
+                .and(predicate::str::contains("cmd.exe"))
+                .and(predicate::str::contains("powershell.exe")),
+        );
+}
+
+#[test]
+fn tree_shows_ancestors() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1, 0, "C:/Windows/explorer.exe", "explorer.exe", "2026-03-13T10:00:00Z"),
+        sample_process_create("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, 1, "C:/Windows/System32/cmd.exe", "cmd.exe /c whoami", "2026-03-13T10:01:00Z"),
+        sample_process_create("cccccccc-cccc-cccc-cccc-cccccccccccc", 200, 100, "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "powershell.exe -ep bypass", "2026-03-13T10:02:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "200", "--ancestors"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Ancestor Chain for PID 200")
+                .and(predicate::str::contains("3 levels"))
+                .and(predicate::str::contains("explorer.exe"))
+                .and(predicate::str::contains("cmd.exe"))
+                .and(predicate::str::contains("powershell.exe")),
+        );
+}
+
+#[test]
+fn tree_json_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1, 0, "C:/Windows/explorer.exe", "explorer.exe", "2026-03-13T10:00:00Z"),
+        sample_process_create("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, 1, "C:/Windows/System32/cmd.exe", "cmd.exe", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "1", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("tree --json should output valid JSON");
+    assert_eq!(json["pid"], 1);
+    assert_eq!(json["children"][0]["pid"], 100);
+}
+
+#[test]
+fn tree_pid_not_found() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let event = sample_process_create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1, 0, "explorer.exe", "explorer.exe", "2026-03-13T10:00:00Z");
+    fs::write(&path, &event).unwrap();
+
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "999"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn tree_leaf_process_has_no_descendants() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 1, 0, "explorer.exe", "explorer.exe", "2026-03-13T10:00:00Z"),
+        sample_process_create("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 100, 1, "cmd.exe", "cmd.exe", "2026-03-13T10:01:00Z"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    cmd()
+        .args(["tree", "--input", path.to_str().unwrap(), "--pid", "100"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("0 descendants")
+                .and(predicate::str::contains("cmd.exe")),
+        );
+}
