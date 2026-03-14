@@ -1208,7 +1208,19 @@ fn is_public_ip(addr: &str) -> bool {
                 && !v4.is_unspecified()
                 && !v4.is_documentation()
         }
-        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let is_unique_local = (seg[0] & 0xfe00) == 0xfc00; // fc00::/7
+            let is_link_local = (seg[0] & 0xffc0) == 0xfe80; // fe80::/10
+            let is_multicast = (seg[0] & 0xff00) == 0xff00; // ff00::/8
+            let is_documentation = seg[0] == 0x2001 && seg[1] == 0x0db8; // 2001:db8::/32
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !is_unique_local
+                && !is_link_local
+                && !is_multicast
+                && !is_documentation
+        }
     }
 }
 

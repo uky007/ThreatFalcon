@@ -1772,6 +1772,14 @@ fn ioc_extracts_ips_and_domains() {
         sample_network_event("a1a1a1a1-0000-0000-0000-000000000003", "8.8.8.8", 53, "C:/Windows/svchost.exe", "2026-03-13T10:02:00Z"),
         // Private IP — should be excluded
         sample_network_event("a1a1a1a1-0000-0000-0000-000000000004", "192.168.1.1", 80, "C:/test.exe", "2026-03-13T10:03:00Z"),
+        // IPv6 non-public — should all be excluded
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000005", "fc00::1", 443, "C:/test.exe", "2026-03-13T10:03:01Z"),       // unique-local
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000006", "fe80::1", 443, "C:/test.exe", "2026-03-13T10:03:02Z"),       // link-local
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000007", "ff02::1", 443, "C:/test.exe", "2026-03-13T10:03:03Z"),       // multicast
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000008", "2001:db8::1", 443, "C:/test.exe", "2026-03-13T10:03:04Z"),   // documentation
+        sample_network_event("a1a1a1a1-0000-0000-0000-000000000009", "::1", 443, "C:/test.exe", "2026-03-13T10:03:05Z"),           // loopback
+        // IPv6 public — should be included
+        sample_network_event("a1a1a1a1-0000-0000-0000-00000000000a", "2607:f8b0:4004:800::200e", 443, "C:/chrome.exe", "2026-03-13T10:03:06Z"),
         sample_dns_event("b1b1b1b1-0000-0000-0000-000000000001", "evil.example.com", Some("93.184.216.34"), "2026-03-13T10:04:00Z"),
         sample_dns_event("b1b1b1b1-0000-0000-0000-000000000002", "evil.example.com", None, "2026-03-13T10:05:00Z"),
         sample_dns_event("b1b1b1b1-0000-0000-0000-000000000003", "good.example.org", None, "2026-03-13T10:06:00Z"),
@@ -1790,6 +1798,14 @@ fn ioc_extracts_ips_and_domains() {
     assert!(stdout.contains("93.184.216.34"), "should contain public IP");
     assert!(stdout.contains("8.8.8.8"), "should contain DNS IP");
     assert!(!stdout.contains("192.168.1.1"), "should exclude private IP");
+    // IPv6 non-public should be excluded
+    assert!(!stdout.contains("fc00::1"), "should exclude unique-local IPv6");
+    assert!(!stdout.contains("fe80::1"), "should exclude link-local IPv6");
+    assert!(!stdout.contains("ff02::1"), "should exclude multicast IPv6");
+    assert!(!stdout.contains("2001:db8::1"), "should exclude documentation IPv6");
+    assert!(!stdout.contains("::1"), "should exclude loopback IPv6");
+    // IPv6 public should appear
+    assert!(stdout.contains("2607:f8b0:4004:800::200e"), "should contain public IPv6");
 
     // Domains
     assert!(stdout.contains("evil.example.com"), "should contain queried domain");
