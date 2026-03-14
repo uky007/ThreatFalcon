@@ -20,7 +20,7 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`, `hunt`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`, `hunt`, `score`) reads JSONL output directly
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -163,6 +163,7 @@ Commands:
   inspect  Inspect a PE file: headers, sections, imports, and exports
   ioc      Extract indicators of compromise (IPs, domains, hashes)
   hunt     Run threat hunting rules against events
+  score    Score processes by threat signals (detections, network, LOLBins, etc.)
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -864,6 +865,52 @@ Available hunting rules:
 | `beaconing` | Medium | T1071.001 | Repeated connections to the same external IP (threshold: 10+) |
 
 Results are sorted by severity (descending), then by timestamp. Use `--limit` to control the maximum number of findings (default: 50).
+
+### Score
+
+Rank processes by aggregated threat signals to prioritize investigation:
+
+```bash
+# Score all processes
+threatfalcon score --input events.jsonl
+
+# JSON output with full breakdown
+threatfalcon score --input events.jsonl --json
+
+# Show only top 5
+threatfalcon score --input events.jsonl --limit 5
+```
+
+Example output:
+
+```
+=== Process Threat Scores (4821 events scanned) ===
+
+[Score:   62]  PID    4521  C:\Users\user\malware.exe
+              key: 4521:133579284000000000
+              1x detection (+40), LOLBin (+20), 1 external IP(s) (+2)
+
+[Score:   27]  PID    5102  C:\Windows\System32\cmd.exe
+              key: 5102:133579285000000000
+              suspicious parent (+20), 3 external IP(s) (+6), 1 DNS query(s) (+1)
+
+[Score:   10]  PID    3200  C:\app\helper.exe
+              key: 3200:133579282000000000
+              2x unsigned DLL (+10)
+```
+
+Scoring weights:
+
+| Signal | Points | Source |
+|--------|--------|--------|
+| Evasion detection (with rule) | +40 per detection | `EvasionDetected` events with `RuleMetadata` |
+| Suspicious parent-child | +20 | Office/PDF app spawning shell (same as `hunt`) |
+| LOLBin execution | +20 | Living-off-the-land binary (same as `hunt`) |
+| Unsigned DLL load | +5 per DLL | `ImageLoad` with `signed: false` |
+| External IP connection | +2 per unique IP | `NetworkConnect` to public IPs |
+| DNS query | +1 per unique domain | `DnsQuery` events |
+
+Processes with a score of 0 are excluded. Use `--limit` to control the number of results (default: 20).
 
 ## Evasion Detection Rules
 
