@@ -1977,6 +1977,18 @@ fn sample_image_load(id: &str, pid: u32, image_path: &str, image_name: &str, sig
     )
 }
 
+fn sample_image_load_with_context(id: &str, pid: u32, image_path: &str, image_name: &str, signed: bool, timestamp: &str, process_key: &str, proc_image: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"ImageLoad","severity":"Info","data":{{"type":"ImageLoad","pid":{pid},"image_path":"{image_path}","image_name":"{image_name}","signed":{signed},"signature":null,"hashes":null}},"process_context":{{"process_key":"{process_key}","image_path":"{proc_image}"}}}}"#
+    )
+}
+
+fn sample_network_event_with_context(id: &str, dst_addr: &str, dst_port: u16, image: &str, timestamp: &str, pid: u32, process_key: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Network"}}}},"category":"Network","severity":"Info","data":{{"type":"NetworkConnect","pid":{pid},"image_path":"{image}","protocol":"TCP","src_addr":"10.0.0.1","src_port":12345,"dst_addr":"{dst_addr}","dst_port":{dst_port},"direction":"Outbound"}},"process_context":{{"process_key":"{process_key}"}}}}"#
+    )
+}
+
 #[test]
 fn hunt_help() {
     cmd().args(["hunt", "--help"]).assert().success().stdout(
@@ -2214,4 +2226,113 @@ fn hunt_no_false_positives_normal_process() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["findings"].as_array().unwrap().len(), 0, "normal processes should not trigger suspicious-parent");
+}
+
+#[test]
+fn hunt_pid_reuse_suspicious_parent_correct_attribution() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // PID 100 is first used by svchost.exe (benign), then reused by winword.exe.
+    // PID 200 (cmd.exe) is spawned by PID 100 *after* the reuse.
+    // Without process_key, the parent lookup for PID 200 could resolve to
+    // the stale svchost.exe entry and miss the suspicious-parent detection.
+    let lines = [
+        // First instance of PID 100: svchost (benign)
+        sample_process_create_key("80000000-0000-0000-0000-000000000001", 100, 1, "C:/Windows/System32/svchost.exe", "svchost.exe -k netsvcs", "2026-03-13T10:00:00Z", "100:1000"),
+        // PID 100 reused by winword.exe
+        sample_process_create_key("80000000-0000-0000-0000-000000000002", 100, 1, "C:/Program Files/Microsoft Office/winword.exe", "winword.exe doc.docx", "2026-03-13T11:00:00Z", "100:2000"),
+        // cmd.exe spawned from PID 100 (winword instance)
+        sample_process_create_key("80000000-0000-0000-0000-000000000003", 200, 100, "C:/Windows/System32/cmd.exe", "cmd.exe /c whoami", "2026-03-13T11:00:01Z", "200:3000"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "suspicious-parent", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "should detect winword→cmd suspicious-parent");
+    assert!(findings[0]["detail"].as_str().unwrap().contains("winword.exe"), "should attribute to winword.exe, not svchost.exe");
+}
+
+#[test]
+fn hunt_pid_reuse_unsigned_dll_correct_process() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // PID 300 is first used by notepad.exe, then reused by malware.exe.
+    // An unsigned DLL is loaded by the malware instance — the finding
+    // should reference malware.exe, not notepad.exe.
+    let lines = [
+        sample_process_create_key("81000000-0000-0000-0000-000000000001", 300, 1, "C:/Windows/notepad.exe", "notepad.exe", "2026-03-13T10:00:00Z", "300:1000"),
+        sample_process_create_key("81000000-0000-0000-0000-000000000002", 300, 1, "C:/malware/evil.exe", "evil.exe", "2026-03-13T11:00:00Z", "300:2000"),
+        sample_image_load_with_context("81000000-0000-0000-0000-000000000003", 300, "C:/malware/payload.dll", "payload.dll", false, "2026-03-13T11:00:01Z", "300:2000", "C:/malware/evil.exe"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "unsigned-dll", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(
+        findings[0]["process"].as_str().unwrap().contains("evil.exe"),
+        "should attribute to evil.exe via process_context, not notepad.exe. Got: {}",
+        findings[0]["process"]
+    );
+    assert_eq!(findings[0]["process_key"].as_str().unwrap(), "300:2000");
+}
+
+#[test]
+fn hunt_pid_reuse_beaconing_separate_instances() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // PID 400 is used by two different processes, each connecting to the same IP.
+    // First instance: 6 connections (below threshold).
+    // Second instance: 6 connections (below threshold).
+    // Without process_key separation, these would merge into 12 (above threshold)
+    // and incorrectly flag as beaconing.
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..6 {
+        lines.push(sample_network_event_with_context(
+            &format!("82000000-0000-0000-0000-{:012}", i),
+            "185.100.87.174", 443, "C:/app1.exe",
+            &format!("2026-03-13T10:{:02}:00Z", i),
+            400, "400:1000",
+        ));
+    }
+    for i in 0..6 {
+        lines.push(sample_network_event_with_context(
+            &format!("82000000-0000-0000-0001-{:012}", i),
+            "185.100.87.174", 443, "C:/app2.exe",
+            &format!("2026-03-13T11:{:02}:00Z", i),
+            400, "400:2000",
+        ));
+    }
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["hunt", "--input", path.to_str().unwrap(), "--rule", "beaconing", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert_eq!(
+        findings.len(), 0,
+        "should not merge traffic across PID reuse — each instance has only 6 connections (below 10 threshold)"
+    );
 }

@@ -1517,6 +1517,8 @@ struct HuntFinding {
     mitre: String,
     process: String,
     pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_key: Option<String>,
     detail: String,
     timestamp: String,
 }
@@ -1538,23 +1540,36 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
     let mut total: u64 = 0;
     let mut findings: Vec<HuntFinding> = Vec::new();
 
-    // For beaconing detection: track (dst, process) → timestamps
+    // For beaconing detection: track (dst, process_key) → timestamps
     struct BeaconAcc {
         image: String,
         pid: u32,
+        process_key: Option<String>,
         timestamps: Vec<DateTime<Utc>>,
     }
     let mut beacon_map: HashMap<String, BeaconAcc> = HashMap::new();
 
-    // First pass: collect process creates (for parent lookup) and all events
+    // Process registry keyed by process_key for stable identity.
+    // Falls back to "pid:{pid}" when no process_key is available.
     struct ProcInfo {
         image_path: String,
     }
-    let mut procs: HashMap<u32, ProcInfo> = HashMap::new();
+    let mut procs: HashMap<String, ProcInfo> = HashMap::new();
+
+    // Reverse map: find the most recent process_key for a given PID.
+    // Updated on each ProcessCreate so parent lookup resolves to the
+    // temporally-correct instance (the one alive when the child was created).
+    let mut pid_to_key: HashMap<u32, String> = HashMap::new();
 
     for_each_event(input, |event| {
         total += 1;
         let ts = event.timestamp;
+
+        // Extract process_key from event's process_context if available.
+        let event_key = event
+            .process_context
+            .as_ref()
+            .map(|c| c.process_key.clone());
 
         match &event.data {
             EventData::ProcessCreate {
@@ -1565,12 +1580,19 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                 ..
             } => {
                 let child_name = basename(image_path);
-                let parent_name = procs
-                    .get(ppid)
+                let child_key = event_key.clone().unwrap_or_else(|| format!("pid:{pid}"));
+
+                // Look up parent by its process_key (via pid_to_key for the
+                // most recent instance of the PPID).
+                let parent_key = pid_to_key.get(ppid);
+                let parent_name = parent_key
+                    .and_then(|k| procs.get(k))
                     .map(|p| basename(&p.image_path))
                     .unwrap_or_default();
 
-                procs.insert(*pid, ProcInfo {
+                // Register this process instance.
+                pid_to_key.insert(*pid, child_key.clone());
+                procs.insert(child_key.clone(), ProcInfo {
                     image_path: image_path.clone(),
                 });
 
@@ -1587,6 +1609,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                             mitre: "T1204.002".into(),
                             process: image_path.clone(),
                             pid: *pid,
+                            process_key: event_key.clone(),
                             detail: format!(
                                 "{} spawned {} ({})",
                                 parent_name, child_name, command_line
@@ -1606,6 +1629,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                             mitre: "T1218".into(),
                             process: image_path.clone(),
                             pid: *pid,
+                            process_key: event_key.clone(),
                             detail: format!(
                                 "LOLBin execution: {} ({})",
                                 child_name, command_line
@@ -1624,16 +1648,26 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                 ..
             } => {
                 // Rule: unsigned-dll
+                // Use the event's own process_context for process identity.
                 if run_rule("unsigned-dll") && !signed {
+                    let proc_image = event
+                        .process_context
+                        .as_ref()
+                        .and_then(|c| c.image_path.clone())
+                        .or_else(|| {
+                            event_key
+                                .as_ref()
+                                .and_then(|k| procs.get(k))
+                                .map(|p| p.image_path.clone())
+                        })
+                        .unwrap_or_else(|| format!("PID {pid}"));
                     findings.push(HuntFinding {
                         rule: "unsigned-dll".into(),
                         severity: "Low".into(),
                         mitre: "T1574.001".into(),
-                        process: procs
-                            .get(pid)
-                            .map(|p| p.image_path.clone())
-                            .unwrap_or_else(|| format!("PID {pid}")),
+                        process: proc_image,
                         pid: *pid,
+                        process_key: event_key.clone(),
                         detail: format!("Unsigned DLL loaded: {} ({})", image_name, image_path),
                         timestamp: ts.to_rfc3339(),
                     });
@@ -1646,12 +1680,17 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                 image_path,
                 ..
             } => {
-                // Rule: beaconing — accumulate for post-processing
+                // Rule: beaconing — accumulate for post-processing.
+                // Key by process_key to avoid merging traffic across PID reuse.
                 if run_rule("beaconing") && is_public_ip(dst_addr) {
-                    let key = format!("{dst_addr}|{pid}");
+                    let pkey = event_key
+                        .clone()
+                        .unwrap_or_else(|| format!("pid:{pid}"));
+                    let key = format!("{dst_addr}|{pkey}");
                     let acc = beacon_map.entry(key).or_insert_with(|| BeaconAcc {
                         image: image_path.clone(),
                         pid: *pid,
+                        process_key: event_key.clone(),
                         timestamps: Vec::new(),
                     });
                     acc.timestamps.push(ts);
@@ -1683,6 +1722,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                     mitre: "T1071.001".into(),
                     process: acc.image.clone(),
                     pid: acc.pid,
+                    process_key: acc.process_key.clone(),
                     detail: format!(
                         "{} connections to {} from {}",
                         acc.timestamps.len(),
