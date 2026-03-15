@@ -2907,17 +2907,18 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
     let mut seen: HashMap<String, Instant> = HashMap::new();
 
     // Parent tracking for suspicious-parent rule (streaming).
-    // Maps pid → (process_key, image_path) for the most recent ProcessCreate.
-    let mut pid_to_proc: HashMap<u32, (String, String)> = HashMap::new();
+    // Maps pid → (process_key, image_path, event_timestamp).
+    let mut pid_to_proc: HashMap<u32, (String, String, DateTime<Utc>)> = HashMap::new();
 
     // Pending children whose parent hasn't been seen yet.
-    // Maps ppid → Vec<(child_key, child_name, child_image, command_line, timestamp)>
+    // Maps ppid → Vec<PendingChild>
     struct PendingChild {
         key: String,
         child_name: String,
         image_path: String,
         command_line: String,
         pid: u32,
+        event_ts: DateTime<Utc>,
         timestamp: String,
     }
     let mut pending_children: HashMap<u32, Vec<PendingChild>> = HashMap::new();
@@ -3010,9 +3011,10 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         }
 
                         // Suspicious-parent: forward check (parent already seen)
-                        if let Some((_, parent_image)) = pid_to_proc.get(ppid) {
+                        if let Some((_, parent_image, parent_ts)) = pid_to_proc.get(ppid) {
                             let parent_lower = basename(parent_image).to_ascii_lowercase();
-                            if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
+                            if *parent_ts <= event.timestamp
+                                && SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
                                 && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
                             {
                                 acc.breakdown.suspicious_parent = true;
@@ -3050,13 +3052,14 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                                         image_path: image_path.clone(),
                                         command_line: command_line.clone(),
                                         pid: *pid,
+                                        event_ts: event.timestamp,
                                         timestamp: event.timestamp.to_rfc3339(),
                                     });
                             }
                         }
 
                         // Update parent tracking
-                        pid_to_proc.insert(*pid, (key.clone(), image_path.clone()));
+                        pid_to_proc.insert(*pid, (key.clone(), image_path.clone(), event.timestamp));
 
                         // Retroactive check: if this process is a suspicious
                         // parent, check any pending children that were waiting.
@@ -3064,6 +3067,11 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         if SUSPICIOUS_PARENTS.iter().any(|p| self_lower == *p) {
                             if let Some(children) = pending_children.remove(pid) {
                                 for pc in children {
+                                    // Guard: parent must have been created
+                                    // before the child (timestamp order).
+                                    if event.timestamp > pc.event_ts {
+                                        continue;
+                                    }
                                     if let Some(child_acc) = acc_map.get_mut(&pc.key) {
                                         child_acc.breakdown.suspicious_parent = true;
                                     }
