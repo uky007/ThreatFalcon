@@ -2888,18 +2888,32 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
 
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
 
-    let file = std::fs::File::open(input)
-        .with_context(|| format!("cannot open {}", input.display()))?;
-    let file_size = file.metadata()?.len();
-    let mut reader = std::io::BufReader::new(file);
+    let is_stdin = input.as_os_str() == "-";
 
-    // Seek to end — only process newly appended events.
-    reader.seek(SeekFrom::End(0))?;
-    eprintln!(
-        "Monitoring {} for threats (skipped {} bytes, Ctrl+C to stop)",
-        input.display(),
-        file_size,
-    );
+    // Inode info for rotation detection (file mode only).
+    let mut file_ino: (u64, u64) = (0, 0);
+
+    // Build reader: stdin (stream mode) or file (follow mode).
+    let mut reader: Box<dyn BufRead> = if is_stdin {
+        eprintln!(
+            "Monitoring stdin for threats (Ctrl+D to stop)",
+        );
+        Box::new(std::io::BufReader::new(std::io::stdin()))
+    } else {
+        let file = std::fs::File::open(input)
+            .with_context(|| format!("cannot open {}", input.display()))?;
+        let file_size = file.metadata()?.len();
+        file_ino = file_inode(&file);
+        let mut file_reader = std::io::BufReader::new(file);
+        // Seek to end — only process newly appended events.
+        file_reader.seek(SeekFrom::End(0))?;
+        eprintln!(
+            "Monitoring {} for threats (skipped {} bytes, Ctrl+C to stop)",
+            input.display(),
+            file_size,
+        );
+        Box::new(file_reader)
+    };
     eprintln!(
         "  score threshold: {}, cooldown: {}s",
         threshold, cooldown_secs,
@@ -2953,12 +2967,18 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
         line_buf.clear();
         match reader.read_line(&mut line_buf) {
             Ok(0) => {
-                if tail_file_rotated(input, &reader) {
+                if is_stdin {
+                    // Stream ended (pipe closed / Ctrl+D).
+                    break Ok(());
+                }
+                // File follow mode: check for rotation, then sleep.
+                if file_path_rotated(input, &file_ino) {
                     eprintln!("File rotated, reopening {}", input.display());
                     drop(stdout);
                     let new_file = std::fs::File::open(input)
                         .with_context(|| format!("cannot reopen {}", input.display()))?;
-                    reader = std::io::BufReader::new(new_file);
+                    file_ino = file_inode(&new_file);
+                    reader = Box::new(std::io::BufReader::new(new_file));
                     stdout = std::io::stdout().lock();
                     continue;
                 }
@@ -3528,6 +3548,39 @@ fn tail_file_rotated(
     }
 
     false
+}
+
+/// Extract (dev, ino) pair from a file for rotation detection.
+fn file_inode(file: &std::fs::File) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata()
+            .map(|m| (m.dev(), m.ino()))
+            .unwrap_or((0, 0))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        (0, 0)
+    }
+}
+
+/// Check if the file at `path` has a different inode than `original_ino`.
+fn file_path_rotated(path: &Path, original_ino: &(u64, u64)) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(m) => (m.dev(), m.ino()) != *original_ino,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, original_ino);
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

