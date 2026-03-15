@@ -1322,7 +1322,7 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
                 }
             }
 
-            EventData::EvasionDetected { pid, .. } => {
+            EventData::EvasionDetected { pid, process_name, .. } => {
                 if event.rule.is_some() {
                     let pid_val = pid.unwrap_or(0);
                     let key = event_key
@@ -1334,6 +1334,7 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
                             .process_context
                             .as_ref()
                             .and_then(|c| c.image_path.clone())
+                            .or_else(|| process_name.clone())
                             .unwrap_or_default(),
                         breakdown: ScoreBreakdown::default(),
                         unique_ips: HashSet::new(),
