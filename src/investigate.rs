@@ -257,6 +257,14 @@ pub enum Command {
         /// Output as structured JSONL instead of human-readable text
         #[arg(long)]
         json: bool,
+
+        /// POST alerts as JSON to this webhook URL
+        #[arg(long, value_name = "URL")]
+        webhook: Option<String>,
+
+        /// Bearer token for webhook authentication
+        #[arg(long, value_name = "TOKEN")]
+        webhook_token: Option<String>,
     },
 
     /// Replay saved JSONL events in chronological order with timing
@@ -418,11 +426,17 @@ pub fn run(command: Command) -> Result<()> {
             threshold,
             cooldown,
             json,
+            webhook,
+            webhook_token,
         } => {
             let rules = load_rules_config(config.as_deref())?;
             let threshold = threshold.unwrap_or(rules.alert.threshold);
             let cooldown = cooldown.unwrap_or(rules.alert.cooldown);
-            run_alert(&input, threshold, cooldown, json, &rules)
+            let wh = webhook.map(|url| WebhookConfig {
+                url,
+                token: webhook_token,
+            });
+            run_alert(&input, threshold, cooldown, json, &rules, wh.as_ref())
         }
 
         Command::Replay { input, speed } => run_replay(&input, speed),
@@ -2863,6 +2877,12 @@ fn run_inspect(path: &Path, json: bool) -> Result<()> {
 // Alert — real-time detection monitor
 // ---------------------------------------------------------------------------
 
+/// Webhook output configuration for alert.
+struct WebhookConfig {
+    url: String,
+    token: Option<String>,
+}
+
 /// A single alert emitted by the monitor.
 #[derive(Serialize)]
 struct AlertEvent {
@@ -2881,12 +2901,22 @@ struct AlertEvent {
     timestamp: String,
 }
 
-fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules: &RulesConfig) -> Result<()> {
+fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules: &RulesConfig, webhook: Option<&WebhookConfig>) -> Result<()> {
     use std::collections::{HashMap, HashSet};
     use std::io::{Seek, SeekFrom};
     use std::time::Instant;
 
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
+
+    // Build webhook client if configured.
+    let webhook_client = webhook.map(|wh| {
+        eprintln!("  webhook: {}", wh.url);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+        (client, wh)
+    });
 
     let is_stdin = input.as_os_str() == "-";
 
@@ -3372,6 +3402,20 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
                         writeln!(stdout, "  {}", alert.detail)?;
                     }
                     stdout.flush()?;
+
+                    // POST to webhook if configured.
+                    if let Some((client, wh)) = &webhook_client {
+                        let mut req = client
+                            .post(&wh.url)
+                            .header("Content-Type", "application/json")
+                            .body(serde_json::to_string(alert)?);
+                        if let Some(token) = &wh.token {
+                            req = req.bearer_auth(token);
+                        }
+                        if let Err(e) = req.send() {
+                            eprintln!("webhook error: {e}");
+                        }
+                    }
                 }
             }
             Err(e) => return Err(e.into()),
