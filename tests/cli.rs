@@ -3058,3 +3058,182 @@ fn alert_score_threshold_re_notifies_after_cooldown() {
         score_alerts.len(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rules config tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn score_uses_config_weights() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let config_path = dir.path().join("threatfalcon.toml");
+
+    // Set detection weight to 100 instead of default 40.
+    fs::write(&config_path, "[rules.score]\ndetection = 100\n").unwrap();
+
+    let lines = [
+        sample_process_create_key(
+            "e0000000-0000-0000-0000-000000000001", 100, 1,
+            "C:/malware.exe", "malware.exe",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+        sample_detection_event("e0000000-0000-0000-0000-000000000002", "TF-EVA-001"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args([
+            "score", "--input", path.to_str().unwrap(),
+            "--config", config_path.to_str().unwrap(), "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let procs = parsed["scored_processes"].as_array().unwrap();
+    let detection_proc = procs.iter().find(|p| {
+        p["breakdown"]["detections"].as_u64().unwrap_or(0) > 0
+    }).expect("should have a detection process");
+    // Score should be 100 (custom weight) instead of default 40.
+    assert!(
+        detection_proc["score"].as_u64().unwrap() >= 100,
+        "expected score >= 100 with custom weight, got: {}",
+        detection_proc["score"],
+    );
+}
+
+#[test]
+fn hunt_uses_config_lolbins() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let config_path = dir.path().join("threatfalcon.toml");
+
+    // Custom lolbins list that includes "custom_lolbin.exe".
+    fs::write(
+        &config_path,
+        "[rules.hunt]\nlolbins = [\"custom_lolbin.exe\"]\n",
+    ).unwrap();
+
+    let lines = [
+        sample_process_create_key(
+            "e1000000-0000-0000-0000-000000000001", 200, 1,
+            "C:/custom_lolbin.exe", "custom_lolbin.exe args",
+            "2026-03-13T10:00:00Z", "200:2000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args([
+            "hunt", "--input", path.to_str().unwrap(),
+            "--config", config_path.to_str().unwrap(),
+            "--rule", "lolbin", "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert!(
+        !findings.is_empty(),
+        "custom_lolbin.exe should match custom lolbins config, got: {stdout}",
+    );
+}
+
+#[test]
+fn hunt_default_lolbin_not_in_custom_config() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let config_path = dir.path().join("threatfalcon.toml");
+
+    // Custom lolbins list that does NOT include certutil.exe.
+    fs::write(
+        &config_path,
+        "[rules.hunt]\nlolbins = [\"only_this.exe\"]\n",
+    ).unwrap();
+
+    let lines = [
+        sample_process_create_key(
+            "e2000000-0000-0000-0000-000000000001", 300, 1,
+            "C:/Windows/System32/certutil.exe", "certutil.exe -urlcache",
+            "2026-03-13T10:00:00Z", "300:3000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args([
+            "hunt", "--input", path.to_str().unwrap(),
+            "--config", config_path.to_str().unwrap(),
+            "--rule", "lolbin", "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert!(
+        findings.is_empty(),
+        "certutil.exe should NOT match when excluded from custom config, got: {stdout}",
+    );
+}
+
+#[test]
+fn alert_uses_config_threshold() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let config_path = dir.path().join("threatfalcon.toml");
+
+    // Set threshold to 200 — a single detection (40 pts) should NOT trigger.
+    fs::write(&config_path, "[rules.alert]\nthreshold = 200\n").unwrap();
+
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", path.to_str().unwrap(),
+        "--config", config_path.to_str().unwrap(), "--json",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let event = sample_detection_event(
+        "e3000000-0000-0000-0000-000000000001",
+        "TF-EVA-001",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Should have the detection alert but NOT the score-threshold alert.
+    let has_score = stdout.lines().any(|l| {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            v["alert_type"] == "score"
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_score,
+        "score-threshold should NOT fire when threshold=200, got: {stdout}",
+    );
+}

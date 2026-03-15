@@ -34,6 +34,54 @@ pub struct SensorConfig {
     pub health_interval_secs: u64,
     /// Path to the persistent agent state file (stores agent_id).
     pub state_path: PathBuf,
+    /// Hunt / score / alert rule configuration.
+    pub rules: RulesConfig,
+}
+
+/// Configuration for hunt, score, and alert rules.
+/// All fields have sensible defaults matching the built-in behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RulesConfig {
+    pub hunt: HuntRulesConfig,
+    pub score: ScoreWeights,
+    pub alert: AlertDefaults,
+}
+
+/// Configurable process lists and thresholds for hunt rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HuntRulesConfig {
+    /// Parent images that should not normally spawn shells/scripting engines.
+    pub suspicious_parents: Vec<String>,
+    /// Children that are suspicious when spawned from a suspicious parent.
+    pub suspicious_children: Vec<String>,
+    /// LOLBins — legitimate Windows binaries commonly abused by adversaries.
+    pub lolbins: Vec<String>,
+    /// Minimum connection count to the same IP before flagging as beaconing.
+    pub beaconing_threshold: usize,
+}
+
+/// Point values for each scoring signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScoreWeights {
+    pub detection: u32,
+    pub suspicious_parent: u32,
+    pub lolbin: u32,
+    pub unsigned_dll: u32,
+    pub external_ip: u32,
+    pub dns_query: u32,
+}
+
+/// Default values for the alert subcommand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertDefaults {
+    /// Score threshold to trigger a score-based alert.
+    pub threshold: u32,
+    /// Seconds to suppress duplicate alerts for the same process + rule.
+    pub cooldown: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +345,7 @@ impl SensorConfig {
                 Some(d) => d.join("threatfalcon.state"),
                 None => PathBuf::from("threatfalcon.state"),
             },
+            rules: RulesConfig::default(),
         }
     }
 }
@@ -377,6 +426,93 @@ impl Default for EvasionConfig {
             detect_amsi_bypass: true,
             detect_unhooking: true,
             detect_direct_syscall: true,
+        }
+    }
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            hunt: HuntRulesConfig::default(),
+            score: ScoreWeights::default(),
+            alert: AlertDefaults::default(),
+        }
+    }
+}
+
+impl Default for HuntRulesConfig {
+    fn default() -> Self {
+        Self {
+            suspicious_parents: vec![
+                "winword.exe".into(),
+                "excel.exe".into(),
+                "powerpnt.exe".into(),
+                "outlook.exe".into(),
+                "msaccess.exe".into(),
+                "mspub.exe".into(),
+                "visio.exe".into(),
+                "onenote.exe".into(),
+                "acrobat.exe".into(),
+                "acrord32.exe".into(),
+            ],
+            suspicious_children: vec![
+                "cmd.exe".into(),
+                "powershell.exe".into(),
+                "pwsh.exe".into(),
+                "wscript.exe".into(),
+                "cscript.exe".into(),
+                "mshta.exe".into(),
+                "regsvr32.exe".into(),
+                "rundll32.exe".into(),
+                "certutil.exe".into(),
+                "bitsadmin.exe".into(),
+            ],
+            lolbins: vec![
+                "certutil.exe".into(),
+                "mshta.exe".into(),
+                "regsvr32.exe".into(),
+                "rundll32.exe".into(),
+                "wscript.exe".into(),
+                "cscript.exe".into(),
+                "msiexec.exe".into(),
+                "bitsadmin.exe".into(),
+                "wmic.exe".into(),
+                "msbuild.exe".into(),
+                "installutil.exe".into(),
+                "regasm.exe".into(),
+                "regsvcs.exe".into(),
+                "cmstp.exe".into(),
+                "esentutl.exe".into(),
+                "expand.exe".into(),
+                "extrac32.exe".into(),
+                "hh.exe".into(),
+                "ieexec.exe".into(),
+                "makecab.exe".into(),
+                "replace.exe".into(),
+            ],
+            beaconing_threshold: 10,
+        }
+    }
+}
+
+impl Default for ScoreWeights {
+    fn default() -> Self {
+        Self {
+            detection: 40,
+            suspicious_parent: 20,
+            lolbin: 20,
+            unsigned_dll: 5,
+            external_ip: 2,
+            dns_query: 1,
+        }
+    }
+}
+
+impl Default for AlertDefaults {
+    fn default() -> Self {
+        Self {
+            threshold: 40,
+            cooldown: 300,
         }
     }
 }
@@ -765,5 +901,70 @@ mod tests {
             cfg.state_path,
             expected_dir,
         );
+    }
+
+    #[test]
+    fn rules_defaults_match_original_values() {
+        let rules = RulesConfig::default();
+        // Hunt defaults
+        assert_eq!(rules.hunt.beaconing_threshold, 10);
+        assert!(rules.hunt.lolbins.contains(&"certutil.exe".to_string()));
+        assert!(rules.hunt.suspicious_parents.contains(&"winword.exe".to_string()));
+        assert!(rules.hunt.suspicious_children.contains(&"cmd.exe".to_string()));
+        // Score weights
+        assert_eq!(rules.score.detection, 40);
+        assert_eq!(rules.score.suspicious_parent, 20);
+        assert_eq!(rules.score.lolbin, 20);
+        assert_eq!(rules.score.unsigned_dll, 5);
+        assert_eq!(rules.score.external_ip, 2);
+        assert_eq!(rules.score.dns_query, 1);
+        // Alert defaults
+        assert_eq!(rules.alert.threshold, 40);
+        assert_eq!(rules.alert.cooldown, 300);
+    }
+
+    #[test]
+    fn rules_partial_override() {
+        let toml = r#"
+            [rules.score]
+            detection = 100
+
+            [rules.hunt]
+            beaconing_threshold = 5
+
+            [rules.alert]
+            cooldown = 60
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        // Overridden
+        assert_eq!(cfg.rules.score.detection, 100);
+        assert_eq!(cfg.rules.hunt.beaconing_threshold, 5);
+        assert_eq!(cfg.rules.alert.cooldown, 60);
+        // Defaults preserved
+        assert_eq!(cfg.rules.score.lolbin, 20);
+        assert_eq!(cfg.rules.alert.threshold, 40);
+        assert!(cfg.rules.hunt.lolbins.contains(&"certutil.exe".to_string()));
+    }
+
+    #[test]
+    fn rules_custom_lolbins() {
+        let toml = r#"
+            [rules.hunt]
+            lolbins = ["custom.exe", "another.exe"]
+        "#;
+        let cfg: SensorConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.rules.hunt.lolbins, vec!["custom.exe", "another.exe"]);
+        // suspicious_parents still has defaults
+        assert!(cfg.rules.hunt.suspicious_parents.contains(&"winword.exe".to_string()));
+    }
+
+    #[test]
+    fn rules_roundtrip() {
+        let cfg = SensorConfig::default();
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let cfg2: SensorConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.rules.score.detection, cfg2.rules.score.detection);
+        assert_eq!(cfg.rules.hunt.lolbins.len(), cfg2.rules.hunt.lolbins.len());
+        assert_eq!(cfg.rules.alert.threshold, cfg2.rules.alert.threshold);
     }
 }
