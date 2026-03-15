@@ -2890,8 +2890,14 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
 
     let is_stdin = input.as_os_str() == "-";
 
-    // Inode info for rotation detection (file mode only).
-    let mut file_ino: (u64, u64) = (0, 0);
+    // File identity for rotation detection (file mode only).
+    let mut file_id = FileIdentity {
+        #[cfg(unix)]
+        dev: 0,
+        #[cfg(unix)]
+        ino: 0,
+        size: 0,
+    };
 
     // Build reader: stdin (stream mode) or file (follow mode).
     let mut reader: Box<dyn BufRead> = if is_stdin {
@@ -2903,7 +2909,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
         let file = std::fs::File::open(input)
             .with_context(|| format!("cannot open {}", input.display()))?;
         let file_size = file.metadata()?.len();
-        file_ino = file_inode(&file);
+        file_id = file_identity(&file);
         let mut file_reader = std::io::BufReader::new(file);
         // Seek to end — only process newly appended events.
         file_reader.seek(SeekFrom::End(0))?;
@@ -2972,12 +2978,12 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
                     break Ok(());
                 }
                 // File follow mode: check for rotation, then sleep.
-                if file_path_rotated(input, &file_ino) {
+                if file_path_rotated(input, &file_id) {
                     eprintln!("File rotated, reopening {}", input.display());
                     drop(stdout);
                     let new_file = std::fs::File::open(input)
                         .with_context(|| format!("cannot reopen {}", input.display()))?;
-                    file_ino = file_inode(&new_file);
+                    file_id = file_identity(&new_file);
                     reader = Box::new(std::io::BufReader::new(new_file));
                     stdout = std::io::stdout().lock();
                     continue;
@@ -3550,37 +3556,61 @@ fn tail_file_rotated(
     false
 }
 
-/// Extract (dev, ino) pair from a file for rotation detection.
-fn file_inode(file: &std::fs::File) -> (u64, u64) {
+/// Snapshot of file identity for rotation detection.
+#[allow(dead_code)] // `size` used only on non-unix
+struct FileIdentity {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        file.metadata()
-            .map(|m| (m.dev(), m.ino()))
-            .unwrap_or((0, 0))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        (0, 0)
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    /// File size at open — used as non-Unix fallback (if the path's file
+    /// is smaller than this, we assume truncation/rotation).
+    size: u64,
+}
+
+/// Capture identity of an open file.
+fn file_identity(file: &std::fs::File) -> FileIdentity {
+    let meta = file.metadata().ok();
+    FileIdentity {
+        #[cfg(unix)]
+        dev: meta.as_ref().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.dev()
+        }).unwrap_or(0),
+        #[cfg(unix)]
+        ino: meta.as_ref().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        }).unwrap_or(0),
+        size: meta.map(|m| m.len()).unwrap_or(0),
     }
 }
 
-/// Check if the file at `path` has a different inode than `original_ino`.
-fn file_path_rotated(path: &Path, original_ino: &(u64, u64)) -> bool {
+/// Check if the file at `path` has been rotated relative to `original`.
+fn file_path_rotated(path: &Path, original: &FileIdentity) -> bool {
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(path) {
-            Ok(m) => (m.dev(), m.ino()) != *original_ino,
-            Err(_) => false,
+        if path_meta.dev() != original.dev || path_meta.ino() != original.ino {
+            return true;
         }
     }
+
+    // Non-Unix fallback: if the path's file is smaller than our original,
+    // assume rotation (covers truncation).
     #[cfg(not(unix))]
     {
-        let _ = (path, original_ino);
-        false
+        if path_meta.len() < original.size {
+            return true;
+        }
     }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
