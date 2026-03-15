@@ -227,6 +227,25 @@ pub enum Command {
         json: bool,
     },
 
+    /// Monitor events in real time and alert on threat detections
+    Alert {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Score threshold to trigger a score-based alert (default: 40)
+        #[arg(long, default_value = "40")]
+        threshold: u32,
+
+        /// Seconds to suppress duplicate alerts for the same process + rule (default: 300)
+        #[arg(long, default_value = "300")]
+        cooldown: u64,
+
+        /// Output as structured JSONL instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Follow new events appended to a JSONL file (like tail -f)
     Tail {
         /// Path to JSONL event file
@@ -361,6 +380,13 @@ pub fn run(command: Command) -> Result<()> {
             limit,
             json,
         } => run_ioc(&input, r#type.as_deref(), limit, json),
+
+        Command::Alert {
+            input,
+            threshold,
+            cooldown,
+            json,
+        } => run_alert(&input, threshold, cooldown, json),
 
         Command::Tail {
             input,
@@ -2816,6 +2842,500 @@ fn run_inspect(path: &Path, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Alert — real-time detection monitor
+// ---------------------------------------------------------------------------
+
+/// A single alert emitted by the monitor.
+#[derive(Serialize)]
+struct AlertEvent {
+    /// "hunt" for hunt-rule matches, "score" for threshold breaches.
+    alert_type: String,
+    rule: String,
+    severity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mitre: Option<String>,
+    process_key: String,
+    pid: u32,
+    image: String,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<u32>,
+    timestamp: String,
+}
+
+fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{Seek, SeekFrom};
+    use std::time::Instant;
+
+    let cooldown = std::time::Duration::from_secs(cooldown_secs);
+
+    let file = std::fs::File::open(input)
+        .with_context(|| format!("cannot open {}", input.display()))?;
+    let file_size = file.metadata()?.len();
+    let mut reader = std::io::BufReader::new(file);
+
+    // Seek to end — only process newly appended events.
+    reader.seek(SeekFrom::End(0))?;
+    eprintln!(
+        "Monitoring {} for threats (skipped {} bytes, Ctrl+C to stop)",
+        input.display(),
+        file_size,
+    );
+    eprintln!(
+        "  score threshold: {}, cooldown: {}s",
+        threshold, cooldown_secs,
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    let mut line_buf = String::new();
+
+    // Per-process scoring accumulators (same as run_score).
+    struct ProcAcc {
+        pid: u32,
+        image: String,
+        breakdown: ScoreBreakdown,
+        unique_ips: HashSet<String>,
+        unique_domains: HashSet<String>,
+    }
+    let mut acc_map: HashMap<String, ProcAcc> = HashMap::new();
+
+    // Deduplication: (process_key, rule) → last alert time.
+    let mut seen: HashMap<String, Instant> = HashMap::new();
+
+    // Parent tracking for suspicious-parent rule (streaming).
+    // Maps pid → (process_key, image_path, event_timestamp).
+    let mut pid_to_proc: HashMap<u32, (String, String, DateTime<Utc>)> = HashMap::new();
+
+    // Pending children whose parent hasn't been seen yet.
+    // Maps ppid → Vec<PendingChild>
+    struct PendingChild {
+        key: String,
+        child_name: String,
+        image_path: String,
+        command_line: String,
+        pid: u32,
+        event_ts: DateTime<Utc>,
+        timestamp: String,
+    }
+    let mut pending_children: HashMap<u32, Vec<PendingChild>> = HashMap::new();
+
+    let should_emit = |dedup_key: &str, seen: &mut HashMap<String, Instant>, cooldown: std::time::Duration| -> bool {
+        let now = Instant::now();
+        if let Some(last) = seen.get(dedup_key) {
+            if now.duration_since(*last) < cooldown {
+                return false;
+            }
+        }
+        seen.insert(dedup_key.to_string(), now);
+        true
+    };
+
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => {
+                if tail_file_rotated(input, &reader) {
+                    eprintln!("File rotated, reopening {}", input.display());
+                    drop(stdout);
+                    let new_file = std::fs::File::open(input)
+                        .with_context(|| format!("cannot reopen {}", input.display()))?;
+                    reader = std::io::BufReader::new(new_file);
+                    stdout = std::io::stdout().lock();
+                    continue;
+                }
+                drop(stdout);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                stdout = std::io::stdout().lock();
+            }
+            Ok(_) => {
+                let line = line_buf.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let event = match serde_json::from_str::<ThreatEvent>(line) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                let event_key = event
+                    .process_context
+                    .as_ref()
+                    .map(|c| c.process_key.clone());
+
+                let mut alerts: Vec<AlertEvent> = Vec::new();
+
+                match &event.data {
+                    EventData::ProcessCreate {
+                        pid,
+                        ppid,
+                        image_path,
+                        command_line,
+                        ..
+                    } => {
+                        let key = event_key.clone().unwrap_or_else(|| format!("pid:{pid}"));
+                        let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
+                            pid: *pid,
+                            image: image_path.clone(),
+                            breakdown: ScoreBreakdown::default(),
+                            unique_ips: HashSet::new(),
+                            unique_domains: HashSet::new(),
+                        });
+
+                        // LOLBin check
+                        let child_name = basename(image_path);
+                        let child_lower = child_name.to_ascii_lowercase();
+                        if LOLBINS.iter().any(|l| child_lower == *l) {
+                            acc.breakdown.lolbin = true;
+                            let dedup = format!("{key}|lolbin");
+                            if should_emit(&dedup, &mut seen, cooldown) {
+                                alerts.push(AlertEvent {
+                                    alert_type: "hunt".into(),
+                                    rule: "lolbin".into(),
+                                    severity: "Medium".into(),
+                                    mitre: Some("T1218".into()),
+                                    process_key: key.clone(),
+                                    pid: *pid,
+                                    image: image_path.clone(),
+                                    detail: format!(
+                                        "LOLBin execution: {} ({})",
+                                        child_name, command_line,
+                                    ),
+                                    score: None,
+                                    timestamp: event.timestamp.to_rfc3339(),
+                                });
+                            }
+                        }
+
+                        // Suspicious-parent: forward check (parent already seen)
+                        if let Some((_, parent_image, parent_ts)) = pid_to_proc.get(ppid) {
+                            let parent_lower = basename(parent_image).to_ascii_lowercase();
+                            if *parent_ts <= event.timestamp
+                                && SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
+                                && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+                            {
+                                acc.breakdown.suspicious_parent = true;
+                                let dedup = format!("{key}|suspicious-parent");
+                                if should_emit(&dedup, &mut seen, cooldown) {
+                                    alerts.push(AlertEvent {
+                                        alert_type: "hunt".into(),
+                                        rule: "suspicious-parent".into(),
+                                        severity: "High".into(),
+                                        mitre: Some("T1204.002".into()),
+                                        process_key: key.clone(),
+                                        pid: *pid,
+                                        image: image_path.clone(),
+                                        detail: format!(
+                                            "{} spawned {} ({})",
+                                            basename(parent_image),
+                                            child_name,
+                                            command_line,
+                                        ),
+                                        score: None,
+                                        timestamp: event.timestamp.to_rfc3339(),
+                                    });
+                                }
+                            }
+                        } else {
+                            // Parent not yet seen — queue for retroactive check.
+                            let child_lower_check = child_lower.clone();
+                            if SUSPICIOUS_CHILDREN.iter().any(|c| child_lower_check == *c) {
+                                pending_children
+                                    .entry(*ppid)
+                                    .or_default()
+                                    .push(PendingChild {
+                                        key: key.clone(),
+                                        child_name: child_name.clone(),
+                                        image_path: image_path.clone(),
+                                        command_line: command_line.clone(),
+                                        pid: *pid,
+                                        event_ts: event.timestamp,
+                                        timestamp: event.timestamp.to_rfc3339(),
+                                    });
+                            }
+                        }
+
+                        // Update parent tracking
+                        pid_to_proc.insert(*pid, (key.clone(), image_path.clone(), event.timestamp));
+
+                        // Retroactive check: if this process is a suspicious
+                        // parent, check any pending children that were waiting.
+                        let self_lower = basename(image_path).to_ascii_lowercase();
+                        if SUSPICIOUS_PARENTS.iter().any(|p| self_lower == *p) {
+                            if let Some(children) = pending_children.remove(pid) {
+                                for pc in children {
+                                    // Guard: parent must have been created
+                                    // before the child (timestamp order).
+                                    if event.timestamp > pc.event_ts {
+                                        continue;
+                                    }
+                                    if let Some(child_acc) = acc_map.get_mut(&pc.key) {
+                                        child_acc.breakdown.suspicious_parent = true;
+                                    }
+                                    let dedup = format!("{}|suspicious-parent", pc.key);
+                                    if should_emit(&dedup, &mut seen, cooldown) {
+                                        alerts.push(AlertEvent {
+                                            alert_type: "hunt".into(),
+                                            rule: "suspicious-parent".into(),
+                                            severity: "High".into(),
+                                            mitre: Some("T1204.002".into()),
+                                            process_key: pc.key,
+                                            pid: pc.pid,
+                                            image: pc.image_path,
+                                            detail: format!(
+                                                "{} spawned {} ({})",
+                                                basename(image_path),
+                                                pc.child_name,
+                                                pc.command_line,
+                                            ),
+                                            score: None,
+                                            timestamp: pc.timestamp,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    EventData::EvasionDetected { pid, process_name, .. } => {
+                        if event.rule.is_some() {
+                            let pid_val = pid.unwrap_or(0);
+                            let key = event_key
+                                .clone()
+                                .unwrap_or_else(|| format!("pid:{pid_val}"));
+                            let rule_id = event
+                                .rule
+                                .as_ref()
+                                .map(|r| r.id.clone())
+                                .unwrap_or_else(|| "detection".into());
+                            let img = event
+                                .process_context
+                                .as_ref()
+                                .and_then(|c| c.image_path.clone())
+                                .or_else(|| process_name.clone())
+                                .unwrap_or_default();
+                            let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
+                                pid: pid_val,
+                                image: img.clone(),
+                                breakdown: ScoreBreakdown::default(),
+                                unique_ips: HashSet::new(),
+                                unique_domains: HashSet::new(),
+                            });
+                            acc.breakdown.detections += 1;
+
+                            let dedup = format!("{key}|{rule_id}");
+                            if should_emit(&dedup, &mut seen, cooldown) {
+                                alerts.push(AlertEvent {
+                                    alert_type: "detection".into(),
+                                    rule: rule_id,
+                                    severity: format!("{:?}", event.severity),
+                                    mitre: event.rule.as_ref().map(|r| {
+                                        r.mitre.technique_id.clone()
+                                    }),
+                                    process_key: key.clone(),
+                                    pid: pid_val,
+                                    image: img,
+                                    detail: event_summary(&event.data),
+                                    score: None,
+                                    timestamp: event.timestamp.to_rfc3339(),
+                                });
+                            }
+                        }
+                    }
+
+                    EventData::ImageLoad {
+                        pid,
+                        image_name,
+                        image_path,
+                        signed,
+                        ..
+                    } => {
+                        if !signed {
+                            let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
+                            let proc_image = event
+                                .process_context
+                                .as_ref()
+                                .and_then(|c| c.image_path.clone())
+                                .unwrap_or_else(|| format!("PID {pid}"));
+                            let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
+                                pid: *pid,
+                                image: proc_image.clone(),
+                                breakdown: ScoreBreakdown::default(),
+                                unique_ips: HashSet::new(),
+                                unique_domains: HashSet::new(),
+                            });
+                            acc.breakdown.unsigned_dlls += 1;
+
+                            let dedup = format!("{key}|unsigned-dll|{image_name}");
+                            if should_emit(&dedup, &mut seen, cooldown) {
+                                alerts.push(AlertEvent {
+                                    alert_type: "hunt".into(),
+                                    rule: "unsigned-dll".into(),
+                                    severity: "Low".into(),
+                                    mitre: Some("T1574.001".into()),
+                                    process_key: key.clone(),
+                                    pid: *pid,
+                                    image: proc_image,
+                                    detail: format!(
+                                        "Unsigned DLL loaded: {} ({})",
+                                        image_name, image_path,
+                                    ),
+                                    score: None,
+                                    timestamp: event.timestamp.to_rfc3339(),
+                                });
+                            }
+                        }
+                    }
+
+                    EventData::NetworkConnect {
+                        pid,
+                        dst_addr,
+                        ..
+                    } => {
+                        if is_public_ip(dst_addr) {
+                            let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
+                            let proc_image = event
+                                .process_context
+                                .as_ref()
+                                .and_then(|c| c.image_path.clone())
+                                .unwrap_or_else(|| format!("PID {pid}"));
+                            let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
+                                pid: *pid,
+                                image: proc_image,
+                                breakdown: ScoreBreakdown::default(),
+                                unique_ips: HashSet::new(),
+                                unique_domains: HashSet::new(),
+                            });
+                            acc.unique_ips.insert(dst_addr.clone());
+                        }
+                    }
+
+                    EventData::DnsQuery {
+                        pid,
+                        query_name,
+                        ..
+                    } => {
+                        if !query_name.is_empty() {
+                            let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
+                            let proc_image = event
+                                .process_context
+                                .as_ref()
+                                .and_then(|c| c.image_path.clone())
+                                .unwrap_or_else(|| format!("PID {pid}"));
+                            let acc = acc_map.entry(key.clone()).or_insert_with(|| ProcAcc {
+                                pid: *pid,
+                                image: proc_image,
+                                breakdown: ScoreBreakdown::default(),
+                                unique_ips: HashSet::new(),
+                                unique_domains: HashSet::new(),
+                            });
+                            acc.unique_domains.insert(query_name.clone());
+                        }
+                    }
+
+                    _ => {}
+                }
+
+                // Check score threshold for all affected accumulators.
+                // We only need to check keys that were touched this iteration.
+                // Collect keys from alerts to check.
+                let keys_to_check: Vec<String> = alerts
+                    .iter()
+                    .map(|a| a.process_key.clone())
+                    .collect();
+
+                // Also check the event's own key if it had scoring updates
+                // but no hunt alert (e.g. network/dns events).
+                let event_own_key = match &event.data {
+                    EventData::NetworkConnect { pid, .. } => {
+                        let k = event
+                            .process_context
+                            .as_ref()
+                            .map(|c| c.process_key.clone())
+                            .unwrap_or_else(|| format!("pid:{pid}"));
+                        Some(k)
+                    }
+                    EventData::DnsQuery { pid, .. } => {
+                        let k = event
+                            .process_context
+                            .as_ref()
+                            .map(|c| c.process_key.clone())
+                            .unwrap_or_else(|| format!("pid:{pid}"));
+                        Some(k)
+                    }
+                    _ => None,
+                };
+
+                let all_keys: HashSet<String> = keys_to_check
+                    .into_iter()
+                    .chain(event_own_key)
+                    .collect();
+
+                for key in &all_keys {
+                    if let Some(acc) = acc_map.get_mut(key.as_str()) {
+                        acc.breakdown.external_ips = acc.unique_ips.len() as u32;
+                        acc.breakdown.dns_queries = acc.unique_domains.len() as u32;
+                        let current_score = acc.breakdown.total();
+                        if current_score >= threshold {
+                            let dedup = format!("{key}|score-threshold");
+                            if should_emit(&dedup, &mut seen, cooldown) {
+                                alerts.push(AlertEvent {
+                                    alert_type: "score".into(),
+                                    rule: "score-threshold".into(),
+                                    severity: "High".into(),
+                                    mitre: None,
+                                    process_key: key.clone(),
+                                    pid: acc.pid,
+                                    image: acc.image.clone(),
+                                    detail: format!(
+                                        "Process score {} reached threshold {}",
+                                        current_score, threshold,
+                                    ),
+                                    score: Some(current_score),
+                                    timestamp: event.timestamp.to_rfc3339(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Emit alerts
+                for alert in &alerts {
+                    if json {
+                        writeln!(stdout, "{}", serde_json::to_string(alert)?)?;
+                    } else {
+                        let mitre = alert
+                            .mitre
+                            .as_deref()
+                            .map(|m| format!(" ({m})"))
+                            .unwrap_or_default();
+                        let score_str = alert
+                            .score
+                            .map(|s| format!(" [score: {s}]"))
+                            .unwrap_or_default();
+                        writeln!(
+                            stdout,
+                            "{} [{}] {} {}{}{} PID {} {}",
+                            alert.timestamp,
+                            alert.severity,
+                            alert.alert_type.to_ascii_uppercase(),
+                            alert.rule,
+                            mitre,
+                            score_str,
+                            alert.pid,
+                            alert.image,
+                        )?;
+                        writeln!(stdout, "  {}", alert.detail)?;
+                    }
+                    stdout.flush()?;
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
