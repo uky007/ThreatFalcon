@@ -2888,18 +2888,38 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
 
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
 
-    let file = std::fs::File::open(input)
-        .with_context(|| format!("cannot open {}", input.display()))?;
-    let file_size = file.metadata()?.len();
-    let mut reader = std::io::BufReader::new(file);
+    let is_stdin = input.as_os_str() == "-";
 
-    // Seek to end — only process newly appended events.
-    reader.seek(SeekFrom::End(0))?;
-    eprintln!(
-        "Monitoring {} for threats (skipped {} bytes, Ctrl+C to stop)",
-        input.display(),
-        file_size,
-    );
+    // File identity for rotation detection (file mode only).
+    let mut file_id = FileIdentity {
+        #[cfg(unix)]
+        dev: 0,
+        #[cfg(unix)]
+        ino: 0,
+        size: 0,
+    };
+
+    // Build reader: stdin (stream mode) or file (follow mode).
+    let mut reader: Box<dyn BufRead> = if is_stdin {
+        eprintln!(
+            "Monitoring stdin for threats (Ctrl+D to stop)",
+        );
+        Box::new(std::io::BufReader::new(std::io::stdin()))
+    } else {
+        let file = std::fs::File::open(input)
+            .with_context(|| format!("cannot open {}", input.display()))?;
+        let file_size = file.metadata()?.len();
+        file_id = file_identity(&file);
+        let mut file_reader = std::io::BufReader::new(file);
+        // Seek to end — only process newly appended events.
+        file_reader.seek(SeekFrom::End(0))?;
+        eprintln!(
+            "Monitoring {} for threats (skipped {} bytes, Ctrl+C to stop)",
+            input.display(),
+            file_size,
+        );
+        Box::new(file_reader)
+    };
     eprintln!(
         "  score threshold: {}, cooldown: {}s",
         threshold, cooldown_secs,
@@ -2953,12 +2973,18 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
         line_buf.clear();
         match reader.read_line(&mut line_buf) {
             Ok(0) => {
-                if tail_file_rotated(input, &reader) {
+                if is_stdin {
+                    // Stream ended (pipe closed / Ctrl+D).
+                    break Ok(());
+                }
+                // File follow mode: check for rotation, then sleep.
+                if file_path_rotated(input, &file_id) {
                     eprintln!("File rotated, reopening {}", input.display());
                     drop(stdout);
                     let new_file = std::fs::File::open(input)
                         .with_context(|| format!("cannot reopen {}", input.display()))?;
-                    reader = std::io::BufReader::new(new_file);
+                    file_id = file_identity(&new_file);
+                    reader = Box::new(std::io::BufReader::new(new_file));
                     stdout = std::io::stdout().lock();
                     continue;
                 }
@@ -3523,6 +3549,63 @@ fn tail_file_rotated(
     #[cfg(not(unix))]
     {
         if path_meta.len() < handle_meta.len() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Snapshot of file identity for rotation detection.
+#[allow(dead_code)] // `size` used only on non-unix
+struct FileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    /// File size at open — used as non-Unix fallback (if the path's file
+    /// is smaller than this, we assume truncation/rotation).
+    size: u64,
+}
+
+/// Capture identity of an open file.
+fn file_identity(file: &std::fs::File) -> FileIdentity {
+    let meta = file.metadata().ok();
+    FileIdentity {
+        #[cfg(unix)]
+        dev: meta.as_ref().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.dev()
+        }).unwrap_or(0),
+        #[cfg(unix)]
+        ino: meta.as_ref().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.ino()
+        }).unwrap_or(0),
+        size: meta.map(|m| m.len()).unwrap_or(0),
+    }
+}
+
+/// Check if the file at `path` has been rotated relative to `original`.
+fn file_path_rotated(path: &Path, original: &FileIdentity) -> bool {
+    let path_meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_meta.dev() != original.dev || path_meta.ino() != original.ino {
+            return true;
+        }
+    }
+
+    // Non-Unix fallback: if the path's file is smaller than our original,
+    // assume rotation (covers truncation).
+    #[cfg(not(unix))]
+    {
+        if path_meta.len() < original.size {
             return true;
         }
     }
