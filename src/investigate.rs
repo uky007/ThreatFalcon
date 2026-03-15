@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{RulesConfig, SensorConfig};
 use crate::events::{EventCategory, EventData, Severity, ThreatEvent};
 use crate::index;
 
@@ -180,6 +181,10 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
 
+        /// Path to config file for rule settings (optional)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+
         /// Maximum number of processes to display (default: 20)
         #[arg(long, default_value = "20")]
         limit: usize,
@@ -194,6 +199,10 @@ pub enum Command {
         /// Path to JSONL event file
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
+
+        /// Path to config file for rule settings (optional)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
 
         /// Run only a specific rule (e.g., "suspicious-parent", "lolbin", "unsigned-dll", "beaconing")
         #[arg(long)]
@@ -233,13 +242,17 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
 
-        /// Score threshold to trigger a score-based alert (default: 40)
-        #[arg(long, default_value = "40")]
-        threshold: u32,
+        /// Path to config file for rule settings (optional)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
 
-        /// Seconds to suppress duplicate alerts for the same process + rule (default: 300)
-        #[arg(long, default_value = "300")]
-        cooldown: u64,
+        /// Score threshold to trigger a score-based alert (default from config: 40)
+        #[arg(long)]
+        threshold: Option<u32>,
+
+        /// Seconds to suppress duplicate alerts for the same process + rule (default from config: 300)
+        #[arg(long)]
+        cooldown: Option<u64>,
 
         /// Output as structured JSONL instead of human-readable text
         #[arg(long)]
@@ -365,14 +378,21 @@ pub fn run(command: Command) -> Result<()> {
 
         Command::Inspect { file, json } => run_inspect(&file, json),
 
-        Command::Score { input, limit, json } => run_score(&input, limit, json),
+        Command::Score { input, config, limit, json } => {
+            let rules = load_rules_config(config.as_deref())?;
+            run_score(&input, limit, json, &rules)
+        }
 
         Command::Hunt {
             input,
+            config,
             rule,
             limit,
             json,
-        } => run_hunt(&input, rule.as_deref(), limit, json),
+        } => {
+            let rules = load_rules_config(config.as_deref())?;
+            run_hunt(&input, rule.as_deref(), limit, json, &rules)
+        }
 
         Command::Ioc {
             input,
@@ -383,10 +403,16 @@ pub fn run(command: Command) -> Result<()> {
 
         Command::Alert {
             input,
+            config,
             threshold,
             cooldown,
             json,
-        } => run_alert(&input, threshold, cooldown, json),
+        } => {
+            let rules = load_rules_config(config.as_deref())?;
+            let threshold = threshold.unwrap_or(rules.alert.threshold);
+            let cooldown = cooldown.unwrap_or(rules.alert.cooldown);
+            run_alert(&input, threshold, cooldown, json, &rules)
+        }
 
         Command::Tail {
             input,
@@ -417,6 +443,41 @@ pub fn run(command: Command) -> Result<()> {
             run_tail(&input, &filter, json)
         }
     }
+}
+
+/// Load `RulesConfig` from an optional TOML config path.
+/// When `None`, tries to auto-discover `threatfalcon.toml` in the usual
+/// locations (cwd, then platform base dir). Falls back to built-in defaults
+/// if no file is found.
+fn load_rules_config(path: Option<&Path>) -> Result<RulesConfig> {
+    let resolved = match path {
+        Some(p) => Some(p.to_path_buf()),
+        None => crate::config::find_config_file(None),
+    };
+    match resolved {
+        Some(p) => {
+            let content = std::fs::read_to_string(&p)
+                .with_context(|| format!("cannot read config: {}", p.display()))?;
+            let cfg: SensorConfig = toml::from_str(&content)
+                .with_context(|| format!("invalid config: {}", p.display()))?;
+            Ok(normalize_rules(cfg.rules))
+        }
+        None => Ok(RulesConfig::default()),
+    }
+}
+
+/// Normalize rule string values to lowercase for case-insensitive matching.
+fn normalize_rules(mut rules: RulesConfig) -> RulesConfig {
+    for s in &mut rules.hunt.lolbins {
+        *s = s.to_ascii_lowercase();
+    }
+    for s in &mut rules.hunt.suspicious_parents {
+        *s = s.to_ascii_lowercase();
+    }
+    for s in &mut rules.hunt.suspicious_children {
+        *s = s.to_ascii_lowercase();
+    }
+    rules
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,13 +1304,7 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
 // Score
 // ---------------------------------------------------------------------------
 
-/// Point values for each signal type.
-const SCORE_DETECTION: u32 = 40;
-const SCORE_SUSPICIOUS_PARENT: u32 = 20;
-const SCORE_LOLBIN: u32 = 20;
-const SCORE_UNSIGNED_DLL: u32 = 5;
-const SCORE_EXTERNAL_IP: u32 = 2;
-const SCORE_DNS_QUERY: u32 = 1;
+use crate::config::ScoreWeights;
 
 #[derive(Serialize)]
 struct ScoreReport {
@@ -1277,17 +1332,17 @@ struct ScoreBreakdown {
 }
 
 impl ScoreBreakdown {
-    fn total(&self) -> u32 {
-        self.detections * SCORE_DETECTION
-            + if self.suspicious_parent { SCORE_SUSPICIOUS_PARENT } else { 0 }
-            + if self.lolbin { SCORE_LOLBIN } else { 0 }
-            + self.unsigned_dlls * SCORE_UNSIGNED_DLL
-            + self.external_ips * SCORE_EXTERNAL_IP
-            + self.dns_queries * SCORE_DNS_QUERY
+    fn total(&self, w: &ScoreWeights) -> u32 {
+        self.detections * w.detection
+            + if self.suspicious_parent { w.suspicious_parent } else { 0 }
+            + if self.lolbin { w.lolbin } else { 0 }
+            + self.unsigned_dlls * w.unsigned_dll
+            + self.external_ips * w.external_ip
+            + self.dns_queries * w.dns_query
     }
 }
 
-fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
+fn run_score(input: &Path, limit: usize, json: bool, rules: &RulesConfig) -> Result<()> {
     use std::collections::{HashMap, HashSet};
 
     struct ProcAcc {
@@ -1343,7 +1398,7 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
                 });
                 // LOLBin check
                 let child_lower = basename(image_path).to_ascii_lowercase();
-                if LOLBINS.iter().any(|l| child_lower == *l) {
+                if rules.hunt.lolbins.iter().any(|l| child_lower == *l) {
                     acc.breakdown.lolbin = true;
                 }
             }
@@ -1464,8 +1519,8 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
 
         let child_lower = basename(&pc.image_path).to_ascii_lowercase();
         let parent_lower = parent_name.to_ascii_lowercase();
-        if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
-            && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+        if rules.hunt.suspicious_parents.iter().any(|p| parent_lower == *p)
+            && rules.hunt.suspicious_children.iter().any(|c| child_lower == *c)
         {
             if let Some(acc) = acc_map.get_mut(&child_key) {
                 acc.breakdown.suspicious_parent = true;
@@ -1474,12 +1529,13 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
     }
 
     // Finalize counts and scores.
+    let weights = &rules.score;
     let mut scored: Vec<ScoredProcess> = acc_map
         .into_iter()
         .map(|(key, mut acc)| {
             acc.breakdown.external_ips = acc.unique_ips.len() as u32;
             acc.breakdown.dns_queries = acc.unique_domains.len() as u32;
-            let score = acc.breakdown.total();
+            let score = acc.breakdown.total(weights);
             ScoredProcess {
                 process_key: key,
                 pid: acc.pid,
@@ -1532,34 +1588,34 @@ fn run_score(input: &Path, limit: usize, json: bool) -> Result<()> {
             signals.push(format!(
                 "{}x detection (+{})",
                 p.breakdown.detections,
-                p.breakdown.detections * SCORE_DETECTION
+                p.breakdown.detections * weights.detection
             ));
         }
         if p.breakdown.suspicious_parent {
-            signals.push(format!("suspicious parent (+{SCORE_SUSPICIOUS_PARENT})"));
+            signals.push(format!("suspicious parent (+{})", weights.suspicious_parent));
         }
         if p.breakdown.lolbin {
-            signals.push(format!("LOLBin (+{SCORE_LOLBIN})"));
+            signals.push(format!("LOLBin (+{})", weights.lolbin));
         }
         if p.breakdown.unsigned_dlls > 0 {
             signals.push(format!(
                 "{}x unsigned DLL (+{})",
                 p.breakdown.unsigned_dlls,
-                p.breakdown.unsigned_dlls * SCORE_UNSIGNED_DLL
+                p.breakdown.unsigned_dlls * weights.unsigned_dll
             ));
         }
         if p.breakdown.external_ips > 0 {
             signals.push(format!(
                 "{} external IP(s) (+{})",
                 p.breakdown.external_ips,
-                p.breakdown.external_ips * SCORE_EXTERNAL_IP
+                p.breakdown.external_ips * weights.external_ip
             ));
         }
         if p.breakdown.dns_queries > 0 {
             signals.push(format!(
                 "{} DNS query(s) (+{})",
                 p.breakdown.dns_queries,
-                p.breakdown.dns_queries * SCORE_DNS_QUERY
+                p.breakdown.dns_queries * weights.dns_query
             ));
         }
         writeln!(out, "              {}", signals.join(", "))?;
@@ -1824,59 +1880,6 @@ fn parse_hash_field(field: &str) -> Vec<String> {
 
 const HUNT_RULES: &[&str] = &["suspicious-parent", "lolbin", "unsigned-dll", "beaconing"];
 
-/// LOLBins — legitimate Windows binaries commonly abused by adversaries.
-const LOLBINS: &[&str] = &[
-    "certutil.exe",
-    "mshta.exe",
-    "regsvr32.exe",
-    "rundll32.exe",
-    "wscript.exe",
-    "cscript.exe",
-    "msiexec.exe",
-    "bitsadmin.exe",
-    "wmic.exe",
-    "msbuild.exe",
-    "installutil.exe",
-    "regasm.exe",
-    "regsvcs.exe",
-    "cmstp.exe",
-    "esentutl.exe",
-    "expand.exe",
-    "extrac32.exe",
-    "hh.exe",
-    "ieexec.exe",
-    "makecab.exe",
-    "replace.exe",
-];
-
-/// Parent images that should not normally spawn shells/scripting engines.
-const SUSPICIOUS_PARENTS: &[&str] = &[
-    "winword.exe",
-    "excel.exe",
-    "powerpnt.exe",
-    "outlook.exe",
-    "msaccess.exe",
-    "mspub.exe",
-    "visio.exe",
-    "onenote.exe",
-    "acrobat.exe",
-    "acrord32.exe",
-];
-
-/// Children that are suspicious when spawned from office/document apps.
-const SUSPICIOUS_CHILDREN: &[&str] = &[
-    "cmd.exe",
-    "powershell.exe",
-    "pwsh.exe",
-    "wscript.exe",
-    "cscript.exe",
-    "mshta.exe",
-    "regsvr32.exe",
-    "rundll32.exe",
-    "certutil.exe",
-    "bitsadmin.exe",
-];
-
 #[derive(Serialize)]
 struct HuntReport {
     total_events: u64,
@@ -1896,7 +1899,7 @@ struct HuntFinding {
     timestamp: String,
 }
 
-fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -> Result<()> {
+fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, rules: &RulesConfig) -> Result<()> {
     use std::collections::HashMap;
 
     if let Some(r) = rule_filter {
@@ -1967,7 +1970,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
                 if run_rule("lolbin") {
                     let child_name = basename(image_path);
                     let child_lower = child_name.to_ascii_lowercase();
-                    if LOLBINS.iter().any(|l| child_lower == *l) {
+                    if rules.hunt.lolbins.iter().any(|l| child_lower == *l) {
                         findings.push(HuntFinding {
                             rule: "lolbin".into(),
                             severity: "Medium".into(),
@@ -2074,8 +2077,8 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
             let child_name = basename(&pc.image_path);
             let parent_lower = parent_name.to_ascii_lowercase();
             let child_lower = child_name.to_ascii_lowercase();
-            if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
-                && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+            if rules.hunt.suspicious_parents.iter().any(|p| parent_lower == *p)
+                && rules.hunt.suspicious_children.iter().any(|c| child_lower == *c)
             {
                 findings.push(HuntFinding {
                     rule: "suspicious-parent".into(),
@@ -2097,9 +2100,8 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool) -
     // Post-processing: beaconing detection
     // Flag connections to the same IP from the same process ≥ threshold
     if run_rule("beaconing") {
-        let beacon_threshold: usize = 10;
         for (key, acc) in &beacon_map {
-            if acc.timestamps.len() >= beacon_threshold {
+            if acc.timestamps.len() >= rules.hunt.beaconing_threshold {
                 let dst = key.split('|').next().unwrap_or("?");
                 let earliest = acc
                     .timestamps
@@ -2866,7 +2868,7 @@ struct AlertEvent {
     timestamp: String,
 }
 
-fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Result<()> {
+fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules: &RulesConfig) -> Result<()> {
     use std::collections::{HashMap, HashSet};
     use std::io::{Seek, SeekFrom};
     use std::time::Instant;
@@ -2988,7 +2990,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         // LOLBin check
                         let child_name = basename(image_path);
                         let child_lower = child_name.to_ascii_lowercase();
-                        if LOLBINS.iter().any(|l| child_lower == *l) {
+                        if rules.hunt.lolbins.iter().any(|l| child_lower == *l) {
                             acc.breakdown.lolbin = true;
                             let dedup = format!("{key}|lolbin");
                             if should_emit(&dedup, &mut seen, cooldown) {
@@ -3014,8 +3016,8 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         if let Some((_, parent_image, parent_ts)) = pid_to_proc.get(ppid) {
                             let parent_lower = basename(parent_image).to_ascii_lowercase();
                             if *parent_ts <= event.timestamp
-                                && SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
-                                && SUSPICIOUS_CHILDREN.iter().any(|c| child_lower == *c)
+                                && rules.hunt.suspicious_parents.iter().any(|p| parent_lower == *p)
+                                && rules.hunt.suspicious_children.iter().any(|c| child_lower == *c)
                             {
                                 acc.breakdown.suspicious_parent = true;
                                 let dedup = format!("{key}|suspicious-parent");
@@ -3042,7 +3044,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         } else {
                             // Parent not yet seen — queue for retroactive check.
                             let child_lower_check = child_lower.clone();
-                            if SUSPICIOUS_CHILDREN.iter().any(|c| child_lower_check == *c) {
+                            if rules.hunt.suspicious_children.iter().any(|c| child_lower_check == *c) {
                                 pending_children
                                     .entry(*ppid)
                                     .or_default()
@@ -3064,7 +3066,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         // Retroactive check: if this process is a suspicious
                         // parent, check any pending children that were waiting.
                         let self_lower = basename(image_path).to_ascii_lowercase();
-                        if SUSPICIOUS_PARENTS.iter().any(|p| self_lower == *p) {
+                        if rules.hunt.suspicious_parents.iter().any(|p| self_lower == *p) {
                             if let Some(children) = pending_children.remove(pid) {
                                 for pc in children {
                                     // Guard: parent must have been created
@@ -3278,7 +3280,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                     if let Some(acc) = acc_map.get_mut(key.as_str()) {
                         acc.breakdown.external_ips = acc.unique_ips.len() as u32;
                         acc.breakdown.dns_queries = acc.unique_domains.len() as u32;
-                        let current_score = acc.breakdown.total();
+                        let current_score = acc.breakdown.total(&rules.score);
                         if current_score >= threshold {
                             let dedup = format!("{key}|score-threshold");
                             if should_emit(&dedup, &mut seen, cooldown) {

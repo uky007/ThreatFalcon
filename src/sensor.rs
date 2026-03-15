@@ -292,6 +292,7 @@ mod tests {
             collectors: CollectorConfig::default(),
             health_interval_secs: 60,
             state_path: dir.path().join("test.state"),
+            rules: RulesConfig::default(),
         }
     }
 
