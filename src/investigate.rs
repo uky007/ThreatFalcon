@@ -446,18 +446,38 @@ pub fn run(command: Command) -> Result<()> {
 }
 
 /// Load `RulesConfig` from an optional TOML config path.
-/// When `None`, returns the built-in defaults.
+/// When `None`, tries to auto-discover `threatfalcon.toml` in the usual
+/// locations (cwd, then platform base dir). Falls back to built-in defaults
+/// if no file is found.
 fn load_rules_config(path: Option<&Path>) -> Result<RulesConfig> {
-    match path {
+    let resolved = match path {
+        Some(p) => Some(p.to_path_buf()),
+        None => crate::config::find_config_file(None),
+    };
+    match resolved {
         Some(p) => {
-            let content = std::fs::read_to_string(p)
+            let content = std::fs::read_to_string(&p)
                 .with_context(|| format!("cannot read config: {}", p.display()))?;
             let cfg: SensorConfig = toml::from_str(&content)
                 .with_context(|| format!("invalid config: {}", p.display()))?;
-            Ok(cfg.rules)
+            Ok(normalize_rules(cfg.rules))
         }
         None => Ok(RulesConfig::default()),
     }
+}
+
+/// Normalize rule string values to lowercase for case-insensitive matching.
+fn normalize_rules(mut rules: RulesConfig) -> RulesConfig {
+    for s in &mut rules.hunt.lolbins {
+        *s = s.to_ascii_lowercase();
+    }
+    for s in &mut rules.hunt.suspicious_parents {
+        *s = s.to_ascii_lowercase();
+    }
+    for s in &mut rules.hunt.suspicious_children {
+        *s = s.to_ascii_lowercase();
+    }
+    rules
 }
 
 // ---------------------------------------------------------------------------

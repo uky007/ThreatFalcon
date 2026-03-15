@@ -3237,3 +3237,44 @@ fn alert_uses_config_threshold() {
         "score-threshold should NOT fire when threshold=200, got: {stdout}",
     );
 }
+
+#[test]
+fn hunt_config_case_insensitive() {
+    // Config values written in mixed case should still match.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let config_path = dir.path().join("threatfalcon.toml");
+
+    // Write "CertUtil.exe" in Windows-natural casing.
+    fs::write(
+        &config_path,
+        "[rules.hunt]\nlolbins = [\"CertUtil.exe\"]\n",
+    ).unwrap();
+
+    let lines = [
+        sample_process_create_key(
+            "f0000000-0000-0000-0000-000000000001", 100, 1,
+            "C:/Windows/System32/certutil.exe", "certutil.exe -urlcache",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args([
+            "hunt", "--input", path.to_str().unwrap(),
+            "--config", config_path.to_str().unwrap(),
+            "--rule", "lolbin", "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = parsed["findings"].as_array().unwrap();
+    assert!(
+        !findings.is_empty(),
+        "CertUtil.exe in config should match certutil.exe in events (case-insensitive), got: {stdout}",
+    );
+}

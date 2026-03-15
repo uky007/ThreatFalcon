@@ -240,7 +240,7 @@ pub struct EvasionConfig {
 /// tests to avoid mutating the process-global cwd). When `None`, the real
 /// current directory is checked. The platform base dir (ProgramData on
 /// Windows) is always checked second.
-fn find_config_file(cwd_override: Option<&std::path::Path>) -> Option<PathBuf> {
+pub fn find_config_file(cwd_override: Option<&std::path::Path>) -> Option<PathBuf> {
     let cwd_path = match cwd_override {
         Some(dir) => dir.join(CONFIG_FILE),
         None => PathBuf::from(CONFIG_FILE),
