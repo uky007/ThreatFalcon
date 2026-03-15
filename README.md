@@ -20,7 +20,10 @@ ThreatFalcon is early-stage software.
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
 - Process context enrichment provides stable process identity across PID reuse
-- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`, `hunt`, `score`) reads JSONL output directly
+- Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`, `hunt`, `score`, `alert`, `replay`) reads JSONL output directly
+- Real-time detection monitoring (`alert`) with hunt rule evaluation, per-process scoring, deduplication, and webhook output
+- JSONL event replay (`replay`) with speed control for offline testing and rule tuning
+- Hunt/score/alert rule parameters are configurable via `[rules]` in `threatfalcon.toml`
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
 - The event schema and collector behavior may still change
 
@@ -164,6 +167,8 @@ Commands:
   ioc      Extract indicators of compromise (IPs, domains, hashes)
   hunt     Run threat hunting rules against events
   score    Score processes by threat signals (detections, network, LOLBins, etc.)
+  alert    Monitor events in real time and alert on threat detections
+  replay   Replay saved JSONL events in chronological order with timing
 
 Options:
   --config <PATH>       Path to config file (default: threatfalcon.toml)
@@ -911,6 +916,137 @@ Scoring weights:
 | DNS query | +1 per unique domain | `DnsQuery` events |
 
 Processes with a score of 0 are excluded. Use `--limit` to control the number of results (default: 20).
+
+Hunt, score, and alert subcommands accept `--config` to load rule settings from a TOML file. When `--config` is not specified, `threatfalcon.toml` is auto-discovered using the same lookup path as the sensor. See [Rules Configuration](#rules-configuration) for details.
+
+### Alert
+
+Monitor events in real time and alert on threat detections. Applies hunt rules and per-process scoring to each new event as it arrives:
+
+```bash
+# Follow a live event file and alert on threats
+threatfalcon alert --input events.jsonl
+
+# JSON output for structured processing
+threatfalcon alert --input events.jsonl --json
+
+# Read from stdin (e.g., piped from replay)
+threatfalcon alert --input - --json
+
+# Custom score threshold and cooldown
+threatfalcon alert --input events.jsonl --threshold 60 --cooldown 120
+
+# POST alerts to a webhook endpoint
+threatfalcon alert --input events.jsonl --json \
+  --webhook https://hooks.example.com/alerts \
+  --webhook-token secret123
+
+# Load rule settings from a config file
+threatfalcon alert --input events.jsonl --config threatfalcon.toml --json
+```
+
+Alert types:
+
+| Type | Trigger | Severity |
+|------|---------|----------|
+| `detection` | Evasion detection event with rule metadata | From event |
+| `hunt` / `lolbin` | LOLBin process execution | Medium |
+| `hunt` / `suspicious-parent` | Office/PDF app spawning shell | High |
+| `hunt` / `unsigned-dll` | Unsigned DLL loaded | Low |
+| `score` / `score-threshold` | Process score reaches threshold | High |
+
+Key features:
+
+- **File follow mode**: seeks to end of file, watches for new events, handles file rotation
+- **Stdin mode** (`--input -`): reads from stdin, exits cleanly on EOF — enables piping from `replay` or other tools
+- **Deduplication**: same `process_key` + `rule` combination is suppressed for `--cooldown` seconds (default: 300)
+- **Suspicious-parent**: works regardless of event order (parent before child or child before parent), with timestamp-based validation to prevent PID-reuse false positives
+- **Webhook output**: `--webhook <URL>` POSTs each alert as JSON to an HTTP endpoint. Delivery runs in a background thread so the alert loop is never blocked. Failures are logged to stderr but do not interrupt processing. Optional `--webhook-token` adds Bearer authentication.
+
+### Replay
+
+Replay saved JSONL events in chronological order with configurable speed control. Events are sorted by timestamp regardless of file order:
+
+```bash
+# Real-time playback
+threatfalcon replay --input captured_events.jsonl
+
+# 10x speed
+threatfalcon replay --input captured_events.jsonl --speed 10
+
+# Instant replay (no delays)
+threatfalcon replay --input captured_events.jsonl --speed 0
+
+# Replay through alert for offline detection testing
+threatfalcon replay --input captured.jsonl --speed 0 | \
+  threatfalcon alert --input - --json
+
+# Full pipeline: replay + alert + webhook
+threatfalcon replay --input captured.jsonl --speed 10 | \
+  threatfalcon alert --input - --json \
+    --config threatfalcon.toml \
+    --webhook https://hooks.example.com/alerts
+```
+
+Options:
+
+| Flag | Description |
+|------|-------------|
+| `--speed <N>` | Playback speed multiplier (default: 1.0 = real time, 0 = instant) |
+
+Output is JSONL to stdout. Progress messages (event count, completion) are printed to stderr. This design enables clean piping to `alert`, `jq`, or other tools.
+
+## Rules Configuration
+
+Hunt rules, score weights, and alert defaults can be configured via the `[rules]` section in `threatfalcon.toml`. All values are optional — omitted fields use built-in defaults.
+
+```toml
+[rules.hunt]
+# Parent images that should not normally spawn shells
+suspicious_parents = [
+  "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+  "msaccess.exe", "mspub.exe", "visio.exe", "onenote.exe",
+  "acrobat.exe", "acrord32.exe",
+]
+
+# Children that are suspicious when spawned from a suspicious parent
+suspicious_children = [
+  "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe",
+  "cscript.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe",
+  "certutil.exe", "bitsadmin.exe",
+]
+
+# LOLBins — legitimate binaries commonly abused
+lolbins = [
+  "certutil.exe", "mshta.exe", "regsvr32.exe", "rundll32.exe",
+  "wscript.exe", "cscript.exe", "msiexec.exe", "bitsadmin.exe",
+  "wmic.exe", "msbuild.exe", "installutil.exe", "regasm.exe",
+  "regsvcs.exe", "cmstp.exe", "esentutl.exe", "expand.exe",
+  "extrac32.exe", "hh.exe", "ieexec.exe", "makecab.exe",
+  "replace.exe",
+]
+
+# Minimum connection count before flagging as beaconing
+beaconing_threshold = 10
+
+[rules.score]
+detection = 40
+suspicious_parent = 20
+lolbin = 20
+unsigned_dll = 5
+external_ip = 2
+dns_query = 1
+
+[rules.alert]
+threshold = 40    # Score threshold for score-based alerts
+cooldown = 300    # Seconds to suppress duplicate alerts
+```
+
+Rule string values (process names) are normalized to lowercase on load, so entries like `WinWord.exe` or `CertUtil.exe` match correctly.
+
+The `hunt`, `score`, and `alert` subcommands accept `--config <path>` to load rule settings from a specific file. When `--config` is not specified, `threatfalcon.toml` is auto-discovered using the same lookup path as the sensor (current directory, then `%ProgramData%\ThreatFalcon\` on Windows). If no config file is found, built-in defaults are used.
+
+CLI flags (`--threshold`, `--cooldown`) override config values when specified.
 
 ## Evasion Detection Rules
 
