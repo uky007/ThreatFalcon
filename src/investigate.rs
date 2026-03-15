@@ -263,7 +263,7 @@ pub enum Command {
         webhook: Option<String>,
 
         /// Bearer token for webhook authentication
-        #[arg(long, value_name = "TOKEN")]
+        #[arg(long, value_name = "TOKEN", requires = "webhook")]
         webhook_token: Option<String>,
     },
 
@@ -2908,15 +2908,39 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
 
     let cooldown = std::time::Duration::from_secs(cooldown_secs);
 
-    // Build webhook client if configured.
-    let webhook_client = webhook.map(|wh| {
-        eprintln!("  webhook: {}", wh.url);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
-        (client, wh)
-    });
+    // Spawn a background webhook sender if configured.
+    // Alerts are sent via a channel so the main loop is never blocked.
+    let (webhook_tx, webhook_handle): (
+        Option<std::sync::mpsc::Sender<String>>,
+        Option<std::thread::JoinHandle<()>>,
+    ) = match webhook {
+        Some(wh) => {
+            eprintln!("  webhook: {}", wh.url);
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let url = wh.url.clone();
+            let token = wh.token.clone();
+            let handle = std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .expect("failed to build HTTP client");
+                for body in rx {
+                    let mut req = client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .body(body);
+                    if let Some(ref token) = token {
+                        req = req.bearer_auth(token);
+                    }
+                    if let Err(e) = req.send() {
+                        eprintln!("webhook error: {e}");
+                    }
+                }
+            });
+            (Some(tx), Some(handle))
+        }
+        None => (None, None),
+    };
 
     let is_stdin = input.as_os_str() == "-";
 
@@ -2999,7 +3023,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
         true
     };
 
-    loop {
+    let result: Result<()> = loop {
         line_buf.clear();
         match reader.read_line(&mut line_buf) {
             Ok(0) => {
@@ -3403,24 +3427,30 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
                     }
                     stdout.flush()?;
 
-                    // POST to webhook if configured.
-                    if let Some((client, wh)) = &webhook_client {
-                        let mut req = client
-                            .post(&wh.url)
-                            .header("Content-Type", "application/json")
-                            .body(serde_json::to_string(alert)?);
-                        if let Some(token) = &wh.token {
-                            req = req.bearer_auth(token);
-                        }
-                        if let Err(e) = req.send() {
-                            eprintln!("webhook error: {e}");
+                    // Send to webhook background thread if configured.
+                    if let Some(ref tx) = webhook_tx {
+                        if let Ok(json_body) = serde_json::to_string(alert) {
+                            let _ = tx.send(json_body);
                         }
                     }
                 }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // Drain webhook before returning error.
+                drop(webhook_tx);
+                if let Some(h) = webhook_handle { let _ = h.join(); }
+                return Err(e.into());
+            }
         }
+    };
+
+    // Drain the webhook sender thread before exiting.
+    drop(webhook_tx);
+    if let Some(h) = webhook_handle {
+        let _ = h.join();
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
