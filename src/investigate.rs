@@ -2900,7 +2900,6 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
         breakdown: ScoreBreakdown,
         unique_ips: HashSet<String>,
         unique_domains: HashSet<String>,
-        threshold_alerted: bool,
     }
     let mut acc_map: HashMap<String, ProcAcc> = HashMap::new();
 
@@ -2910,6 +2909,18 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
     // Parent tracking for suspicious-parent rule (streaming).
     // Maps pid → (process_key, image_path) for the most recent ProcessCreate.
     let mut pid_to_proc: HashMap<u32, (String, String)> = HashMap::new();
+
+    // Pending children whose parent hasn't been seen yet.
+    // Maps ppid → Vec<(child_key, child_name, child_image, command_line, timestamp)>
+    struct PendingChild {
+        key: String,
+        child_name: String,
+        image_path: String,
+        command_line: String,
+        pid: u32,
+        timestamp: String,
+    }
+    let mut pending_children: HashMap<u32, Vec<PendingChild>> = HashMap::new();
 
     let should_emit = |dedup_key: &str, seen: &mut HashMap<String, Instant>, cooldown: std::time::Duration| -> bool {
         let now = Instant::now();
@@ -2971,7 +2982,6 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                             breakdown: ScoreBreakdown::default(),
                             unique_ips: HashSet::new(),
                             unique_domains: HashSet::new(),
-                            threshold_alerted: false,
                         });
 
                         // LOLBin check
@@ -2999,7 +3009,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                             }
                         }
 
-                        // Suspicious-parent check (streaming: look up parent pid)
+                        // Suspicious-parent: forward check (parent already seen)
                         if let Some((_, parent_image)) = pid_to_proc.get(ppid) {
                             let parent_lower = basename(parent_image).to_ascii_lowercase();
                             if SUSPICIOUS_PARENTS.iter().any(|p| parent_lower == *p)
@@ -3027,10 +3037,59 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                                     });
                                 }
                             }
+                        } else {
+                            // Parent not yet seen — queue for retroactive check.
+                            let child_lower_check = child_lower.clone();
+                            if SUSPICIOUS_CHILDREN.iter().any(|c| child_lower_check == *c) {
+                                pending_children
+                                    .entry(*ppid)
+                                    .or_default()
+                                    .push(PendingChild {
+                                        key: key.clone(),
+                                        child_name: child_name.clone(),
+                                        image_path: image_path.clone(),
+                                        command_line: command_line.clone(),
+                                        pid: *pid,
+                                        timestamp: event.timestamp.to_rfc3339(),
+                                    });
+                            }
                         }
 
                         // Update parent tracking
-                        pid_to_proc.insert(*pid, (key, image_path.clone()));
+                        pid_to_proc.insert(*pid, (key.clone(), image_path.clone()));
+
+                        // Retroactive check: if this process is a suspicious
+                        // parent, check any pending children that were waiting.
+                        let self_lower = basename(image_path).to_ascii_lowercase();
+                        if SUSPICIOUS_PARENTS.iter().any(|p| self_lower == *p) {
+                            if let Some(children) = pending_children.remove(pid) {
+                                for pc in children {
+                                    if let Some(child_acc) = acc_map.get_mut(&pc.key) {
+                                        child_acc.breakdown.suspicious_parent = true;
+                                    }
+                                    let dedup = format!("{}|suspicious-parent", pc.key);
+                                    if should_emit(&dedup, &mut seen, cooldown) {
+                                        alerts.push(AlertEvent {
+                                            alert_type: "hunt".into(),
+                                            rule: "suspicious-parent".into(),
+                                            severity: "High".into(),
+                                            mitre: Some("T1204.002".into()),
+                                            process_key: pc.key,
+                                            pid: pc.pid,
+                                            image: pc.image_path,
+                                            detail: format!(
+                                                "{} spawned {} ({})",
+                                                basename(image_path),
+                                                pc.child_name,
+                                                pc.command_line,
+                                            ),
+                                            score: None,
+                                            timestamp: pc.timestamp,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     EventData::EvasionDetected { pid, process_name, .. } => {
@@ -3056,7 +3115,6 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                                 breakdown: ScoreBreakdown::default(),
                                 unique_ips: HashSet::new(),
                                 unique_domains: HashSet::new(),
-                                threshold_alerted: false,
                             });
                             acc.breakdown.detections += 1;
 
@@ -3100,7 +3158,6 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                                 breakdown: ScoreBreakdown::default(),
                                 unique_ips: HashSet::new(),
                                 unique_domains: HashSet::new(),
-                                threshold_alerted: false,
                             });
                             acc.breakdown.unsigned_dlls += 1;
 
@@ -3143,7 +3200,6 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                                 breakdown: ScoreBreakdown::default(),
                                 unique_ips: HashSet::new(),
                                 unique_domains: HashSet::new(),
-                                threshold_alerted: false,
                             });
                             acc.unique_ips.insert(dst_addr.clone());
                         }
@@ -3167,7 +3223,6 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                                 breakdown: ScoreBreakdown::default(),
                                 unique_ips: HashSet::new(),
                                 unique_domains: HashSet::new(),
-                                threshold_alerted: false,
                             });
                             acc.unique_domains.insert(query_name.clone());
                         }
@@ -3216,8 +3271,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool) -> Re
                         acc.breakdown.external_ips = acc.unique_ips.len() as u32;
                         acc.breakdown.dns_queries = acc.unique_domains.len() as u32;
                         let current_score = acc.breakdown.total();
-                        if current_score >= threshold && !acc.threshold_alerted {
-                            acc.threshold_alerted = true;
+                        if current_score >= threshold {
                             let dedup = format!("{key}|score-threshold");
                             if should_emit(&dedup, &mut seen, cooldown) {
                                 alerts.push(AlertEvent {

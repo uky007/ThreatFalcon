@@ -2933,3 +2933,128 @@ fn alert_suspicious_parent() {
     });
     assert!(has_suspicious, "expected suspicious-parent alert, got: {stdout}");
 }
+
+#[test]
+fn alert_suspicious_parent_child_before_parent() {
+    // Child ProcessCreate arrives BEFORE parent — retroactive detection.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args(["alert", "--input", path.to_str().unwrap(), "--json"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Child first (cmd.exe with ppid=500), then parent (winword.exe pid=500).
+    let child_event = sample_process_create_key(
+        "c0000000-0000-0000-0000-000000000001",
+        501, 500,
+        "C:/Windows/System32/cmd.exe",
+        "cmd.exe /c whoami",
+        "2026-03-13T10:00:00Z",
+        "501:8001",
+    );
+    let parent = sample_process_create_key(
+        "c0000000-0000-0000-0000-000000000002",
+        500, 1,
+        "C:/Program Files/Microsoft Office/winword.exe",
+        "winword.exe doc.docx",
+        "2026-03-13T09:59:00Z",
+        "500:8000",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        // Child arrives first!
+        writeln!(f, "{child_event}").unwrap();
+        writeln!(f, "{parent}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let has_suspicious = stdout.lines().any(|l| {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            v["rule"] == "suspicious-parent"
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_suspicious,
+        "expected suspicious-parent alert even when child arrives before parent, got: {stdout}",
+    );
+}
+
+#[test]
+fn alert_score_threshold_re_notifies_after_cooldown() {
+    // Score threshold should re-fire after cooldown expires.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    // Use a very short cooldown (1 second).
+    let mut child = std::process::Command::new(
+        assert_cmd::cargo::cargo_bin("threatfalcon"),
+    )
+    .args([
+        "alert", "--input", path.to_str().unwrap(),
+        "--threshold", "40", "--cooldown", "1", "--json",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // First detection (40 pts → triggers threshold).
+    let event1 = sample_detection_event(
+        "d0000000-0000-0000-0000-000000000001",
+        "TF-EVA-001",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event1}").unwrap();
+    }
+
+    // Wait for cooldown to expire (1s cooldown + margin).
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Second detection (score now 80 → should re-trigger threshold).
+    let event2 = sample_detection_event(
+        "d0000000-0000-0000-0000-000000000002",
+        "TF-EVA-002",
+    );
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{event2}").unwrap();
+    }
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let score_alerts: Vec<&str> = stdout.lines().filter(|l| {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            v["alert_type"] == "score"
+        } else {
+            false
+        }
+    }).collect();
+
+    assert!(
+        score_alerts.len() >= 2,
+        "expected score-threshold to re-fire after cooldown, got {} score alerts: {stdout}",
+        score_alerts.len(),
+    );
+}
