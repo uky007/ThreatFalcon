@@ -3278,3 +3278,195 @@ fn hunt_config_case_insensitive() {
         "CertUtil.exe in config should match certutil.exe in events (case-insensitive), got: {stdout}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Replay subcommand tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_shows_replay_subcommand() {
+    cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("replay"));
+}
+
+#[test]
+fn replay_help() {
+    cmd().args(["replay", "--help"]).assert().success().stdout(
+        predicate::str::contains("--input")
+            .and(predicate::str::contains("--speed")),
+    );
+}
+
+#[test]
+fn replay_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, "").unwrap();
+
+    let output = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("No events"));
+}
+
+#[test]
+fn replay_outputs_all_events_in_order() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Write events out of chronological order.
+    let lines = [
+        sample_process_create_key(
+            "a0000000-0000-0000-0000-000000000002", 200, 1,
+            "C:/b.exe", "b.exe",
+            "2026-03-13T10:00:02Z", "200:2000",
+        ),
+        sample_process_create_key(
+            "a0000000-0000-0000-0000-000000000001", 100, 1,
+            "C:/a.exe", "a.exe",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+        sample_process_create_key(
+            "a0000000-0000-0000-0000-000000000003", 300, 1,
+            "C:/c.exe", "c.exe",
+            "2026-03-13T10:00:01Z", "300:3000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let output_lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(output_lines.len(), 3);
+
+    // Verify chronological order by parsing timestamps.
+    let ts: Vec<String> = output_lines.iter().map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["timestamp"].as_str().unwrap().to_string()
+    }).collect();
+    assert!(ts[0] < ts[1], "first should be before second: {} vs {}", ts[0], ts[1]);
+    assert!(ts[1] < ts[2], "second should be before third: {} vs {}", ts[1], ts[2]);
+}
+
+#[test]
+fn replay_outputs_valid_jsonl() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_key(
+            "a1000001-0000-0000-0000-000000000001", 100, 1,
+            "C:/test.exe", "test.exe",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+        sample_detection_event("a1000001-0000-0000-0000-000000000002", "TF-EVA-001"),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Every line should be valid JSON.
+    for line in stdout.lines() {
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(parsed["id"].is_string());
+        assert!(parsed["timestamp"].is_string());
+    }
+}
+
+#[test]
+fn replay_with_speed_respects_timing() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    // Two events 2 seconds apart.
+    let lines = [
+        sample_process_create_key(
+            "a2000002-0000-0000-0000-000000000001", 100, 1,
+            "C:/a.exe", "a.exe",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+        sample_process_create_key(
+            "a2000002-0000-0000-0000-000000000002", 200, 1,
+            "C:/b.exe", "b.exe",
+            "2026-03-13T10:00:02Z", "200:2000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    // Warm-up run to eliminate cold-start variance.
+    let _ = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+        .output()
+        .unwrap();
+
+    // Run speed=0 (instant) and speed=10 (2s/10 = 0.2s delay).
+    // Compare: speed=10 should take measurably longer than speed=0.
+    let start_instant = std::time::Instant::now();
+    let output = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+        .output()
+        .unwrap();
+    let elapsed_instant = start_instant.elapsed();
+    assert!(output.status.success());
+
+    let start_slow = std::time::Instant::now();
+    let output = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "10"])
+        .output()
+        .unwrap();
+    let elapsed_slow = start_slow.elapsed();
+    assert!(output.status.success());
+
+    // speed=10 should take at least 100ms more than speed=0
+    // (the 2s gap scaled to ~200ms).
+    assert!(
+        elapsed_slow > elapsed_instant + std::time::Duration::from_millis(100),
+        "speed=10 ({}ms) should be slower than speed=0 ({}ms) by >=100ms",
+        elapsed_slow.as_millis(),
+        elapsed_instant.as_millis(),
+    );
+}
+
+#[test]
+fn replay_stderr_shows_progress() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+
+    let lines = [
+        sample_process_create_key(
+            "a3000003-0000-0000-0000-000000000001", 100, 1,
+            "C:/test.exe", "test.exe",
+            "2026-03-13T10:00:00Z", "100:1000",
+        ),
+    ];
+    fs::write(&path, lines.join("\n")).unwrap();
+
+    let output = cmd()
+        .args(["replay", "--input", path.to_str().unwrap(), "--speed", "0"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Replaying 1 events"), "expected progress in stderr, got: {stderr}");
+    assert!(stderr.contains("complete"), "expected completion in stderr, got: {stderr}");
+}

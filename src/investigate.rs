@@ -259,6 +259,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Replay saved JSONL events in chronological order with timing
+    Replay {
+        /// Path to JSONL event file
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+
+        /// Playback speed multiplier (default: 1.0 = real time, 0 = instant)
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
+    },
+
     /// Follow new events appended to a JSONL file (like tail -f)
     Tail {
         /// Path to JSONL event file
@@ -413,6 +424,8 @@ pub fn run(command: Command) -> Result<()> {
             let cooldown = cooldown.unwrap_or(rules.alert.cooldown);
             run_alert(&input, threshold, cooldown, json, &rules)
         }
+
+        Command::Replay { input, speed } => run_replay(&input, speed),
 
         Command::Tail {
             input,
@@ -3338,6 +3351,69 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+fn run_replay(input: &Path, speed: f64) -> Result<()> {
+    if speed < 0.0 {
+        anyhow::bail!("--speed must be non-negative (0 = instant, 1.0 = real time)");
+    }
+
+    let mut events: Vec<(String, DateTime<Utc>)> = Vec::new();
+
+    let file = std::fs::File::open(input)
+        .with_context(|| format!("cannot open {}", input.display()))?;
+    let reader = std::io::BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<ThreatEvent>(&line) {
+            events.push((line, event.timestamp));
+        }
+    }
+
+    if events.is_empty() {
+        eprintln!("No events to replay.");
+        return Ok(());
+    }
+
+    // Sort by timestamp.
+    events.sort_by_key(|(_, ts)| *ts);
+
+    eprintln!(
+        "Replaying {} events (speed: {}x)",
+        events.len(),
+        if speed == 0.0 { "instant".to_string() } else { format!("{speed}") },
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    let mut prev_ts: Option<DateTime<Utc>> = None;
+
+    for (line, ts) in &events {
+        // Sleep for the scaled inter-event gap.
+        if speed > 0.0 {
+            if let Some(prev) = prev_ts {
+                let gap = (*ts - prev).to_std().unwrap_or_default();
+                if !gap.is_zero() {
+                    let scaled = gap.div_f64(speed);
+                    std::thread::sleep(scaled);
+                }
+            }
+        }
+        prev_ts = Some(*ts);
+
+        writeln!(stdout, "{line}")?;
+        stdout.flush()?;
+    }
+
+    eprintln!("Replay complete.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
