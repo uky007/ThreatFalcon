@@ -331,6 +331,7 @@ detect_etw_patching = true
 detect_amsi_bypass = true
 detect_unhooking = true
 detect_direct_syscall = true
+detect_indirect_syscall = true
 ```
 
 ETW provider `keywords` can be specified as a hex string (`"0xFFFFFFFFFFFFFFFF"`) or an integer.
@@ -1058,6 +1059,7 @@ The evasion collector periodically scans running processes for EDR evasion techn
 | TF-EVA-002 | AMSI Scan Buffer Bypass | `amsi!AmsiScanBuffer` patched to return clean | T1562.001 | High/Medium |
 | TF-EVA-003 | ntdll User-Mode Hook Removal | ntdll `.text` replaced with clean on-disk copy | T1562.001 | Medium |
 | TF-EVA-004 | Suspicious Direct Syscall Stub | `syscall`/`int 0x2e` stubs in non-system module | T1562.001 | Medium |
+| TF-EVA-005 | Suspicious Indirect Syscall Stub | Indirect branch after syscall prologue in non-system module | T1562.001 | Low |
 
 ### TF-EVA-004: Direct Syscall Detection
 
@@ -1071,6 +1073,22 @@ syscall / int 0x2e  ; 0F 05 or CD 2E
 ```
 
 The scanner enumerates loaded modules per process, skips system DLLs that legitimately contain syscall stubs (ntdll.dll, win32u.dll — verified by full path to `System32`/`SysWOW64`, not just basename), parses each module's PE headers to locate the `.text` section by RVA and characteristics, and matches the stub pattern. Evidence includes the module name, stub offset, SSN value, and raw bytes.
+
+### TF-EVA-005: Indirect Syscall Detection
+
+Indirect syscall tools (SysWhispers3, HellsGate, HalosGate, RecycledGate) resolve the SSN and the address of the `syscall` instruction inside ntdll at runtime, then dispatch via an **indirect branch** so that the actual `syscall` executes from a legitimate system module. This bypasses user-mode hooks and evades TF-EVA-004's direct stub detection.
+
+TF-EVA-005 uses the same prologue detection as TF-EVA-004 but matches indirect branches instead of `syscall`/`int 0x2e`:
+
+```
+mov r10, rcx              ; 4C 8B D1 or 49 89 CA
+mov eax, <SSN>            ; B8 xx xx xx xx
+jmp reg / jmp [mem]       ; FF /4 variants (indirect branch)
+```
+
+Only true indirect branches (`FF /4` — register or memory operand targets) are matched. Relative branches (`E9` jmp rel32, `EB` jmp rel8) are excluded because they encode a fixed offset and are commonly used for intra-module tail calls, producing false positives.
+
+**Limitations:** This is a heuristic match. The sensor does not verify that the branch target falls within ntdll's address range. Tail-call thunks, vtable dispatch, or other indirect jump patterns in the same module may produce false positives. Confidence is set to **Low** to reflect this.
 
 Function locations for ETW patching (`EtwEventWrite`) and AMSI bypass (`AmsiScanBuffer`) detection are resolved from the on-disk PE export table at scanner startup, eliminating per-process `GetProcAddress` calls and enabling AMSI detection even when the sensor process does not have `amsi.dll` loaded.
 

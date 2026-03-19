@@ -339,6 +339,7 @@ pub enum EvasionTechnique {
     AmsiBypass,
     NtdllUnhooking,
     DirectSyscall,
+    IndirectSyscall,
     ProcessHollowing,
     ProcessHerpaderping,
     DllSearchOrderHijack,

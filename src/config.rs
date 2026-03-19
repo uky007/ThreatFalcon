@@ -232,6 +232,7 @@ pub struct EvasionConfig {
     pub detect_amsi_bypass: bool,
     pub detect_unhooking: bool,
     pub detect_direct_syscall: bool,
+    pub detect_indirect_syscall: bool,
 }
 
 /// Search for `CONFIG_FILE` in a list of candidate directories.
@@ -426,6 +427,7 @@ impl Default for EvasionConfig {
             detect_amsi_bypass: true,
             detect_unhooking: true,
             detect_direct_syscall: true,
+            detect_indirect_syscall: true,
         }
     }
 }

@@ -62,6 +62,18 @@ enum SyscallInstruction {
     Syscall,
     /// `int 0x2e` — opcode CD 2E
     Int2E,
+    /// Indirect branch (`FF /4` — jmp via register or memory operand).
+    /// Heuristic indicator of indirect syscall dispatch; branch target
+    /// is not verified by the scanner.
+    IndirectJmp,
+}
+
+impl SyscallInstruction {
+    /// True if the instruction is an indirect branch (heuristic for indirect syscall).
+    #[allow(dead_code)]
+    fn is_indirect(&self) -> bool {
+        matches!(self, Self::IndirectJmp)
+    }
 }
 
 impl std::fmt::Display for SyscallInstruction {
@@ -69,6 +81,7 @@ impl std::fmt::Display for SyscallInstruction {
         match self {
             Self::Syscall => write!(f, "syscall (0F 05)"),
             Self::Int2E => write!(f, "int 0x2e (CD 2E)"),
+            Self::IndirectJmp => write!(f, "jmp <target> (indirect syscall)"),
         }
     }
 }
@@ -133,25 +146,49 @@ fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
             data[i + 7],
         ]);
 
-        // Step 3: scan forward for syscall/int 0x2e within MAX_GAP
+        // Step 3: scan forward for syscall/int 0x2e/jmp within MAX_GAP
         let scan_end = (i + 8 + MAX_GAP).min(data.len().saturating_sub(1));
         let mut found = false;
         for j in (i + 8)..=scan_end {
             if j + 1 >= data.len() {
                 break;
             }
+
+            // Direct syscall instructions
             let instr = if data[j] == 0x0F && data[j + 1] == 0x05 {
-                Some(SyscallInstruction::Syscall)
+                Some((SyscallInstruction::Syscall, j + 2))
             } else if data[j] == 0xCD && data[j + 1] == 0x2E {
-                Some(SyscallInstruction::Int2E)
+                Some((SyscallInstruction::Int2E, j + 2))
+            }
+            // Indirect syscall: FF-prefixed jmp r/m64 (FF /4)
+            //
+            // Only *indirect* branches (target resolved via register or
+            // memory operand) are matched.  Relative branches (E9/EB)
+            // are excluded — they encode a fixed offset and cannot
+            // reliably target ntdll across ASLR'd address spaces;
+            // matching them would false-positive on normal intra-module
+            // tail calls and trampolines.
+            else if data[j] == 0xFF && j + 2 <= data.len() {
+                detect_ff_jmp(data, j)
+            }
+            // Indirect syscall: REX.B + FF jmp r/m64 (41 FF /4)
+            // for jmp r8-r15
+            else if data[j] == 0x41
+                && j + 3 <= data.len()
+                && data[j + 1] == 0xFF
+            {
+                detect_rex_b_ff_jmp(data, j)
             } else {
                 None
             };
 
-            if let Some(instruction) = instr {
-                let mut end = j + 2;
-                // Include trailing ret (C3) if present
-                if end < data.len() && data[end] == 0xC3 {
+            if let Some((instruction, end_after_instr)) = instr {
+                let mut end = end_after_instr;
+                // Include trailing ret (C3) if present (direct stubs)
+                if !instruction.is_indirect()
+                    && end < data.len()
+                    && data[end] == 0xC3
+                {
                     end += 1;
                 }
                 matches.push(SyscallStubMatch {
@@ -172,6 +209,128 @@ fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
     }
 
     matches
+}
+
+/// Detect `FF /4` (jmp r/m64) at position `j` in `data`.
+///
+/// Returns `(IndirectJmp, end_offset)` if the ModRM byte encodes a jmp.
+/// Handles register-direct (FF E0-E7), RIP-relative (FF 25), SIB-based
+/// (e.g. FF 64 24 xx for `jmp [rsp+disp8]`), and other addressing modes.
+#[allow(dead_code)]
+fn detect_ff_jmp(data: &[u8], j: usize) -> Option<(SyscallInstruction, usize)> {
+    if j + 2 > data.len() {
+        return None;
+    }
+    let modrm = data[j + 1];
+    let reg_field = (modrm >> 3) & 7;
+    if reg_field != 4 {
+        // Not jmp — /4 is the opcode extension for jmp r/m64
+        return None;
+    }
+
+    let mod_field = modrm >> 6;
+    let rm = modrm & 7;
+
+    let end = match mod_field {
+        // mod=11: register direct — jmp reg (FF E0-E7)
+        // Exclude FF E4 (jmp rsp) — not useful for syscall dispatch
+        3 => {
+            if rm == 4 {
+                return None;
+            }
+            j + 2
+        }
+        // mod=00: [reg] or special cases
+        0 => {
+            if rm == 5 {
+                // [rip+disp32] — FF 25 xx xx xx xx
+                if j + 6 > data.len() {
+                    return None;
+                }
+                j + 6
+            } else if rm == 4 {
+                // SIB byte follows — FF 24 SIB [+disp depending on SIB.base]
+                if j + 3 > data.len() {
+                    return None;
+                }
+                let sib = data[j + 2];
+                let base = sib & 7;
+                if base == 5 {
+                    // [disp32] — SIB with base=5 and mod=00
+                    if j + 7 > data.len() {
+                        return None;
+                    }
+                    j + 7
+                } else {
+                    j + 3
+                }
+            } else {
+                // [reg] — 2 bytes total
+                j + 2
+            }
+        }
+        // mod=01: [reg+disp8] or [SIB+disp8]
+        1 => {
+            if rm == 4 {
+                // SIB + disp8 — e.g. FF 64 24 38 = jmp [rsp+38h]
+                if j + 4 > data.len() {
+                    return None;
+                }
+                j + 4
+            } else {
+                // [reg+disp8]
+                if j + 3 > data.len() {
+                    return None;
+                }
+                j + 3
+            }
+        }
+        // mod=10: [reg+disp32] or [SIB+disp32]
+        2 => {
+            if rm == 4 {
+                // SIB + disp32
+                if j + 7 > data.len() {
+                    return None;
+                }
+                j + 7
+            } else {
+                // [reg+disp32]
+                if j + 6 > data.len() {
+                    return None;
+                }
+                j + 6
+            }
+        }
+        _ => return None,
+    };
+
+    Some((SyscallInstruction::IndirectJmp, end))
+}
+
+/// Detect `41 FF /4` (REX.B + jmp r/m64) at position `j` for `jmp r8`-`jmp r15`.
+#[allow(dead_code)]
+fn detect_rex_b_ff_jmp(
+    data: &[u8],
+    j: usize,
+) -> Option<(SyscallInstruction, usize)> {
+    if j + 3 > data.len() {
+        return None;
+    }
+    // data[j] == 0x41 (REX.B), data[j+1] == 0xFF already checked by caller
+    let modrm = data[j + 2];
+    let reg_field = (modrm >> 3) & 7;
+    if reg_field != 4 {
+        return None;
+    }
+    let mod_field = modrm >> 6;
+    if mod_field == 3 {
+        // register direct: jmp r8..r15 (3 bytes: 41 FF E0-E7)
+        Some((SyscallInstruction::IndirectJmp, j + 3))
+    } else {
+        // Memory-operand forms with REX.B are uncommon for indirect
+        // syscalls; skip for now to avoid false positives.
+        None
+    }
 }
 
 /// Detect known AMSI bypass patterns in the first bytes of AmsiScanBuffer.
@@ -333,10 +492,17 @@ mod platform {
                     }
                 }
 
-                if config.detect_direct_syscall {
-                    if let Some(evt) =
-                        check_direct_syscall(handle, *pid, agent)
-                    {
+                if config.detect_direct_syscall
+                    || config.detect_indirect_syscall
+                {
+                    let evts = check_syscall_stubs(
+                        handle,
+                        *pid,
+                        agent,
+                        config.detect_direct_syscall,
+                        config.detect_indirect_syscall,
+                    );
+                    for evt in evts {
                         if let Err(e) = tx.try_send(evt) {
                             dropped.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(error = %e, "Evasion event dropped");
@@ -837,11 +1003,24 @@ mod platform {
     /// Maximum bytes to read from a remote module's .text section.
     const MAX_TEXT_READ: usize = 1024 * 1024; // 1 MB
 
-    fn check_direct_syscall(
+    /// Scan all modules of a process for direct and indirect syscall stubs.
+    ///
+    /// Returns up to two events: one for direct stubs (TF-EVA-004) and
+    /// one for indirect stubs (TF-EVA-005). Both use the same prologue
+    /// detection (`mov r10, rcx; mov eax, SSN`) but differ in the
+    /// dispatching instruction: direct stubs use `syscall`/`int 0x2e`,
+    /// while indirect stubs use an indirect branch (`FF /4`) that is
+    /// consistent with — but not verified to target — the syscall
+    /// gadget inside ntdll.
+    fn check_syscall_stubs(
         handle: HANDLE,
         pid: u32,
         agent: &crate::events::AgentInfo,
-    ) -> Option<ThreatEvent> {
+        want_direct: bool,
+        want_indirect: bool,
+    ) -> Vec<ThreatEvent> {
+        let mut events = Vec::new();
+
         let mut modules = [HMODULE::default(); 1024];
         let mut needed = 0u32;
         unsafe {
@@ -853,14 +1032,25 @@ mod platform {
             )
             .is_err()
             {
-                return None;
+                return events;
             }
         }
 
         let count =
             needed as usize / std::mem::size_of::<HMODULE>();
 
+        // Track whether we've already emitted each type so we return
+        // at most one event per type per process.
+        let mut found_direct = false;
+        let mut found_indirect = false;
+
         for m in &modules[..count] {
+            if (!want_direct || found_direct)
+                && (!want_indirect || found_indirect)
+            {
+                break;
+            }
+
             let mut name_buf = [0u8; 260];
             let len = unsafe {
                 GetModuleBaseNameA(handle, *m, &mut name_buf)
@@ -872,9 +1062,6 @@ mod platform {
                 std::str::from_utf8(&name_buf[..len as usize])
                     .unwrap_or("");
 
-            // Skip DLLs that legitimately contain syscall stubs,
-            // but only if they're actually loaded from a system
-            // directory (prevents side-loaded same-name bypasses).
             if is_system_syscall_module(handle, *m, mod_name) {
                 continue;
             }
@@ -891,65 +1078,149 @@ mod platform {
                 continue;
             }
 
-            let first = &stubs[0];
-            let evidence = vec![
-                format!(
-                    "module: {} at base 0x{:X}",
-                    mod_name, module_base
-                ),
-                format!(
-                    "{} syscall stub(s) found in .text section",
-                    stubs.len()
-                ),
-                format!(
-                    "first stub at .text+0x{:X}: {}",
-                    first.offset, first.instruction
-                ),
-                format!("SSN: 0x{:X}", first.ssn),
-                format!("stub bytes: {:02X?}", first.raw_bytes),
-            ];
+            // Partition stubs into direct and indirect
+            let direct_stubs: Vec<_> = stubs
+                .iter()
+                .filter(|s| !s.instruction.is_indirect())
+                .collect();
+            let indirect_stubs: Vec<_> = stubs
+                .iter()
+                .filter(|s| s.instruction.is_indirect())
+                .collect();
 
-            return Some(ThreatEvent::with_rule(
-                agent,
-                EventSource::EvasionDetector,
-                EventCategory::Evasion,
-                Severity::High,
-                EventData::EvasionDetected {
-                    technique: EvasionTechnique::DirectSyscall,
-                    pid: Some(pid),
-                    process_name: None,
-                    details: format!(
-                        "{} suspicious direct syscall stub(s) \
-                         found in non-system module {}",
-                        stubs.len(),
-                        mod_name,
+            // Emit TF-EVA-004 for direct syscall stubs
+            if want_direct && !found_direct && !direct_stubs.is_empty() {
+                let first = &direct_stubs[0];
+                let evidence = vec![
+                    format!(
+                        "module: {} at base 0x{:X}",
+                        mod_name, module_base
                     ),
-                },
-                RuleMetadata {
-                    id: "TF-EVA-004".into(),
-                    name: "Suspicious Direct Syscall Stub".into(),
-                    description: "A non-system module contains \
-                        syscall/int 0x2e instruction sequences \
-                        with the mov r10,rcx; mov eax,SSN prologue \
-                        characteristic of tools like SysWhispers. \
-                        This pattern is commonly used to invoke \
-                        system calls without going through ntdll, \
-                        but the sensor has not confirmed execution."
-                        .into(),
-                    mitre: MitreRef {
-                        tactic: "Defense Evasion".into(),
-                        technique_id: "T1562.001".into(),
-                        technique_name:
-                            "Impair Defenses: Disable or Modify Tools"
-                                .into(),
+                    format!(
+                        "{} direct syscall stub(s) found in .text section",
+                        direct_stubs.len()
+                    ),
+                    format!(
+                        "first stub at .text+0x{:X}: {}",
+                        first.offset, first.instruction
+                    ),
+                    format!("SSN: 0x{:X}", first.ssn),
+                    format!("stub bytes: {:02X?}", first.raw_bytes),
+                ];
+                events.push(ThreatEvent::with_rule(
+                    agent,
+                    EventSource::EvasionDetector,
+                    EventCategory::Evasion,
+                    Severity::High,
+                    EventData::EvasionDetected {
+                        technique: EvasionTechnique::DirectSyscall,
+                        pid: Some(pid),
+                        process_name: None,
+                        details: format!(
+                            "{} suspicious direct syscall stub(s) \
+                             found in non-system module {}",
+                            direct_stubs.len(),
+                            mod_name,
+                        ),
                     },
-                    confidence: Confidence::Medium,
-                    evidence,
-                },
-            ));
+                    RuleMetadata {
+                        id: "TF-EVA-004".into(),
+                        name: "Suspicious Direct Syscall Stub".into(),
+                        description: "A non-system module contains \
+                            syscall/int 0x2e instruction sequences \
+                            with the mov r10,rcx; mov eax,SSN prologue \
+                            characteristic of tools like SysWhispers. \
+                            This pattern is commonly used to invoke \
+                            system calls without going through ntdll, \
+                            but the sensor has not confirmed execution."
+                            .into(),
+                        mitre: MitreRef {
+                            tactic: "Defense Evasion".into(),
+                            technique_id: "T1562.001".into(),
+                            technique_name:
+                                "Impair Defenses: Disable or Modify Tools"
+                                    .into(),
+                        },
+                        confidence: Confidence::Medium,
+                        evidence,
+                    },
+                ));
+                found_direct = true;
+            }
+
+            // Emit TF-EVA-005 for indirect syscall stubs
+            if want_indirect
+                && !found_indirect
+                && !indirect_stubs.is_empty()
+            {
+                let first = &indirect_stubs[0];
+                let evidence = vec![
+                    format!(
+                        "module: {} at base 0x{:X}",
+                        mod_name, module_base
+                    ),
+                    format!(
+                        "{} indirect syscall stub(s) found in .text section",
+                        indirect_stubs.len()
+                    ),
+                    format!(
+                        "first stub at .text+0x{:X}: {}",
+                        first.offset, first.instruction
+                    ),
+                    format!("SSN: 0x{:X}", first.ssn),
+                    format!("stub bytes: {:02X?}", first.raw_bytes),
+                ];
+                events.push(ThreatEvent::with_rule(
+                    agent,
+                    EventSource::EvasionDetector,
+                    EventCategory::Evasion,
+                    Severity::High,
+                    EventData::EvasionDetected {
+                        technique: EvasionTechnique::IndirectSyscall,
+                        pid: Some(pid),
+                        process_name: None,
+                        details: format!(
+                            "{} suspicious indirect syscall stub(s) \
+                             (jmp-based dispatch) found in non-system \
+                             module {}",
+                            indirect_stubs.len(),
+                            mod_name,
+                        ),
+                    },
+                    RuleMetadata {
+                        id: "TF-EVA-005".into(),
+                        name: "Suspicious Indirect Syscall Stub".into(),
+                        description: "A non-system module contains \
+                            the mov r10,rcx; mov eax,SSN prologue \
+                            followed by an indirect branch (jmp via \
+                            register or memory operand). This pattern \
+                            is consistent with indirect syscall tools \
+                            such as SysWhispers3, HellsGate, and \
+                            HalosGate, which resolve the ntdll syscall \
+                            gadget address at runtime and dispatch via \
+                            an indirect jmp. Note: this is a heuristic \
+                            match — the sensor has not verified that \
+                            the branch target actually falls within \
+                            ntdll. Tail-call thunks or vtable-based \
+                            dispatch in the same module may produce \
+                            false positives."
+                            .into(),
+                        mitre: MitreRef {
+                            tactic: "Defense Evasion".into(),
+                            technique_id: "T1562.001".into(),
+                            technique_name:
+                                "Impair Defenses: Disable or Modify Tools"
+                                    .into(),
+                        },
+                        confidence: Confidence::Low,
+                        evidence,
+                    },
+                ));
+                found_indirect = true;
+            }
         }
 
-        None
+        events
     }
 
     /// Read the .text section of a remote module by parsing its PE
@@ -1319,6 +1590,198 @@ mod tests {
             format!("{}", SyscallInstruction::Int2E),
             "int 0x2e (CD 2E)"
         );
+        assert_eq!(
+            format!("{}", SyscallInstruction::IndirectJmp),
+            "jmp <target> (indirect syscall)"
+        );
+    }
+
+    #[test]
+    fn instruction_is_indirect() {
+        assert!(!SyscallInstruction::Syscall.is_indirect());
+        assert!(!SyscallInstruction::Int2E.is_indirect());
+        assert!(SyscallInstruction::IndirectJmp.is_indirect());
+    }
+
+    // ---- indirect syscall stub scanner tests --------------------------------
+
+    #[test]
+    fn no_match_jmp_rel32() {
+        // E9 (jmp rel32) is a *direct* branch — a fixed offset baked into
+        // the instruction.  It cannot reliably target ntdll across ASLR'd
+        // address spaces and is commonly used for intra-module tail calls
+        // and trampolines, so it must NOT fire TF-EVA-005.
+        let data = [
+            0x4C, 0x8B, 0xD1,                   // mov r10, rcx
+            0xB8, 0x18, 0x00, 0x00, 0x00,        // mov eax, 0x18
+            0xE9, 0x10, 0x20, 0x30, 0x00,        // jmp rel32
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn detect_indirect_jmp_rip_rel() {
+        // SysWhispers3 variant: mov r10,rcx; mov eax,SSN; jmp [rip+disp32]
+        let data = [
+            0x4C, 0x8B, 0xD1,                   // mov r10, rcx
+            0xB8, 0x26, 0x00, 0x00, 0x00,        // mov eax, 0x26
+            0xFF, 0x25, 0x40, 0x00, 0x00, 0x00,  // jmp [rip+0x40]
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x26);
+        assert_eq!(matches[0].instruction, SyscallInstruction::IndirectJmp);
+        assert_eq!(matches[0].raw_bytes, data.to_vec());
+    }
+
+    #[test]
+    fn detect_indirect_jmp_reg() {
+        // jmp rax (FF E0) — register contains ntdll syscall address
+        let data = [
+            0x4C, 0x8B, 0xD1,                   // mov r10, rcx
+            0xB8, 0x50, 0x00, 0x00, 0x00,        // mov eax, 0x50
+            0xFF, 0xE0,                           // jmp rax
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x50);
+        assert_eq!(matches[0].instruction, SyscallInstruction::IndirectJmp);
+    }
+
+    #[test]
+    fn detect_indirect_jmp_rcx() {
+        // jmp rcx (FF E1)
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x3F, 0x00, 0x00, 0x00,
+            0xFF, 0xE1,                           // jmp rcx
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].instruction, SyscallInstruction::IndirectJmp);
+    }
+
+    #[test]
+    fn no_indirect_jmp_rsp() {
+        // jmp rsp (FF E4) — not a valid syscall dispatch, should be skipped
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0xFF, 0xE4,                           // jmp rsp — excluded
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn detect_indirect_jmp_rsp_disp8() {
+        // SysWhispers3: jmp [rsp+38h] (FF 64 24 38) — mod=01, rm=100(SIB),
+        // SIB=24(base=rsp,index=none), disp8=0x38
+        let data = [
+            0x4C, 0x8B, 0xD1,                   // mov r10, rcx
+            0xB8, 0x18, 0x00, 0x00, 0x00,        // mov eax, 0x18
+            0xFF, 0x64, 0x24, 0x38,               // jmp [rsp+38h]
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x18);
+        assert_eq!(matches[0].instruction, SyscallInstruction::IndirectJmp);
+        assert_eq!(matches[0].raw_bytes, data.to_vec());
+    }
+
+    #[test]
+    fn no_match_jmp_rel8() {
+        // EB (jmp rel8) is a *direct* short branch — same reasoning as
+        // jmp rel32: fixed offset, not an indirect dispatch.
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x0F, 0x00, 0x00, 0x00,
+            0xEB, 0x20,                           // jmp short +0x20
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn detect_indirect_jmp_r8_rex_b() {
+        // REX.B + jmp r8 (41 FF E0)
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0x41, 0xFF, 0xE0,                     // jmp r8
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].instruction, SyscallInstruction::IndirectJmp);
+    }
+
+    #[test]
+    fn detect_indirect_jmp_mem_deref() {
+        // jmp [rcx] (FF 21) — mod=00, reg=4(/4=jmp), rm=001(rcx)
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0xFF, 0x21,                           // jmp [rcx]
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].instruction, SyscallInstruction::IndirectJmp);
+    }
+
+    #[test]
+    fn mixed_direct_and_indirect_stubs() {
+        let mut data = Vec::new();
+        // Direct stub: SSN 0x18
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0x00, 0x00, 0x00,
+            0x0F, 0x05, 0xC3,
+        ]);
+        // Padding
+        data.extend_from_slice(&[0xCC; 5]);
+        // Indirect stub: SSN 0x26
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x26, 0x00, 0x00, 0x00,
+            0xFF, 0xE0, // jmp rax
+        ]);
+
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].ssn, 0x18);
+        assert_eq!(matches[0].instruction, SyscallInstruction::Syscall);
+        assert!(!matches[0].instruction.is_indirect());
+        assert_eq!(matches[1].ssn, 0x26);
+        assert_eq!(matches[1].instruction, SyscallInstruction::IndirectJmp);
+        assert!(matches[1].instruction.is_indirect());
+    }
+
+    #[test]
+    fn indirect_no_trailing_ret_captured() {
+        // Indirect stubs should NOT include trailing ret in raw_bytes
+        // (the ret belongs to the wrapper, not the stub)
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0xFF, 0xE0,                           // jmp rax
+            0xC3,                                 // ret (not part of stub)
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        // raw_bytes should be 10 bytes (prologue + jmp rax), not 11
+        assert_eq!(matches[0].raw_bytes.len(), 10);
+    }
+
+    #[test]
+    fn ff_not_jmp_ignored() {
+        // FF /2 = call r/m64 — should NOT be matched as indirect jmp
+        // FF D0 = call rax (ModRM: 11 010 000 → reg=2, mod=11, rm=000)
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0xFF, 0xD0,                           // call rax (not jmp!)
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert!(matches.is_empty());
     }
 
     // ---- whitelist tests ---------------------------------------------------
