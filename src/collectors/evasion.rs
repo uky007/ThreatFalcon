@@ -499,7 +499,8 @@ mod platform {
                                     &ntdll_reference, &amsi_reference,
                                 );
                             }
-                            last_sweep = std::time::Instant::now();
+                            // No need to track last_sweep — this
+                            // inner loop runs indefinitely until stop.
                         }
                     }
                 }
