@@ -1201,7 +1201,7 @@ mod platform {
         // On failure, lpNumberOfBytesRead is undefined on Windows, so a
         // stale value could make us accept a zero-filled buffer as code.
         read = 0;
-        let ok = unsafe {
+        let _ = unsafe {
             ReadProcessMemory(
                 handle,
                 text_addr as *const std::ffi::c_void,
