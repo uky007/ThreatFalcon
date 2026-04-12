@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
 use crate::collectors::etw::EtwCollector;
-use crate::collectors::evasion::EvasionCollector;
+use crate::collectors::evasion::{self, EvasionCollector};
 use crate::collectors::sysmon::SysmonCollector;
 use crate::collectors::Collector;
 use crate::config::SensorConfig;
@@ -37,10 +37,14 @@ impl Sensor {
             agent_id,
         };
 
+        // Create the scan request channel: ETW → Evasion
+        let (scan_tx, scan_rx) = evasion::scan_request_channel();
+
         let collectors: Vec<Box<dyn Collector>> = vec![
             Box::new(EtwCollector::new(
                 config.collectors.etw.clone(),
                 agent.clone(),
+                scan_tx,
             )),
             Box::new(SysmonCollector::new(
                 config.collectors.sysmon.clone(),
@@ -49,6 +53,7 @@ impl Sensor {
             Box::new(EvasionCollector::new(
                 config.collectors.evasion.clone(),
                 agent.clone(),
+                scan_rx,
             )),
         ];
 

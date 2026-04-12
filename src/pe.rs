@@ -469,6 +469,28 @@ impl PeHeaders {
         Some(entries)
     }
 
+    /// Check if a PE imports a specific function from a specific DLL.
+    ///
+    /// Both `dll_name` and `func_name` are compared case-insensitively.
+    /// Used by TI × import correlation to detect direct syscalls:
+    /// if a process calls NtAllocateVirtualMemory (via TI event) but
+    /// does not import it from ntdll.dll, it used a direct syscall.
+    #[allow(dead_code)]
+    pub fn has_import(&self, data: &[u8], dll_name: &str, func_name: &str) -> bool {
+        let imports = match self.parse_imports(data) {
+            Some(i) => i,
+            None => return false,
+        };
+        imports.iter().any(|entry| {
+            entry.dll_name.eq_ignore_ascii_case(dll_name)
+                && entry.functions.iter().any(|f| {
+                    f.name
+                        .as_deref()
+                        .map_or(false, |n| n.eq_ignore_ascii_case(func_name))
+                })
+        })
+    }
+
     /// Human-readable machine architecture name.
     pub fn machine_name(&self) -> &'static str {
         match self.machine {

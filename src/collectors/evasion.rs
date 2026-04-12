@@ -10,30 +10,80 @@ use crate::events::{AgentInfo, Confidence, ThreatEvent};
 
 use super::Collector;
 
-/// Periodically scans running processes to detect EDR evasion techniques:
+// ---------------------------------------------------------------------------
+// Scan request channel: ETW → Evasion
+// ---------------------------------------------------------------------------
+
+/// Requests sent from the ETW collector to trigger immediate scans.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum ScanRequest {
+    /// A new process was created — scan its memory immediately.
+    ProcessCreated { pid: u32 },
+    /// A new module was loaded — scan the on-disk PE for syscall stubs.
+    ImageLoaded { pid: u32, image_path: String },
+    /// A Threat Intelligence event fired — check if the calling process
+    /// imports the syscall function from ntdll.  If not, it used a
+    /// direct syscall.
+    ThreatIntelligence {
+        calling_pid: u32,
+        /// The Nt* function that was called (e.g. "NtAllocateVirtualMemory").
+        function_name: String,
+        /// Original TI event ID for evidence.
+        ti_event_id: u16,
+    },
+}
+
+/// Create a scan request channel pair.
 ///
-/// - **ETW patching**: `ntdll!EtwEventWrite` is patched to `ret` so the kernel
-///   stops receiving user-mode ETW events from the target process.
-/// - **AMSI bypass**: `amsi!AmsiScanBuffer` is patched to always return clean.
-/// - **ntdll unhooking**: The process replaces its hooked ntdll `.text` section
-///   with a clean copy mapped from `\KnownDlls\ntdll.dll` or from disk.
-/// - **Direct syscalls**: The process uses `syscall` / `int 0x2e` instructions
-///   from its own module instead of calling ntdll, bypassing user-mode hooks.
+/// Uses `std::sync::mpsc::sync_channel` (bounded) to prevent
+/// unbounded memory growth when the consumer falls behind under
+/// ProcessCreate/ImageLoad/TI event bursts.  Excess requests are
+/// silently dropped by the ETW sender (try_send).
+const SCAN_REQUEST_CAPACITY: usize = 4096;
+
+pub fn scan_request_channel() -> (
+    std::sync::mpsc::SyncSender<ScanRequest>,
+    std::sync::mpsc::Receiver<ScanRequest>,
+) {
+    std::sync::mpsc::sync_channel(SCAN_REQUEST_CAPACITY)
+}
+
+/// Periodically scans running processes to detect EDR evasion techniques,
+/// and handles on-demand scan requests from the ETW collector.
+///
+/// Detection layers:
+/// 1. **Periodic memory scan**: polls all processes every `scan_interval_ms`
+/// 2. **ProcessCreate scan**: immediate memory scan on new process creation
+/// 3. **ImageLoad disk scan**: scans on-disk PE when a new module loads
+/// 4. **TI × import correlation**: checks if a TI-flagged syscall was
+///    imported from ntdll (if not → direct syscall evidence)
 pub struct EvasionCollector {
     config: EvasionConfig,
     #[allow(dead_code)] // used on Windows only
     agent: AgentInfo,
     dropped: Arc<AtomicU64>,
+    /// Receiver for on-demand scan requests from ETW collector.
+    /// Wrapped in Mutex because Collector trait requires Sync, but
+    /// std::sync::mpsc::Receiver is !Sync.  The Mutex is only locked
+    /// once in start() to take the receiver.
+    #[allow(dead_code)]
+    scan_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<ScanRequest>>>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl EvasionCollector {
-    pub fn new(config: EvasionConfig, agent: AgentInfo) -> Self {
+    pub fn new(
+        config: EvasionConfig,
+        agent: AgentInfo,
+        scan_rx: std::sync::mpsc::Receiver<ScanRequest>,
+    ) -> Self {
         Self {
             config,
             agent,
             dropped: Arc::new(AtomicU64::new(0)),
+            scan_rx: std::sync::Mutex::new(Some(scan_rx)),
             #[cfg(target_os = "windows")]
             stop_flag: None,
         }
@@ -302,6 +352,21 @@ fn detect_amsi_patch_pattern(
     None
 }
 
+/// Map TI event IDs to the Nt* function that was called.
+#[allow(dead_code)]
+pub fn ti_event_to_function(event_id: u16) -> Option<&'static str> {
+    match event_id {
+        1 | 6 => Some("NtAllocateVirtualMemory"),
+        2 | 7 => Some("NtProtectVirtualMemory"),
+        3 | 8 => Some("NtMapViewOfSection"),
+        4 => Some("NtQueueApcThread"),
+        5 => Some("NtSetContextThread"),
+        9 => Some("NtSuspendThread"),
+        10 => Some("NtResumeThread"),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
@@ -319,15 +384,27 @@ mod platform {
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
+        scan_rx: std::sync::mpsc::Receiver<super::ScanRequest>,
     ) -> Result<Arc<AtomicBool>> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
 
         tokio::task::spawn_blocking(move || {
-            scan_loop(&config, &agent, &tx, &stop_clone, &dropped);
+            scan_loop(&config, &agent, &tx, &stop_clone, &dropped, scan_rx);
         });
 
         Ok(stop)
+    }
+
+    fn emit(
+        tx: &mpsc::Sender<ThreatEvent>,
+        dropped: &Arc<AtomicU64>,
+        evt: ThreatEvent,
+    ) {
+        if let Err(e) = tx.try_send(evt) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "Evasion event dropped");
+        }
     }
 
     fn scan_loop(
@@ -336,85 +413,432 @@ mod platform {
         tx: &mpsc::Sender<ThreatEvent>,
         stop: &Arc<AtomicBool>,
         dropped: &Arc<AtomicU64>,
+        scan_rx: std::sync::mpsc::Receiver<super::ScanRequest>,
     ) {
         let interval =
             std::time::Duration::from_millis(config.scan_interval_ms);
 
-        // Build references at startup: on-disk PE parsing + export table
-        // resolution. These are reused across all scan cycles.
         let ntdll_reference = build_ntdll_reference();
         let amsi_reference = build_amsi_reference();
+
+        let mut last_sweep = std::time::Instant::now()
+            .checked_sub(interval)
+            .unwrap_or_else(std::time::Instant::now);
 
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
 
-            let pids = enumerate_pids();
-            for pid in &pids {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
+            // --- Drain pending requests BEFORE the sweep ---
+            // This ensures ProcessCreate/ImageLoad/TI requests that
+            // arrived since the last cycle are handled immediately,
+            // not delayed behind a full process enumeration.
+            drain_scan_requests(
+                &scan_rx, config, agent, tx, dropped,
+            );
 
-                let handle = match open_process(*pid) {
-                    Some(h) => h,
-                    None => continue,
-                };
-
-                if config.detect_etw_patching {
-                    if let Some(evt) =
-                        check_etw_patching(handle, *pid, agent, &ntdll_reference)
-                    {
-                        if let Err(e) = tx.try_send(evt) {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(error = %e, "Evasion event dropped");
-                        }
+            // --- Periodic full sweep (only when interval elapsed) ---
+            if last_sweep.elapsed() >= interval {
+                let pids = enumerate_pids();
+                for pid in &pids {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
                     }
-                }
 
-                if config.detect_amsi_bypass {
-                    if let Some(evt) =
-                        check_amsi_bypass(handle, *pid, agent, &amsi_reference)
-                    {
-                        if let Err(e) = tx.try_send(evt) {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(error = %e, "Evasion event dropped");
-                        }
-                    }
-                }
+                    // Drain requests between processes so short-lived
+                    // processes don't expire while we scan others.
+                    drain_scan_requests(
+                        &scan_rx, config, agent, tx, dropped,
+                    );
 
-                if config.detect_unhooking {
-                    if let Some(evt) = check_ntdll_unhooking(
-                        handle,
-                        *pid,
-                        agent,
-                        &ntdll_reference,
-                    ) {
-                        if let Err(e) = tx.try_send(evt) {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(error = %e, "Evasion event dropped");
-                        }
-                    }
+                    scan_single_process(
+                        *pid, config, agent, tx, dropped,
+                        &ntdll_reference, &amsi_reference,
+                    );
                 }
-
-                if config.detect_direct_syscall {
-                    if let Some(evt) =
-                        check_direct_syscall(handle, *pid, agent)
-                    {
-                        if let Err(e) = tx.try_send(evt) {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(error = %e, "Evasion event dropped");
-                        }
-                    }
-                }
-
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
+                last_sweep = std::time::Instant::now();
             }
 
-            std::thread::sleep(interval);
+            // Wait for the next request or timeout for the next sweep.
+            let remaining = interval
+                .checked_sub(last_sweep.elapsed())
+                .unwrap_or(std::time::Duration::ZERO);
+            if remaining > std::time::Duration::ZERO {
+                match scan_rx.recv_timeout(remaining) {
+                    Ok(req) => {
+                        handle_scan_request(req, config, agent, tx, dropped);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Normal: sweep interval elapsed
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // ETW sender dropped (shutdown or crash).
+                        // Fall back to sleep-based periodic scanning.
+                        tracing::warn!(
+                            "Scan request channel disconnected — \
+                             falling back to periodic-only scanning"
+                        );
+                        // Continue with periodic sweeps only; use
+                        // sleep instead of recv_timeout from now on.
+                        loop {
+                            if stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            std::thread::sleep(interval);
+                            drain_scan_requests(
+                                &scan_rx, config, agent, tx, dropped,
+                            );
+                            let pids = enumerate_pids();
+                            for pid in &pids {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                scan_single_process(
+                                    *pid, config, agent, tx, dropped,
+                                    &ntdll_reference, &amsi_reference,
+                                );
+                            }
+                            last_sweep = std::time::Instant::now();
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Process all pending scan requests from the ETW collector.
+    fn scan_single_process(
+        pid: u32,
+        config: &EvasionConfig,
+        agent: &crate::events::AgentInfo,
+        tx: &tokio::sync::mpsc::Sender<ThreatEvent>,
+        dropped: &Arc<AtomicU64>,
+        ntdll_reference: &Option<NtdllReference>,
+        amsi_reference: &Option<AmsiReference>,
+    ) {
+        let handle = match open_process(pid) {
+            Some(h) => h,
+            None => return,
+        };
+
+        if config.detect_etw_patching {
+            if let Some(evt) = check_etw_patching(handle, pid, agent, ntdll_reference) {
+                emit(tx, dropped, evt);
+            }
+        }
+        if config.detect_amsi_bypass {
+            if let Some(evt) = check_amsi_bypass(handle, pid, agent, amsi_reference) {
+                emit(tx, dropped, evt);
+            }
+        }
+        if config.detect_unhooking {
+            if let Some(evt) = check_ntdll_unhooking(handle, pid, agent, ntdll_reference) {
+                emit(tx, dropped, evt);
+            }
+        }
+        if config.detect_direct_syscall {
+            if let Some(evt) = check_direct_syscall(handle, pid, agent) {
+                emit(tx, dropped, evt);
+            }
+        }
+
+        unsafe { let _ = CloseHandle(handle); }
+    }
+
+    fn drain_scan_requests(
+        scan_rx: &std::sync::mpsc::Receiver<super::ScanRequest>,
+        config: &EvasionConfig,
+        agent: &crate::events::AgentInfo,
+        tx: &tokio::sync::mpsc::Sender<ThreatEvent>,
+        dropped: &Arc<AtomicU64>,
+    ) {
+        while let Ok(req) = scan_rx.try_recv() {
+            handle_scan_request(req, config, agent, tx, dropped);
+        }
+    }
+
+    fn handle_scan_request(
+        req: super::ScanRequest,
+        config: &EvasionConfig,
+        agent: &crate::events::AgentInfo,
+        tx: &mpsc::Sender<ThreatEvent>,
+        dropped: &Arc<AtomicU64>,
+    ) {
+        use super::ScanRequest;
+        match req {
+            ScanRequest::ProcessCreated { pid } => {
+                if !config.detect_direct_syscall {
+                    return;
+                }
+                let handle = match open_process(pid) {
+                    Some(h) => h,
+                    None => return,
+                };
+                if let Some(evt) = check_direct_syscall(handle, pid, agent) {
+                    emit(tx, dropped, evt);
+                }
+                unsafe { let _ = CloseHandle(handle); }
+            }
+            ScanRequest::ImageLoaded { pid: _, image_path } => {
+                if !config.detect_direct_syscall {
+                    return;
+                }
+                if let Some(evt) = scan_disk_pe(&image_path, agent) {
+                    emit(tx, dropped, evt);
+                }
+            }
+            ScanRequest::ThreatIntelligence {
+                calling_pid,
+                function_name,
+                ti_event_id,
+            } => {
+                if !config.detect_direct_syscall {
+                    return;
+                }
+                if let Some(evt) = check_ti_import_correlation(
+                    calling_pid,
+                    &function_name,
+                    ti_event_id,
+                    agent,
+                ) {
+                    emit(tx, dropped, evt);
+                }
+            }
+        }
+    }
+
+    // ---- ImageLoad disk PE scan -----------------------------------------------
+
+    /// Scan an on-disk PE file for direct syscall stubs.
+    ///
+    /// Called when ETW reports a new module load (ImageLoad event).
+    /// Reads the file from disk, parses the PE, and scans the first
+    /// executable section.  Returns a detection event if stubs are found.
+    fn scan_disk_pe(
+        image_path: &str,
+        agent: &crate::events::AgentInfo,
+    ) -> Option<ThreatEvent> {
+        // Convert NT device path to DOS path if needed
+        let path = normalize_nt_path(image_path);
+
+        // Skip system DLLs
+        let basename = path.rsplit('\\').next().unwrap_or(&path);
+        if super::is_syscall_whitelisted(basename) {
+            return None;
+        }
+
+        let data = std::fs::read(&path).ok()?;
+        let pe = crate::pe::PeHeaders::parse(&data)?;
+        let section = pe.first_executable_section()?;
+        let section_data = pe.read_section_data(&data, section)?;
+
+        let stubs = super::scan_for_syscall_stubs(section_data);
+        if stubs.is_empty() {
+            return None;
+        }
+
+        let has_direct = stubs.iter().any(|s| !s.indirect);
+        if !has_direct {
+            // Indirect-only on disk: emit as telemetry
+            return Some(ThreatEvent::new(
+                agent,
+                EventSource::EvasionDetector,
+                EventCategory::Evasion,
+                Severity::Info,
+                EventData::EvasionDetected {
+                    technique: EvasionTechnique::DirectSyscall,
+                    pid: None,
+                    process_name: Some(basename.to_string()),
+                    details: format!(
+                        "{} indirect syscall stub(s) found on disk in {}",
+                        stubs.len(), basename,
+                    ),
+                },
+            ));
+        }
+
+        let first = &stubs[0];
+        Some(ThreatEvent::with_rule(
+            agent,
+            EventSource::EvasionDetector,
+            EventCategory::Evasion,
+            Severity::High,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::DirectSyscall,
+                pid: None,
+                process_name: Some(basename.to_string()),
+                details: format!(
+                    "{} direct syscall stub(s) found on disk in {}",
+                    stubs.len(), basename,
+                ),
+            },
+            RuleMetadata {
+                id: "TF-EVA-005".into(),
+                name: "Direct Syscall Stub in Loaded Module (Disk Scan)".into(),
+                description: "A newly loaded module contains syscall/int 0x2e \
+                    stubs on disk, detected at ImageLoad time. This does not \
+                    require the process to remain running."
+                    .into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: "T1562.001".into(),
+                    technique_name:
+                        "Impair Defenses: Disable or Modify Tools".into(),
+                },
+                confidence: Confidence::High,
+                evidence: vec![
+                    format!("file: {}", path),
+                    format!("section: {} ({} bytes)", section.name, section_data.len()),
+                    format!("{} syscall stub(s) found", stubs.len()),
+                    format!("first stub at section+0x{:X}: {}", first.offset, first.instruction),
+                    format!("SSN: 0x{:X}", first.ssn),
+                    format!("stub bytes: {:02X?}", first.raw_bytes),
+                ],
+            },
+        ))
+    }
+
+    /// Convert `\Device\HarddiskVolumeN\...` to `X:\...` using
+    /// QueryDosDevice.  Falls back to the original path if conversion
+    /// fails.
+    fn normalize_nt_path(path: &str) -> String {
+        if !path.starts_with("\\Device\\") {
+            return path.to_string();
+        }
+
+        // Extract the volume part: \Device\HarddiskVolume3
+        let rest = &path["\\Device\\".len()..];
+        let vol_end = rest.find('\\').unwrap_or(rest.len());
+        let volume = &path[..("\\Device\\".len() + vol_end)];
+        let remainder = &path[("\\Device\\".len() + vol_end)..];
+
+        // Try drive letters A-Z
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:", letter as char);
+            let wide_drive: Vec<u16> = drive
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut buf = [0u16; 260];
+            let len = unsafe {
+                windows::Win32::Storage::FileSystem::QueryDosDeviceW(
+                    windows::core::PCWSTR(wide_drive.as_ptr()),
+                    Some(&mut buf),
+                )
+            };
+            if len == 0 {
+                continue;
+            }
+            // QueryDosDevice returns a double-null terminated multi-sz
+            let device = String::from_utf16_lossy(
+                &buf[..buf.iter().position(|&c| c == 0).unwrap_or(len as usize)],
+            );
+            if device.eq_ignore_ascii_case(volume) {
+                return format!("{drive}{remainder}");
+            }
+        }
+
+        path.to_string()
+    }
+
+    // ---- TI × import correlation ----------------------------------------------
+
+    /// Check if a TI-flagged syscall was imported by ANY loaded module.
+    ///
+    /// Scans all modules in the process for ntdll imports of the
+    /// function.  If no module imports it, emits **telemetry** (not an
+    /// alert) — the absence of a static import is a weak signal
+    /// because the function can also be reached via kernel32 wrappers,
+    /// delay-loading, or GetProcAddress.
+    fn check_ti_import_correlation(
+        calling_pid: u32,
+        function_name: &str,
+        ti_event_id: u16,
+        agent: &crate::events::AgentInfo,
+    ) -> Option<ThreatEvent> {
+        let handle = open_process(calling_pid)?;
+
+        // Enumerate ALL loaded modules
+        let mut modules = [HMODULE::default(); 1024];
+        let mut needed = 0u32;
+        unsafe {
+            if EnumProcessModules(
+                handle,
+                modules.as_mut_ptr(),
+                std::mem::size_of_val(&modules) as u32,
+                &mut needed,
+            )
+            .is_err()
+            {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+        }
+
+        let count = (needed as usize / std::mem::size_of::<HMODULE>())
+            .min(modules.len());
+
+        // Check if ANY module statically imports the function from ntdll
+        let mut found_import = false;
+        let mut exe_name = String::new();
+        for (idx, m) in modules[..count].iter().enumerate() {
+            let mut path_buf = [0u8; 520];
+            let path_len = unsafe {
+                GetModuleFileNameExA(handle, *m, &mut path_buf)
+            };
+            if path_len == 0 {
+                continue;
+            }
+            let mod_path = std::str::from_utf8(&path_buf[..path_len as usize])
+                .unwrap_or("");
+
+            if idx == 0 {
+                exe_name = mod_path
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(mod_path)
+                    .to_string();
+            }
+
+            // Read on-disk PE and check imports
+            if let Ok(pe_data) = std::fs::read(mod_path) {
+                if let Some(pe) = crate::pe::PeHeaders::parse(&pe_data) {
+                    if pe.has_import(&pe_data, "ntdll.dll", function_name) {
+                        found_import = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        unsafe { let _ = CloseHandle(handle); }
+
+        if found_import {
+            return None;
+        }
+
+        // No module imports the function — emit as telemetry (Info,
+        // no rule metadata).  This is a weak signal: kernel32 wrappers,
+        // delay-loading, and GetProcAddress can all reach Nt* functions
+        // without a static ntdll import.
+        Some(ThreatEvent::new(
+            agent,
+            EventSource::EvasionDetector,
+            EventCategory::Evasion,
+            Severity::Info,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::DirectSyscall,
+                pid: Some(calling_pid),
+                process_name: Some(exe_name),
+                details: format!(
+                    "PID {} called {} (TI event {}) — no loaded module \
+                     statically imports it from ntdll.dll (weak signal, \
+                     may be kernel32 wrapper or GetProcAddress)",
+                    calling_pid, function_name, ti_event_id,
+                ),
+            },
+        ))
     }
 
     // ---- Process enumeration ------------------------------------------------
@@ -837,7 +1261,8 @@ mod platform {
         }
 
         let count =
-            needed as usize / std::mem::size_of::<HMODULE>();
+            (needed as usize / std::mem::size_of::<HMODULE>())
+                .min(modules.len());
         for m in &modules[..count] {
             let mut buf = [0u8; 260];
             let len = unsafe {
@@ -941,7 +1366,8 @@ mod platform {
         }
 
         let count =
-            needed as usize / std::mem::size_of::<HMODULE>();
+            (needed as usize / std::mem::size_of::<HMODULE>())
+                .min(modules.len());
 
         // Scan ALL modules and collect candidates instead of
         // returning on the first match.  This ensures a high-
@@ -1242,14 +1668,21 @@ impl Collector for EvasionCollector {
     ) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
+            let scan_rx = self.scan_rx.lock().unwrap().take().expect(
+                "EvasionCollector::start called twice or scan_rx not set"
+            );
             let flag = platform::start_scanner(
                 self.config.clone(),
                 self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
+                scan_rx,
             )?;
             self.stop_flag = Some(flag);
-            info!("Evasion detector started");
+            info!(
+                "Evasion detector started (periodic + ProcessCreate + \
+                 ImageLoad + TI correlation)"
+            );
         }
 
         #[cfg(not(target_os = "windows"))]
