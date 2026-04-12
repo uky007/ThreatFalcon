@@ -286,6 +286,18 @@ impl PeHeaders {
         })
     }
 
+    /// Return all executable sections.
+    ///
+    /// Stubs can live in any executable section (e.g. UPX1 after
+    /// UPX0, or a custom `.stub` section).  Scanning only the first
+    /// executable section misses these.
+    pub fn all_executable_sections(&self) -> Vec<&SectionHeader> {
+        self.sections
+            .iter()
+            .filter(|s| s.is_executable() || s.contains_code())
+            .collect()
+    }
+
     /// Read the raw bytes of a section from an on-disk PE buffer.
     ///
     /// Uses `min(raw_data_size, virtual_size)` to avoid reading file-alignment
