@@ -314,8 +314,17 @@ pub(crate) mod process_parser {
     fn is_corrupt_process_start(
         t: &(u32, Option<u64>, u32, String, String),
     ) -> bool {
-        let (_pid, _ct, _ppid, image, _cmdline) = t;
-        is_corrupt_image(image)
+        let (_pid, _ct, _ppid, image, cmdline) = t;
+        if is_corrupt_image(image) {
+            return true;
+        }
+        // Empty image + cmdline that is empty or all control chars
+        // strongly indicates a layout mismatch where string fields
+        // were consumed by extra v3 reads.
+        if image.is_empty() && (cmdline.is_empty() || cmdline.chars().all(|c| c.is_control())) {
+            return true;
+        }
+        false
     }
 
     fn is_corrupt_process_stop(
@@ -329,15 +338,19 @@ pub(crate) mod process_parser {
         is_corrupt_image(image)
     }
 
-    /// An image is corrupt if it is 1-2 characters long (garbage
-    /// from misaligned field reads) or consists entirely of control
-    /// characters.
+    /// An image is corrupt if it has fewer than 3 **characters**
+    /// (not UTF-8 bytes) or consists entirely of control characters.
+    ///
+    /// Uses `chars().count()` to handle multi-byte Unicode correctly.
+    /// A misaligned read of a u32 (e.g. TimeDateStamp 0x5678)
+    /// produces 2 Unicode characters like "噸\u{01dc}" which is
+    /// 5 UTF-8 bytes but only 2 chars → corrupt.
     fn is_corrupt_image(image: &str) -> bool {
         if image.is_empty() {
             return false; // empty is valid in some contexts
         }
-        if image.len() < 3 {
-            return true; // "+" "\r" etc.
+        if image.chars().count() < 3 {
+            return true; // "+" "\r" "쩤ǜ" etc.
         }
         // All control/whitespace characters → corrupt
         if image.chars().all(|c| c.is_control() || c.is_whitespace()) {
@@ -3733,6 +3746,28 @@ mod tests {
             assert!(!is_plausible_image_path("+"));
             assert!(!is_plausible_image_path("\r"));
             assert!(!is_plausible_image_path("AB"));
+            // Non-ASCII 2-char garbage from TimeDateStamp misread
+            // as UTF-16 (e.g. 0x01DCCA64 → "쩤ǜ"). These are 2
+            // Unicode chars but 5 UTF-8 bytes — must use char count.
+            assert!(!is_plausible_image_path("\u{CA64}\u{01DC}"));
+            assert!(!is_plausible_image_path("\u{5678}"));
+        }
+
+        #[test]
+        fn reject_empty_image_with_control_cmdline() {
+            // ProcessCreate with empty image + control char cmdline
+            // indicates the v3 extra reads consumed the real strings.
+            let t = (1234u32, Some(9999u64), 2403917075u32,
+                     String::new(), "\x01".to_string());
+            assert!(!is_plausible_process_start(&t));
+        }
+
+        #[test]
+        fn accept_empty_image_with_valid_cmdline() {
+            // Some edge cases have empty image but valid cmdline
+            let t = (4u32, Some(100u64), 0u32,
+                     String::new(), "svchost.exe -k netsvcs".to_string());
+            assert!(is_plausible_process_start(&t));
         }
 
         #[test]
