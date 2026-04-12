@@ -15,6 +15,9 @@ pub struct EtwCollector {
     #[allow(dead_code)] // used on Windows only
     agent: AgentInfo,
     dropped: Arc<AtomicU64>,
+    /// Sender for scan requests to the evasion collector.
+    #[allow(dead_code)]
+    scan_tx: Option<std::sync::mpsc::SyncSender<super::evasion::ScanRequest>>,
     #[cfg(target_os = "windows")]
     stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(target_os = "windows")]
@@ -22,11 +25,16 @@ pub struct EtwCollector {
 }
 
 impl EtwCollector {
-    pub fn new(config: EtwConfig, agent: AgentInfo) -> Self {
+    pub fn new(
+        config: EtwConfig,
+        agent: AgentInfo,
+        scan_tx: std::sync::mpsc::SyncSender<super::evasion::ScanRequest>,
+    ) -> Self {
         Self {
             config,
             agent,
             dropped: Arc::new(AtomicU64::new(0)),
+            scan_tx: Some(scan_tx),
             #[cfg(target_os = "windows")]
             stop_flag: None,
             #[cfg(target_os = "windows")]
@@ -508,6 +516,7 @@ mod platform {
     struct CallbackContext {
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
+        scan_tx: Option<std::sync::mpsc::SyncSender<crate::collectors::evasion::ScanRequest>>,
         stop: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
     }
@@ -523,6 +532,7 @@ mod platform {
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
+        scan_tx: Option<std::sync::mpsc::SyncSender<crate::collectors::evasion::ScanRequest>>,
     ) -> Result<(Arc<AtomicBool>, isize)> {
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -627,6 +637,7 @@ mod platform {
             let ctx = Box::new(CallbackContext {
                 agent,
                 tx,
+                scan_tx,
                 stop: stop_clone,
                 dropped,
             });
@@ -715,10 +726,17 @@ mod platform {
 
         let provider_name = provider_display_name(&provider);
 
-        if let Some(event) =
+        if let Some(ref event) =
             unsafe { map_event(rec, provider_name, event_id, event_version, pid, &ctx.agent) }
         {
-            if let Err(_) = ctx.tx.try_send(event) {
+            // Send scan requests for relevant events
+            if let Some(ref scan_tx) = ctx.scan_tx {
+                send_scan_requests(
+                    scan_tx, provider_name, event_id, pid, event,
+                );
+            }
+
+            if let Err(_) = ctx.tx.try_send(event.clone()) {
                 let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() || n % 1000 == 0 {
                     tracing::warn!(
@@ -727,6 +745,53 @@ mod platform {
                     );
                 }
             }
+        }
+    }
+
+    /// Send scan requests to the evasion collector for relevant ETW events.
+    fn send_scan_requests(
+        scan_tx: &std::sync::mpsc::SyncSender<crate::collectors::evasion::ScanRequest>,
+        provider: &str,
+        event_id: u16,
+        pid: u32,
+        event: &ThreatEvent,
+    ) {
+        use crate::collectors::evasion::ScanRequest;
+
+        match provider {
+            "Microsoft-Windows-Kernel-Process" => {
+                match event_id {
+                    1 => {
+                        // ProcessCreate — trigger immediate memory scan
+                        let _ = scan_tx.try_send(ScanRequest::ProcessCreated { pid });
+                    }
+                    5 => {
+                        // ImageLoad — trigger disk PE scan
+                        if let EventData::ImageLoad { image_path, .. } = &event.data {
+                            if !image_path.is_empty() {
+                                let _ = scan_tx.try_send(ScanRequest::ImageLoaded {
+                                    pid,
+                                    image_path: image_path.clone(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "Microsoft-Windows-Threat-Intelligence" => {
+                // TI event — trigger import correlation
+                if let EventData::EvasionDetected { pid: Some(calling_pid), .. } = &event.data {
+                    if let Some(func) = crate::collectors::evasion::ti_event_to_function(event_id) {
+                        let _ = scan_tx.try_send(ScanRequest::ThreatIntelligence {
+                            calling_pid: *calling_pid,
+                            function_name: func.to_string(),
+                            ti_event_id: event_id,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1733,6 +1798,7 @@ impl Collector for EtwCollector {
                 self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
+                self.scan_tx.take(),
             )?;
             self.stop_flag = Some(flag);
             self.instance_lock = Some(lock);
