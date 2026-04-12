@@ -1185,12 +1185,9 @@ mod platform {
 
         let pe =
             crate::pe::PeHeaders::parse(&header_buf[..header_read])?;
-        let text = pe.text_section()?;
-
-        // Validate: only read sections that are actually code
-        if !text.is_executable() && !text.contains_code() {
-            return None;
-        }
+        // Use first_executable_section to handle UPX-packed PEs
+        // (UPX0/UPX1) and other non-standard section names.
+        let text = pe.first_executable_section()?;
 
         let size = (text.virtual_size as usize).min(MAX_TEXT_READ);
         let text_addr = module_base + text.virtual_address as usize;

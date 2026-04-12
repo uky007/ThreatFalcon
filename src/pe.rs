@@ -272,6 +272,20 @@ impl PeHeaders {
         self.find_section(".text")
     }
 
+    /// Return the first executable section, regardless of name.
+    ///
+    /// Falls back from `.text` to any section with
+    /// `IMAGE_SCN_MEM_EXECUTE` or `IMAGE_SCN_CNT_CODE` flags.
+    /// This handles UPX-packed PEs (UPX0/UPX1), custom-linked
+    /// binaries, and other non-standard section names.
+    pub fn first_executable_section(&self) -> Option<&SectionHeader> {
+        self.text_section().or_else(|| {
+            self.sections
+                .iter()
+                .find(|s| s.is_executable() || s.contains_code())
+        })
+    }
+
     /// Read the raw bytes of a section from an on-disk PE buffer.
     ///
     /// Uses `min(raw_data_size, virtual_size)` to avoid reading file-alignment
@@ -1351,5 +1365,58 @@ mod tests {
         let pe32 = build_pe32(&[make_section(".text", &[0; 16], 0x1000, CODE_CHARS)]);
         let h32 = PeHeaders::parse(&pe32).unwrap();
         assert_eq!(h32.machine_name(), "PE32 (i386)");
+    }
+
+    // ---- first_executable_section tests ------------------------------------
+
+    #[test]
+    fn first_exec_finds_text() {
+        let pe = build_pe64(&[
+            make_section(".text", &[0xCC; 32], 0x1000, CODE_CHARS),
+            make_section(".data", &[0; 16], 0x2000, DATA_CHARS),
+        ]);
+        let h = PeHeaders::parse(&pe).unwrap();
+        let sec = h.first_executable_section().unwrap();
+        assert_eq!(sec.name, ".text");
+    }
+
+    #[test]
+    fn first_exec_finds_upx0() {
+        // UPX-packed PEs have UPX0 (RWX) and UPX1 (RWX).
+        // No .text section exists.
+        let rwx = SCN_MEM_READ | SCN_MEM_WRITE | SCN_MEM_EXECUTE;
+        let pe = build_pe64(&[
+            make_section("UPX0", &[0; 32], 0x1000, rwx | 0x80), // +uninitialized
+            make_section("UPX1", &[0xCC; 64], 0x58000, rwx),
+            make_section("UPX2", &[0; 16], 0x9B000, DATA_CHARS),
+        ]);
+        let h = PeHeaders::parse(&pe).unwrap();
+        assert!(h.text_section().is_none(), ".text should not exist");
+        let sec = h.first_executable_section().unwrap();
+        assert_eq!(sec.name, "UPX0");
+    }
+
+    #[test]
+    fn first_exec_prefers_text_over_others() {
+        // .text exists alongside other executable sections
+        let rwx = SCN_MEM_READ | SCN_MEM_WRITE | SCN_MEM_EXECUTE;
+        let pe = build_pe64(&[
+            make_section(".init", &[0; 16], 0x1000, CODE_CHARS),
+            make_section(".text", &[0xCC; 32], 0x2000, CODE_CHARS),
+            make_section("UPX0", &[0; 16], 0x3000, rwx),
+        ]);
+        let h = PeHeaders::parse(&pe).unwrap();
+        let sec = h.first_executable_section().unwrap();
+        assert_eq!(sec.name, ".text");
+    }
+
+    #[test]
+    fn first_exec_none_for_data_only() {
+        let pe = build_pe64(&[
+            make_section(".rdata", &[0; 16], 0x1000, SCN_MEM_READ),
+            make_section(".data", &[0; 16], 0x2000, DATA_CHARS),
+        ]);
+        let h = PeHeaders::parse(&pe).unwrap();
+        assert!(h.first_executable_section().is_none());
     }
 }
