@@ -622,18 +622,37 @@ mod platform {
         // Convert NT device path to DOS path if needed
         let path = normalize_nt_path(image_path);
 
-        // Skip system DLLs
+        // Skip system DLLs only if loaded from a system directory.
+        // Basename-only check would let an attacker name a payload
+        // "ntdll.dll" and bypass scanning entirely.
         let basename = path.rsplit('\\').next().unwrap_or(&path);
-        if super::is_syscall_whitelisted(basename) {
+        if super::is_syscall_whitelisted(basename) && is_system_path(&path) {
             return None;
         }
 
         let data = std::fs::read(&path).ok()?;
         let pe = crate::pe::PeHeaders::parse(&data)?;
-        let section = pe.first_executable_section()?;
-        let section_data = pe.read_section_data(&data, section)?;
 
-        let stubs = super::scan_for_syscall_stubs(section_data);
+        // Scan ALL executable sections — stubs can live in any of them
+        let sections = pe.all_executable_sections();
+        if sections.is_empty() {
+            return None;
+        }
+
+        let mut stubs = Vec::new();
+        let mut scanned_section_name = String::new();
+        let mut scanned_section_size = 0usize;
+        for section in &sections {
+            if let Some(section_data) = pe.read_section_data(&data, section) {
+                let found = super::scan_for_syscall_stubs(section_data);
+                if !found.is_empty() && stubs.is_empty() {
+                    scanned_section_name = section.name.clone();
+                    scanned_section_size = section_data.len();
+                }
+                stubs.extend(found);
+            }
+        }
+
         if stubs.is_empty() {
             return None;
         }
@@ -689,7 +708,7 @@ mod platform {
                 confidence: Confidence::High,
                 evidence: vec![
                     format!("file: {}", path),
-                    format!("section: {} ({} bytes)", section.name, section_data.len()),
+                    format!("section: {} ({} bytes)", scanned_section_name, scanned_section_size),
                     format!("{} syscall stub(s) found", stubs.len()),
                     format!("first stub at section+0x{:X}: {}", first.offset, first.instruction),
                     format!("SSN: 0x{:X}", first.ssn),
@@ -702,6 +721,16 @@ mod platform {
     /// Convert `\Device\HarddiskVolumeN\...` to `X:\...` using
     /// QueryDosDevice.  Falls back to the original path if conversion
     /// fails.
+    /// Check if a file path is in a system directory.
+    fn is_system_path(path: &str) -> bool {
+        let path_lower = path.to_ascii_lowercase();
+        let sys_root = std::env::var("SystemRoot")
+            .unwrap_or_else(|_| r"C:\Windows".to_string())
+            .to_ascii_lowercase();
+        path_lower.starts_with(&format!(r"{}\system32\", sys_root))
+            || path_lower.starts_with(&format!(r"{}\syswow64\", sys_root))
+    }
+
     fn normalize_nt_path(path: &str) -> String {
         if !path.starts_with("\\Device\\") {
             return path.to_string();
@@ -1392,13 +1421,15 @@ mod platform {
             }
 
             let module_base = m.0 as usize;
-            let (text, _text_rva) =
-                match read_remote_text_section(handle, module_base) {
-                    Some(t) => t,
-                    None => continue,
-                };
+            let sections = read_remote_executable_sections(handle, module_base);
+            if sections.is_empty() {
+                continue;
+            }
 
-            let stubs = super::scan_for_syscall_stubs(&text);
+            let mut stubs = Vec::new();
+            for (text, _rva) in &sections {
+                stubs.extend(super::scan_for_syscall_stubs(text));
+            }
             if stubs.is_empty() {
                 continue;
             }
@@ -1513,11 +1544,48 @@ mod platform {
     /// needed for COFF + optional header + all section headers, and
     /// reads that amount.  This handles PEs with large DOS stubs or
     /// many sections that would exceed a fixed 4 KB buffer.
-    fn read_remote_text_section(
+    /// Read all executable sections from a remote module's in-memory PE.
+    /// Returns a vec of `(bytes, rva)` pairs.
+    fn read_remote_executable_sections(
         handle: HANDLE,
         module_base: usize,
-    ) -> Option<(Vec<u8>, u32)> {
-        // Pass 1: read the DOS header (64 bytes) to learn e_lfanew.
+    ) -> Vec<(Vec<u8>, u32)> {
+        let pe = match parse_remote_pe_headers(handle, module_base) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let mut results = Vec::new();
+        for section in pe.all_executable_sections() {
+            let size = (section.virtual_size as usize).min(MAX_TEXT_READ);
+            if size < 10 {
+                continue;
+            }
+            let addr = module_base + section.virtual_address as usize;
+            let mut buf = vec![0u8; size];
+            let mut read = 0usize;
+            let _ = unsafe {
+                ReadProcessMemory(
+                    handle,
+                    addr as *const std::ffi::c_void,
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    size,
+                    Some(&mut read),
+                )
+            };
+            if read >= 10 {
+                buf.truncate(read);
+                results.push((buf, section.virtual_address));
+            }
+        }
+        results
+    }
+
+    /// Parse PE headers from a remote process module.
+    fn parse_remote_pe_headers(
+        handle: HANDLE,
+        module_base: usize,
+    ) -> Option<crate::pe::PeHeaders> {
         const DOS_HEADER_SIZE: usize = 64;
         let mut dos_buf = [0u8; DOS_HEADER_SIZE];
         let mut read = 0usize;
@@ -1531,11 +1599,7 @@ mod platform {
             )
             .ok()?;
         }
-        if read < DOS_HEADER_SIZE {
-            return None;
-        }
-        // Validate MZ signature
-        if dos_buf[0] != b'M' || dos_buf[1] != b'Z' {
+        if read < DOS_HEADER_SIZE || dos_buf[0] != b'M' || dos_buf[1] != b'Z' {
             return None;
         }
         let e_lfanew =
@@ -1544,16 +1608,8 @@ mod platform {
             return None;
         }
 
-        // Pass 2: read enough to parse COFF header (to learn
-        // num_sections and optional-header size), then compute the
-        // full header extent.
-        //
-        // PE sig (4) + COFF (20) = 24 bytes after e_lfanew gives us
-        // NumberOfSections and SizeOfOptionalHeader.
-        const PE_SIG_COFF: usize = 4 + 20; // PE\0\0 + COFF header
+        const PE_SIG_COFF: usize = 4 + 20;
         let coff_end = e_lfanew + PE_SIG_COFF;
-        // Read from start through the COFF header (so offsets remain
-        // consistent with the full header buffer we'll build).
         let mut probe_buf = vec![0u8; coff_end];
         let mut probe_read = 0usize;
         unsafe {
@@ -1570,29 +1626,23 @@ mod platform {
             return None;
         }
 
-        // NumberOfSections: COFF offset 2..4
         let num_sections = u16::from_le_bytes(
             probe_buf[e_lfanew + 6..e_lfanew + 8].try_into().ok()?,
         ) as usize;
-        // SizeOfOptionalHeader: COFF offset 16..18
         let opt_header_size = u16::from_le_bytes(
             probe_buf[e_lfanew + 20..e_lfanew + 22].try_into().ok()?,
         ) as usize;
 
-        // Full headers = everything up to the end of the section table.
-        // Section table starts right after the optional header.
         const SECTION_ENTRY_SIZE: usize = 40;
         let headers_needed = e_lfanew
             + PE_SIG_COFF
             + opt_header_size
             + num_sections * SECTION_ENTRY_SIZE;
 
-        // Sanity cap: PE headers shouldn't exceed ~1 MB in practice.
         if headers_needed > 1024 * 1024 {
             return None;
         }
 
-        // Pass 3: read the complete headers.
         let mut header_buf = vec![0u8; headers_needed];
         let mut header_read = 0usize;
         unsafe {
@@ -1609,43 +1659,7 @@ mod platform {
             return None;
         }
 
-        let pe =
-            crate::pe::PeHeaders::parse(&header_buf[..header_read])?;
-        // Use first_executable_section to handle UPX-packed PEs
-        // (UPX0/UPX1) and other non-standard section names.
-        let text = pe.first_executable_section()?;
-
-        let size = (text.virtual_size as usize).min(MAX_TEXT_READ);
-        let text_addr = module_base + text.virtual_address as usize;
-
-        let mut text_bytes = vec![0u8; size];
-        // Reset `read` before the .text read — it still holds the byte
-        // count from an earlier ReadProcessMemory (DOS/COFF headers).
-        // On failure, lpNumberOfBytesRead is undefined on Windows, so a
-        // stale value could make us accept a zero-filled buffer as code.
-        read = 0;
-        let _ = unsafe {
-            ReadProcessMemory(
-                handle,
-                text_addr as *const std::ffi::c_void,
-                text_bytes.as_mut_ptr() as *mut std::ffi::c_void,
-                size,
-                Some(&mut read),
-            )
-        };
-
-        // Accept partial reads — some pages may be uncommitted (guard
-        // pages, demand-zero).  ReadProcessMemory may return Err even
-        // when it has copied some bytes (STATUS_PARTIAL_COPY), so check
-        // `read` regardless of the error status.
-        //
-        // A syscall stub is ~10 bytes; require at least that much data.
-        if read < 10 {
-            return None;
-        }
-        text_bytes.truncate(read);
-
-        Some((text_bytes, text.virtual_address))
+        crate::pe::PeHeaders::parse(&header_buf[..header_read])
     }
 }
 

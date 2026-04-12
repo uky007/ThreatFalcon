@@ -762,8 +762,14 @@ mod platform {
             "Microsoft-Windows-Kernel-Process" => {
                 match event_id {
                     1 => {
-                        // ProcessCreate — trigger immediate memory scan
-                        let _ = scan_tx.try_send(ScanRequest::ProcessCreated { pid });
+                        // ProcessCreate — scan the *child* process, not
+                        // the parent.  ETW header PID may be the parent;
+                        // the actual child PID is in the parsed payload.
+                        let child_pid = match &event.data {
+                            EventData::ProcessCreate { pid: p, .. } => *p,
+                            _ => pid,
+                        };
+                        let _ = scan_tx.try_send(ScanRequest::ProcessCreated { pid: child_pid });
                     }
                     5 => {
                         // ImageLoad — trigger disk PE scan
