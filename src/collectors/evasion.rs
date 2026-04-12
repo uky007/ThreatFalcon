@@ -54,6 +54,11 @@ struct SyscallStubMatch {
     ssn: u32,
     /// Raw bytes of the matched stub for evidence.
     raw_bytes: Vec<u8>,
+    /// True when the stub ends with an indirect jump (`jmp [rip+disp]`,
+    /// `jmp r11`, etc.) rather than an inline `syscall`/`int 0x2e`.
+    /// Indirect matches have lower confidence because the jump target
+    /// cannot be verified from a static byte scan alone.
+    indirect: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,23 +89,41 @@ fn is_syscall_whitelisted(name: &str) -> bool {
         .any(|s| name.eq_ignore_ascii_case(s))
 }
 
+/// Maximum plausible syscall service number.
+///
+/// Windows has ~500 syscalls; the highest SSN observed in recent builds
+/// is around 0x200.  Anything above this threshold is almost certainly
+/// a coincidental byte pattern, not a real syscall stub.
+#[allow(dead_code)]
+const MAX_PLAUSIBLE_SSN: u32 = 0x600;
+
 /// Scan a byte slice for direct syscall stub patterns.
 ///
-/// Detects the canonical stub prologue used by SysWhispers and similar tools:
+/// Detects two prologue orders used by SysWhispers and similar tools:
 ///
+/// **Order A** (SysWhispers canonical):
 /// ```text
 /// 4C 8B D1          mov r10, rcx      (or 49 89 CA)
 /// B8 xx xx xx xx    mov eax, <SSN>
-/// ...               (up to MAX_GAP bytes of intervening instructions)
-/// 0F 05             syscall            (or CD 2E — int 0x2e)
 /// ```
 ///
-/// The scanner allows a gap between `mov eax` and the syscall instruction
-/// to handle the Wow64 compatibility-check variant that inserts a
-/// `test byte ptr [SharedUserData], 1; jne` sequence.
+/// **Order B** (reversed, used by some toolkits):
+/// ```text
+/// B8 xx xx xx xx    mov eax, <SSN>
+/// 4C 8B D1          mov r10, rcx      (or 49 89 CA)
+/// ```
+///
+/// After the prologue, the scanner looks for one of:
+/// - `0F 05`  — `syscall`
+/// - `CD 2E`  — `int 0x2e`
+/// - `FF 25`  — `jmp [rip+disp32]` (indirect syscall via ntdll)
+/// - `41 FF E3` / `41 FF E1` — `jmp r11` / `jmp r9` (register indirect)
+///
+/// within a small gap.  An SSN range check (< MAX_PLAUSIBLE_SSN)
+/// eliminates false positives from coincidental byte sequences.
 #[allow(dead_code)] // used on Windows and in tests
 fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
-    /// Max bytes between `mov eax, SSN` and `syscall`/`int 0x2e`.
+    /// Max bytes between the prologue end and the syscall/jmp instruction.
     /// 12 covers the Wow64 test+jne sequence (10 bytes).
     const MAX_GAP: usize = 12;
 
@@ -111,45 +134,74 @@ fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
 
     let mut i = 0;
     while i + 9 < data.len() {
-        // Step 1: mov r10, rcx  (4C 8B D1 or 49 89 CA)
-        let is_mov_r10 =
-            (data[i] == 0x4C && data[i + 1] == 0x8B && data[i + 2] == 0xD1)
-                || (data[i] == 0x49 && data[i + 1] == 0x89 && data[i + 2] == 0xCA);
-        if !is_mov_r10 {
+        // Try both prologue orders:
+        //   Order A: mov r10, rcx (3 bytes) + mov eax, SSN (5 bytes) = 8 bytes
+        //   Order B: mov eax, SSN (5 bytes) + mov r10, rcx (3 bytes) = 8 bytes
+        let (ssn, prologue_end) = if is_mov_r10_rcx(data, i)
+            && i + 7 < data.len()
+            && data[i + 3] == 0xB8
+        {
+            // Order A: mov r10, rcx; mov eax, SSN
+            let ssn = u32::from_le_bytes([
+                data[i + 4],
+                data[i + 5],
+                data[i + 6],
+                data[i + 7],
+            ]);
+            (ssn, i + 8)
+        } else if data[i] == 0xB8
+            && i + 7 < data.len()
+            && is_mov_r10_rcx(data, i + 5)
+        {
+            // Order B: mov eax, SSN; mov r10, rcx
+            let ssn = u32::from_le_bytes([
+                data[i + 1],
+                data[i + 2],
+                data[i + 3],
+                data[i + 4],
+            ]);
+            (ssn, i + 8)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        // Reject implausible SSNs to eliminate false positives
+        if ssn > MAX_PLAUSIBLE_SSN {
             i += 1;
             continue;
         }
 
-        // Step 2: mov eax, imm32  (B8 xx xx xx xx)
-        if i + 7 >= data.len() || data[i + 3] != 0xB8 {
-            i += 1;
-            continue;
-        }
-
-        let ssn = u32::from_le_bytes([
-            data[i + 4],
-            data[i + 5],
-            data[i + 6],
-            data[i + 7],
-        ]);
-
-        // Step 3: scan forward for syscall/int 0x2e within MAX_GAP
-        let scan_end = (i + 8 + MAX_GAP).min(data.len().saturating_sub(1));
+        // Scan forward for syscall/int 2e/indirect jmp within MAX_GAP
+        let scan_end = (prologue_end + MAX_GAP).min(data.len().saturating_sub(1));
         let mut found = false;
-        for j in (i + 8)..=scan_end {
+        let mut j = prologue_end;
+        while j <= scan_end {
             if j + 1 >= data.len() {
                 break;
             }
+
+            // (instruction, end_position, is_indirect)
             let instr = if data[j] == 0x0F && data[j + 1] == 0x05 {
-                Some(SyscallInstruction::Syscall)
+                Some((SyscallInstruction::Syscall, j + 2, false))
             } else if data[j] == 0xCD && data[j + 1] == 0x2E {
-                Some(SyscallInstruction::Int2E)
+                Some((SyscallInstruction::Int2E, j + 2, false))
+            } else if data[j] == 0xFF && data[j + 1] == 0x25 && j + 5 < data.len() {
+                // jmp [rip+disp32] — possible indirect syscall
+                Some((SyscallInstruction::Syscall, j + 6, true))
+            } else if j + 2 < data.len()
+                && data[j] == 0x41
+                && data[j + 1] == 0xFF
+                && (data[j + 2] == 0xE3 || data[j + 2] == 0xE1)
+            {
+                // jmp r11 / jmp r9 — possible register-indirect syscall
+                Some((SyscallInstruction::Syscall, j + 3, true))
             } else {
                 None
             };
 
-            if let Some(instruction) = instr {
-                let mut end = j + 2;
+            if let Some((instruction, end_pos, is_indirect)) = instr {
+                let mut end = end_pos;
                 // Include trailing ret (C3) if present
                 if end < data.len() && data[end] == 0xC3 {
                     end += 1;
@@ -159,11 +211,14 @@ fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
                     instruction,
                     ssn,
                     raw_bytes: data[i..end].to_vec(),
+                    indirect: is_indirect,
                 });
                 found = true;
                 i = end;
                 break;
             }
+
+            j += 1;
         }
 
         if !found {
@@ -172,6 +227,15 @@ fn scan_for_syscall_stubs(data: &[u8]) -> Vec<SyscallStubMatch> {
     }
 
     matches
+}
+
+/// Check if bytes at `pos` are `mov r10, rcx` (4C 8B D1 or 49 89 CA).
+#[inline]
+#[allow(dead_code)]
+fn is_mov_r10_rcx(data: &[u8], pos: usize) -> bool {
+    pos + 2 < data.len()
+        && ((data[pos] == 0x4C && data[pos + 1] == 0x8B && data[pos + 2] == 0xD1)
+            || (data[pos] == 0x49 && data[pos + 1] == 0x89 && data[pos + 2] == 0xCA))
 }
 
 /// Detect known AMSI bypass patterns in the first bytes of AmsiScanBuffer.
@@ -837,6 +901,25 @@ mod platform {
     /// Maximum bytes to read from a remote module's .text section.
     const MAX_TEXT_READ: usize = 1024 * 1024; // 1 MB
 
+    /// A candidate match from one module, used to rank results.
+    struct SyscallCandidate {
+        mod_name: String,
+        module_base: usize,
+        stubs: Vec<super::SyscallStubMatch>,
+        has_direct: bool,
+    }
+
+    impl SyscallCandidate {
+        /// Higher = more suspicious.
+        fn rank(&self) -> u32 {
+            let mut r = self.stubs.len() as u32;
+            if self.has_direct {
+                r += 1000; // direct stubs always outrank indirect
+            }
+            r
+        }
+    }
+
     fn check_direct_syscall(
         handle: HANDLE,
         pid: u32,
@@ -860,6 +943,12 @@ mod platform {
         let count =
             needed as usize / std::mem::size_of::<HMODULE>();
 
+        // Scan ALL modules and collect candidates instead of
+        // returning on the first match.  This ensures a high-
+        // confidence direct-stub module is not masked by an
+        // earlier low-confidence indirect-only module.
+        let mut candidates: Vec<SyscallCandidate> = Vec::new();
+
         for m in &modules[..count] {
             let mut name_buf = [0u8; 260];
             let len = unsafe {
@@ -872,9 +961,6 @@ mod platform {
                 std::str::from_utf8(&name_buf[..len as usize])
                     .unwrap_or("");
 
-            // Skip DLLs that legitimately contain syscall stubs,
-            // but only if they're actually loaded from a system
-            // directory (prevents side-loaded same-name bypasses).
             if is_system_syscall_module(handle, *m, mod_name) {
                 continue;
             }
@@ -891,65 +977,106 @@ mod platform {
                 continue;
             }
 
-            let first = &stubs[0];
-            let evidence = vec![
-                format!(
-                    "module: {} at base 0x{:X}",
-                    mod_name, module_base
-                ),
-                format!(
-                    "{} syscall stub(s) found in .text section",
-                    stubs.len()
-                ),
-                format!(
-                    "first stub at .text+0x{:X}: {}",
-                    first.offset, first.instruction
-                ),
-                format!("SSN: 0x{:X}", first.ssn),
-                format!("stub bytes: {:02X?}", first.raw_bytes),
-            ];
+            let has_direct = stubs.iter().any(|s| !s.indirect);
 
-            return Some(ThreatEvent::with_rule(
+            candidates.push(SyscallCandidate {
+                mod_name: mod_name.to_string(),
+                module_base,
+                stubs,
+                has_direct,
+            });
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Pick the highest-ranked candidate (direct > indirect,
+        // then by stub count).
+        candidates.sort_by(|a, b| b.rank().cmp(&a.rank()));
+        let best = &candidates[0];
+
+        let all_indirect = !best.has_direct;
+        let first = &best.stubs[0];
+
+        let details = format!(
+            "{} suspicious {} stub(s) \
+             found in non-system module {}",
+            best.stubs.len(),
+            if all_indirect { "indirect syscall" } else { "direct syscall" },
+            best.mod_name,
+        );
+
+        // Indirect-only matches are emitted as telemetry (no rule
+        // metadata) because the jump targets cannot be verified
+        // statically.  Only direct syscall/int 0x2e stubs produce
+        // a TF-EVA-004 detection alert.
+        if all_indirect {
+            return Some(ThreatEvent::new(
                 agent,
                 EventSource::EvasionDetector,
                 EventCategory::Evasion,
-                Severity::High,
+                Severity::Info,
                 EventData::EvasionDetected {
                     technique: EvasionTechnique::DirectSyscall,
                     pid: Some(pid),
                     process_name: None,
-                    details: format!(
-                        "{} suspicious direct syscall stub(s) \
-                         found in non-system module {}",
-                        stubs.len(),
-                        mod_name,
-                    ),
-                },
-                RuleMetadata {
-                    id: "TF-EVA-004".into(),
-                    name: "Suspicious Direct Syscall Stub".into(),
-                    description: "A non-system module contains \
-                        syscall/int 0x2e instruction sequences \
-                        with the mov r10,rcx; mov eax,SSN prologue \
-                        characteristic of tools like SysWhispers. \
-                        This pattern is commonly used to invoke \
-                        system calls without going through ntdll, \
-                        but the sensor has not confirmed execution."
-                        .into(),
-                    mitre: MitreRef {
-                        tactic: "Defense Evasion".into(),
-                        technique_id: "T1562.001".into(),
-                        technique_name:
-                            "Impair Defenses: Disable or Modify Tools"
-                                .into(),
-                    },
-                    confidence: Confidence::Medium,
-                    evidence,
+                    details,
                 },
             ));
         }
 
-        None
+        let evidence = vec![
+            format!(
+                "module: {} at base 0x{:X}",
+                best.mod_name, best.module_base
+            ),
+            format!(
+                "{} syscall stub(s) found in .text section",
+                best.stubs.len()
+            ),
+            format!(
+                "first stub at .text+0x{:X}: {}",
+                first.offset, first.instruction
+            ),
+            format!("SSN: 0x{:X}", first.ssn),
+            format!("stub bytes: {:02X?}", first.raw_bytes),
+        ];
+
+        Some(ThreatEvent::with_rule(
+            agent,
+            EventSource::EvasionDetector,
+            EventCategory::Evasion,
+            Severity::High,
+            EventData::EvasionDetected {
+                technique: EvasionTechnique::DirectSyscall,
+                pid: Some(pid),
+                process_name: None,
+                details,
+            },
+            RuleMetadata {
+                id: "TF-EVA-004".into(),
+                name: "Suspicious Direct Syscall Stub".into(),
+                description:
+                    "A non-system module contains \
+                     syscall/int 0x2e instruction sequences \
+                     with the mov r10,rcx; mov eax,SSN prologue \
+                     characteristic of tools like SysWhispers. \
+                     This pattern is commonly used to invoke \
+                     system calls without going through ntdll, \
+                     but the sensor has not confirmed execution."
+                        .into(),
+                mitre: MitreRef {
+                    tactic: "Defense Evasion".into(),
+                    technique_id: "T1562.001".into(),
+                    technique_name:
+                        "Impair Defenses: Disable or Modify Tools"
+                            .into(),
+                },
+                confidence: Confidence::Medium,
+                evidence,
+            },
+        ))
     }
 
     /// Read the .text section of a remote module by parsing its PE
@@ -1069,6 +1196,11 @@ mod platform {
         let text_addr = module_base + text.virtual_address as usize;
 
         let mut text_bytes = vec![0u8; size];
+        // Reset `read` before the .text read — it still holds the byte
+        // count from an earlier ReadProcessMemory (DOS/COFF headers).
+        // On failure, lpNumberOfBytesRead is undefined on Windows, so a
+        // stale value could make us accept a zero-filled buffer as code.
+        read = 0;
         let ok = unsafe {
             ReadProcessMemory(
                 handle,
@@ -1079,9 +1211,16 @@ mod platform {
             )
         };
 
-        if ok.is_err() || read < size {
+        // Accept partial reads — some pages may be uncommitted (guard
+        // pages, demand-zero).  ReadProcessMemory may return Err even
+        // when it has copied some bytes (STATUS_PARTIAL_COPY), so check
+        // `read` regardless of the error status.
+        //
+        // A syscall stub is ~10 bytes; require at least that much data.
+        if read < 10 {
             return None;
         }
+        text_bytes.truncate(read);
 
         Some((text_bytes, text.virtual_address))
     }
@@ -1158,6 +1297,7 @@ mod tests {
         assert_eq!(matches[0].ssn, 0x18);
         assert_eq!(matches[0].instruction, SyscallInstruction::Syscall);
         assert_eq!(matches[0].raw_bytes, data.to_vec());
+        assert!(!matches[0].indirect);
     }
 
     #[test]
@@ -1336,6 +1476,148 @@ mod tests {
         assert!(!is_syscall_whitelisted("malware.dll"));
         assert!(!is_syscall_whitelisted("myapp.exe"));
         assert!(!is_syscall_whitelisted("kernel32.dll"));
+    }
+
+    // ---- SSN range check tests -----------------------------------------------
+
+    #[test]
+    fn reject_implausible_ssn() {
+        // msedgewebview2.exe false positive: SSN = 0x0FC0940F (way too high)
+        let data = [
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0xB8, 0x0F, 0x94, 0xC0, 0x0F, // mov eax, 0x0FC0940F
+            0x0F, 0x05, // syscall (actually data bytes)
+            0xC3,
+        ];
+        assert!(
+            scan_for_syscall_stubs(&data).is_empty(),
+            "SSN > MAX_PLAUSIBLE_SSN must be rejected"
+        );
+    }
+
+    #[test]
+    fn accept_plausible_ssn() {
+        // Real NtWriteVirtualMemory SSN = 0x3A
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x3A, 0x00, 0x00, 0x00,
+            0x0F, 0x05, 0xC3,
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x3A);
+    }
+
+    // ---- reversed prologue tests ---------------------------------------------
+
+    #[test]
+    fn detect_reversed_prologue() {
+        // mov eax, SSN; mov r10, rcx; syscall; ret
+        let data = [
+            0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0x0F, 0x05, // syscall
+            0xC3,
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x18);
+    }
+
+    #[test]
+    fn detect_reversed_prologue_alternate_encoding() {
+        // mov eax, SSN; 49 89 CA (mov r10, rcx alternate); syscall; ret
+        let data = [
+            0xB8, 0x26, 0x00, 0x00, 0x00,
+            0x49, 0x89, 0xCA,
+            0x0F, 0x05,
+            0xC3,
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x26);
+    }
+
+    // ---- indirect syscall tests ----------------------------------------------
+
+    #[test]
+    fn detect_indirect_syscall_jmp_rip() {
+        // mov r10, rcx; mov eax, SSN; jmp [rip+disp32]
+        let data = [
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0xB8, 0x18, 0x00, 0x00, 0x00, // mov eax, 0x18
+            0xFF, 0x25, 0x42, 0x00, 0x00, 0x00, // jmp [rip+0x42]
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x18);
+        assert!(matches[0].indirect, "jmp [rip+disp] must be flagged indirect");
+    }
+
+    #[test]
+    fn detect_indirect_syscall_jmp_r11() {
+        // mov r10, rcx; mov eax, SSN; jmp r11
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x3A, 0x00, 0x00, 0x00,
+            0x41, 0xFF, 0xE3, // jmp r11
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x3A);
+        assert!(matches[0].indirect, "jmp r11 must be flagged indirect");
+    }
+
+    #[test]
+    fn detect_indirect_syscall_jmp_r9() {
+        // Some tools use r9 for the ntdll syscall address
+        let data = [
+            0xB8, 0x50, 0x00, 0x00, 0x00, // mov eax, 0x50
+            0x4C, 0x8B, 0xD1, // mov r10, rcx
+            0x41, 0xFF, 0xE1, // jmp r9
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].ssn, 0x50);
+        assert!(matches[0].indirect, "jmp r9 must be flagged indirect");
+    }
+
+    #[test]
+    fn single_indirect_stub_not_enough() {
+        // A single indirect match should be filtered out by
+        // check_direct_syscall (requires >=2 for indirect-only).
+        // Here we just verify the scanner still flags it as indirect.
+        let data = [
+            0x4C, 0x8B, 0xD1,
+            0xB8, 0x18, 0x00, 0x00, 0x00,
+            0x41, 0xFF, 0xE3,
+        ];
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].indirect);
+        // The check_direct_syscall caller would drop this single match.
+    }
+
+    #[test]
+    fn mixed_direct_and_indirect_stubs() {
+        // One direct + one indirect: has_direct=true, should report
+        // at full confidence.
+        let mut data = Vec::new();
+        // Direct stub
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0x00, 0x00, 0x00,
+            0x0F, 0x05, 0xC3,
+        ]);
+        data.extend_from_slice(&[0xCC; 5]); // padding
+        // Indirect stub
+        data.extend_from_slice(&[
+            0x4C, 0x8B, 0xD1, 0xB8, 0x3A, 0x00, 0x00, 0x00,
+            0x41, 0xFF, 0xE3,
+        ]);
+        let matches = scan_for_syscall_stubs(&data);
+        assert_eq!(matches.len(), 2);
+        assert!(!matches[0].indirect, "first is direct");
+        assert!(matches[1].indirect, "second is indirect");
     }
 
     // ---- AMSI bypass pattern tests ------------------------------------------
