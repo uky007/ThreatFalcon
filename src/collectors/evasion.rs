@@ -425,17 +425,19 @@ mod platform {
             .checked_sub(interval)
             .unwrap_or_else(std::time::Instant::now);
 
+        /// Max requests to process per drain call.  Prevents a flood of
+        /// ProcessCreate/ImageLoad events from starving periodic sweeps
+        /// (ETW patching, AMSI bypass, ntdll unhooking).
+        const DRAIN_BUDGET: usize = 64;
+
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
 
-            // --- Drain pending requests BEFORE the sweep ---
-            // This ensures ProcessCreate/ImageLoad/TI requests that
-            // arrived since the last cycle are handled immediately,
-            // not delayed behind a full process enumeration.
+            // --- Drain pending requests (bounded) BEFORE the sweep ---
             drain_scan_requests(
-                &scan_rx, config, agent, tx, dropped,
+                &scan_rx, config, agent, tx, dropped, DRAIN_BUDGET,
             );
 
             // --- Periodic full sweep (only when interval elapsed) ---
@@ -446,10 +448,9 @@ mod platform {
                         return;
                     }
 
-                    // Drain requests between processes so short-lived
-                    // processes don't expire while we scan others.
+                    // Bounded drain between processes
                     drain_scan_requests(
-                        &scan_rx, config, agent, tx, dropped,
+                        &scan_rx, config, agent, tx, dropped, DRAIN_BUDGET,
                     );
 
                     scan_single_process(
@@ -488,6 +489,7 @@ mod platform {
                             std::thread::sleep(interval);
                             drain_scan_requests(
                                 &scan_rx, config, agent, tx, dropped,
+                                DRAIN_BUDGET,
                             );
                             let pids = enumerate_pids();
                             for pid in &pids {
@@ -547,15 +549,20 @@ mod platform {
         unsafe { let _ = CloseHandle(handle); }
     }
 
+    /// Drain up to `budget` pending scan requests.
     fn drain_scan_requests(
         scan_rx: &std::sync::mpsc::Receiver<super::ScanRequest>,
         config: &EvasionConfig,
         agent: &crate::events::AgentInfo,
         tx: &tokio::sync::mpsc::Sender<ThreatEvent>,
         dropped: &Arc<AtomicU64>,
+        budget: usize,
     ) {
-        while let Ok(req) = scan_rx.try_recv() {
-            handle_scan_request(req, config, agent, tx, dropped);
+        for _ in 0..budget {
+            match scan_rx.try_recv() {
+                Ok(req) => handle_scan_request(req, config, agent, tx, dropped),
+                Err(_) => break,
+            }
         }
     }
 
@@ -628,6 +635,14 @@ mod platform {
         // "ntdll.dll" and bypass scanning entirely.
         let basename = path.rsplit('\\').next().unwrap_or(&path);
         if super::is_syscall_whitelisted(basename) && is_system_path(&path) {
+            return None;
+        }
+
+        // Cap file size to prevent unbounded I/O and memory use.
+        // Legitimate PEs with syscall stubs are well under 16 MB.
+        const MAX_DISK_PE_SIZE: u64 = 16 * 1024 * 1024;
+        let metadata = std::fs::metadata(&path).ok()?;
+        if metadata.len() > MAX_DISK_PE_SIZE {
             return None;
         }
 

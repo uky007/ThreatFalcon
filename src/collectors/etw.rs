@@ -519,6 +519,8 @@ mod platform {
         scan_tx: Option<std::sync::mpsc::SyncSender<crate::collectors::evasion::ScanRequest>>,
         stop: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
+        /// Counter for scan requests dropped due to channel backpressure.
+        scan_requests_dropped: Arc<AtomicU64>,
     }
 
     /// Start an ETW real-time trace session, enable the configured providers,
@@ -640,6 +642,7 @@ mod platform {
                 scan_tx,
                 stop: stop_clone,
                 dropped,
+                scan_requests_dropped: Arc::new(AtomicU64::new(0)),
             });
             let ctx_ptr = Box::into_raw(ctx);
 
@@ -732,7 +735,8 @@ mod platform {
             // Send scan requests for relevant events
             if let Some(ref scan_tx) = ctx.scan_tx {
                 send_scan_requests(
-                    scan_tx, provider_name, event_id, pid, event,
+                    scan_tx, &ctx.scan_requests_dropped,
+                    provider_name, event_id, pid, event,
                 );
             }
 
@@ -751,6 +755,7 @@ mod platform {
     /// Send scan requests to the evasion collector for relevant ETW events.
     fn send_scan_requests(
         scan_tx: &std::sync::mpsc::SyncSender<crate::collectors::evasion::ScanRequest>,
+        scan_dropped: &Arc<AtomicU64>,
         provider: &str,
         event_id: u16,
         pid: u32,
@@ -769,16 +774,26 @@ mod platform {
                             EventData::ProcessCreate { pid: p, .. } => *p,
                             _ => pid,
                         };
-                        let _ = scan_tx.try_send(ScanRequest::ProcessCreated { pid: child_pid });
+                        if scan_tx.try_send(ScanRequest::ProcessCreated { pid: child_pid }).is_err() {
+                            let n = scan_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_power_of_two() {
+                                tracing::warn!(total = n, "Scan requests dropped (queue full)");
+                            }
+                        }
                     }
                     5 => {
                         // ImageLoad — trigger disk PE scan
                         if let EventData::ImageLoad { image_path, .. } = &event.data {
                             if !image_path.is_empty() {
-                                let _ = scan_tx.try_send(ScanRequest::ImageLoaded {
+                                if scan_tx.try_send(ScanRequest::ImageLoaded {
                                     pid,
                                     image_path: image_path.clone(),
-                                });
+                                }).is_err() {
+                                    let n = scan_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n.is_power_of_two() {
+                                        tracing::warn!(total = n, "Scan requests dropped (queue full)");
+                                    }
+                                }
                             }
                         }
                     }
@@ -789,11 +804,16 @@ mod platform {
                 // TI event — trigger import correlation
                 if let EventData::EvasionDetected { pid: Some(calling_pid), .. } = &event.data {
                     if let Some(func) = crate::collectors::evasion::ti_event_to_function(event_id) {
-                        let _ = scan_tx.try_send(ScanRequest::ThreatIntelligence {
+                        if scan_tx.try_send(ScanRequest::ThreatIntelligence {
                             calling_pid: *calling_pid,
                             function_name: func.to_string(),
                             ti_event_id: event_id,
-                        });
+                        }).is_err() {
+                            let n = scan_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_power_of_two() {
+                                tracing::warn!(total = n, "Scan requests dropped (queue full)");
+                            }
+                        }
                     }
                 }
             }
