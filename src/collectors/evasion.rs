@@ -421,6 +421,14 @@ mod platform {
         let ntdll_reference = build_ntdll_reference();
         let amsi_reference = build_amsi_reference();
 
+        // Rate-limit TI import correlation: at most once per PID
+        // per 60 seconds to avoid repeated expensive disk I/O.
+        let ti_rate_limit: std::sync::Arc<std::sync::Mutex<
+            std::collections::HashMap<u32, std::time::Instant>,
+        >> = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
+
         let mut last_sweep = std::time::Instant::now()
             .checked_sub(interval)
             .unwrap_or_else(std::time::Instant::now);
@@ -437,7 +445,7 @@ mod platform {
 
             // --- Drain pending requests (bounded) BEFORE the sweep ---
             drain_scan_requests(
-                &scan_rx, config, agent, tx, dropped, DRAIN_BUDGET,
+                &scan_rx, config, agent, tx, dropped, DRAIN_BUDGET, &ti_rate_limit,
             );
 
             // --- Periodic full sweep (only when interval elapsed) ---
@@ -450,7 +458,7 @@ mod platform {
 
                     // Bounded drain between processes
                     drain_scan_requests(
-                        &scan_rx, config, agent, tx, dropped, DRAIN_BUDGET,
+                        &scan_rx, config, agent, tx, dropped, DRAIN_BUDGET, &ti_rate_limit,
                     );
 
                     scan_single_process(
@@ -468,7 +476,7 @@ mod platform {
             if remaining > std::time::Duration::ZERO {
                 match scan_rx.recv_timeout(remaining) {
                     Ok(req) => {
-                        handle_scan_request(req, config, agent, tx, dropped);
+                        handle_scan_request(req, config, agent, tx, dropped, &ti_rate_limit);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         // Normal: sweep interval elapsed
@@ -557,14 +565,20 @@ mod platform {
         tx: &tokio::sync::mpsc::Sender<ThreatEvent>,
         dropped: &Arc<AtomicU64>,
         budget: usize,
+        ti_rate_limit: &std::sync::Mutex<
+            std::collections::HashMap<u32, std::time::Instant>,
+        >,
     ) {
         for _ in 0..budget {
             match scan_rx.try_recv() {
-                Ok(req) => handle_scan_request(req, config, agent, tx, dropped),
+                Ok(req) => handle_scan_request(req, config, agent, tx, dropped, ti_rate_limit),
                 Err(_) => break,
             }
         }
     }
+
+    /// Rate-limit interval for TI import correlation per PID.
+    const TI_RATE_LIMIT_SECS: u64 = 60;
 
     fn handle_scan_request(
         req: super::ScanRequest,
@@ -572,6 +586,9 @@ mod platform {
         agent: &crate::events::AgentInfo,
         tx: &mpsc::Sender<ThreatEvent>,
         dropped: &Arc<AtomicU64>,
+        ti_rate_limit: &std::sync::Mutex<
+            std::collections::HashMap<u32, std::time::Instant>,
+        >,
     ) {
         use super::ScanRequest;
         match req {
@@ -603,6 +620,19 @@ mod platform {
             } => {
                 if !config.detect_direct_syscall {
                     return;
+                }
+                // Rate-limit: skip if this PID was checked recently
+                {
+                    let mut map = ti_rate_limit.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    if let Some(last) = map.get(&calling_pid) {
+                        if now.duration_since(*last).as_secs() < TI_RATE_LIMIT_SECS {
+                            return;
+                        }
+                    }
+                    map.insert(calling_pid, now);
+                    // Prune old entries to avoid unbounded growth
+                    map.retain(|_, t| now.duration_since(*t).as_secs() < TI_RATE_LIMIT_SECS * 2);
                 }
                 if let Some(evt) = check_ti_import_correlation(
                     calling_pid,
@@ -638,18 +668,26 @@ mod platform {
             return None;
         }
 
-        // Cap file size to prevent unbounded I/O and memory use.
-        // Legitimate PEs with syscall stubs are well under 16 MB.
-        const MAX_DISK_PE_SIZE: u64 = 16 * 1024 * 1024;
+        // Read the full file but cap at 64 MB to avoid extreme cases.
+        // The real budget is enforced per-section below.
+        const MAX_FILE_READ: u64 = 64 * 1024 * 1024;
         let metadata = std::fs::metadata(&path).ok()?;
-        if metadata.len() > MAX_DISK_PE_SIZE {
+        if metadata.len() > MAX_FILE_READ {
+            tracing::debug!(
+                path = %path,
+                size = metadata.len(),
+                "Skipping oversized PE for disk scan"
+            );
             return None;
         }
 
         let data = std::fs::read(&path).ok()?;
         let pe = crate::pe::PeHeaders::parse(&data)?;
 
-        // Scan ALL executable sections — stubs can live in any of them
+        // Scan executable sections with a total byte budget.
+        // This prevents junk-padded PEs from consuming unbounded
+        // I/O — we scan code, not the whole file.
+        const MAX_EXEC_BYTES: usize = 4 * 1024 * 1024;
         let sections = pe.all_executable_sections();
         if sections.is_empty() {
             return None;
@@ -658,14 +696,21 @@ mod platform {
         let mut stubs = Vec::new();
         let mut scanned_section_name = String::new();
         let mut scanned_section_size = 0usize;
+        let mut total_scanned = 0usize;
         for section in &sections {
+            if total_scanned >= MAX_EXEC_BYTES {
+                break;
+            }
             if let Some(section_data) = pe.read_section_data(&data, section) {
-                let found = super::scan_for_syscall_stubs(section_data);
+                let budget_left = MAX_EXEC_BYTES - total_scanned;
+                let scan_len = section_data.len().min(budget_left);
+                let found = super::scan_for_syscall_stubs(&section_data[..scan_len]);
                 if !found.is_empty() && stubs.is_empty() {
                     scanned_section_name = section.name.clone();
-                    scanned_section_size = section_data.len();
+                    scanned_section_size = scan_len;
                 }
                 stubs.extend(found);
+                total_scanned += scan_len;
             }
         }
 

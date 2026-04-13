@@ -15,6 +15,8 @@ pub struct EtwCollector {
     #[allow(dead_code)] // used on Windows only
     agent: AgentInfo,
     dropped: Arc<AtomicU64>,
+    /// Scan requests dropped due to channel backpressure.
+    scan_requests_dropped: Arc<AtomicU64>,
     /// Sender for scan requests to the evasion collector.
     #[allow(dead_code)]
     scan_tx: Option<std::sync::mpsc::SyncSender<super::evasion::ScanRequest>>,
@@ -34,6 +36,7 @@ impl EtwCollector {
             config,
             agent,
             dropped: Arc::new(AtomicU64::new(0)),
+            scan_requests_dropped: Arc::new(AtomicU64::new(0)),
             scan_tx: Some(scan_tx),
             #[cfg(target_os = "windows")]
             stop_flag: None,
@@ -535,6 +538,7 @@ mod platform {
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
         scan_tx: Option<std::sync::mpsc::SyncSender<crate::collectors::evasion::ScanRequest>>,
+        scan_requests_dropped: Arc<AtomicU64>,
     ) -> Result<(Arc<AtomicBool>, isize)> {
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -642,7 +646,7 @@ mod platform {
                 scan_tx,
                 stop: stop_clone,
                 dropped,
-                scan_requests_dropped: Arc::new(AtomicU64::new(0)),
+                scan_requests_dropped,
             });
             let ctx_ptr = Box::into_raw(ctx);
 
@@ -1825,6 +1829,7 @@ impl Collector for EtwCollector {
                 _tx,
                 self.dropped.clone(),
                 self.scan_tx.take(),
+                self.scan_requests_dropped.clone(),
             )?;
             self.stop_flag = Some(flag);
             self.instance_lock = Some(lock);
@@ -1858,6 +1863,7 @@ impl Collector for EtwCollector {
 
     fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+            + self.scan_requests_dropped.load(Ordering::Relaxed)
     }
 }
 
