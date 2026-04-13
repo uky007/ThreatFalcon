@@ -497,7 +497,7 @@ mod platform {
                             std::thread::sleep(interval);
                             drain_scan_requests(
                                 &scan_rx, config, agent, tx, dropped,
-                                DRAIN_BUDGET,
+                                DRAIN_BUDGET, &ti_rate_limit,
                             );
                             let pids = enumerate_pids();
                             for pid in &pids {
