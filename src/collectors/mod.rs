@@ -5,6 +5,7 @@ mod tdh;
 pub mod evasion;
 pub mod health;
 pub mod macos;
+pub mod linux_audit;
 pub mod sysmon;
 pub mod sysmon_parser;
 

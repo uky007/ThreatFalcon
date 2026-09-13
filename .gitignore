@@ -4,3 +4,6 @@
 /configs/macos.state
 /configs/macos-events.jsonl
 /configs/macos-events.jsonl.*
+/configs/linux.state
+/configs/linux-events.jsonl
+/configs/linux-events.jsonl.*

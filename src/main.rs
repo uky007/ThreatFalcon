@@ -10,6 +10,7 @@ mod events;
 mod fixtures;
 mod index;
 mod investigate;
+mod linux_events;
 mod macos_events;
 mod output;
 #[allow(dead_code)] // some methods only used by evasion collector on Windows
@@ -38,7 +39,7 @@ mod exit_code {
     pub const RUNTIME_ERROR: i32 = 2;
 }
 
-/// ThreatFalcon — experimental endpoint telemetry sensor for Windows and macOS
+/// ThreatFalcon — experimental endpoint telemetry sensor for Windows, macOS and Linux
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -243,7 +244,7 @@ async fn run_foreground(cli: Cli) -> Result<()> {
 
     tracing::info!("ThreatFalcon Sensor v{}", env!("CARGO_PKG_VERSION"));
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     tracing::warn!(
         "Native collection is not implemented on this OS — offline tools remain available"
     );

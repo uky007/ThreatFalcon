@@ -394,6 +394,7 @@ pub struct IndexStats {
 
 /// Filter for index queries — mirrors the CLI query filters but uses
 /// pre-parsed values suitable for SQL.
+#[derive(Default)]
 pub struct IndexFilter {
     pub pid: Option<u32>,
     pub process_key: Option<String>,
@@ -521,6 +522,7 @@ fn severity_str(sev: &Severity) -> &'static str {
 
 fn source_index_fields(source: &EventSource) -> (&'static str, Option<String>) {
     match source {
+        EventSource::LinuxAudit => ("linuxaudit", None),
         EventSource::EndpointSecurity => ("endpointsecurity", None),
         EventSource::Etw { provider } => ("etw", Some(provider.clone())),
         EventSource::Sysmon { event_id } => ("sysmon", Some(event_id.to_string())),
@@ -549,6 +551,7 @@ fn category_short(cat: &EventCategory) -> &'static str {
 /// keep this module self-contained).
 fn event_pid(data: &EventData) -> Option<u32> {
     match data {
+        EventData::LinuxAudit { record } => record.pid(),
         EventData::MacosEndpointSecurity { record } => Some(record.subject().identity.pid),
         EventData::ProcessCreate { pid, .. }
         | EventData::ProcessTerminate { pid, .. }

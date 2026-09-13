@@ -21,6 +21,44 @@ fn event(agent: &str, timestamp: &str) -> Value {
 const AGENT: &str = "00000000-0000-0000-0000-000000000001";
 
 #[test]
+fn linux_audit_health_is_bilingual_and_does_not_claim_exact_loss_or_coverage() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("linux-health.jsonl");
+    let mut sample = event(AGENT, "2026-09-13T00:00:00Z");
+    sample["data"]["collectors"] = json!([{
+        "name":"LinuxAudit", "state":"Error", "recovery_mode":"future_only",
+        "error":{"code":"audit_permission_denied"},
+        "linux_audit":{"records_received":20,"records_filtered":3,"fields_omitted":5,"socket_overruns":7,"truncated_datagrams":2}
+    }]);
+    fs::write(&path, sample.to_string()).unwrap();
+    for (lang, label, limitation) in [
+        ("ja", "欠落イベント数ではありません", "収集範囲は未確認"),
+        ("en", "not lost event counts", "coverage are not verified"),
+    ] {
+        cmd()
+            .args(["health", "--input", path.to_str().unwrap(), "--lang", lang])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("CAP_AUDIT_READ")
+                    .and(predicate::str::contains(label))
+                    .and(predicate::str::contains(limitation))
+                    .and(predicate::str::contains("7 / 2")),
+            );
+    }
+    let result = cmd()
+        .args(["analyze", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        report["agents"][AGENT]["recorded_loss_or_degradation"],
+        true
+    );
+}
+
+#[test]
 fn macos_permissions_and_sequence_diagnostics_are_bilingual() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("macos-health.jsonl");

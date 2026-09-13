@@ -55,6 +55,10 @@ impl Sensor {
                 config.collectors.macos.clone(),
                 agent.clone(),
             )),
+            Box::new(crate::collectors::linux_audit::LinuxAuditCollector::new(
+                config.collectors.linux_audit.clone(),
+                agent.clone(),
+            )),
         ];
 
         info!(agent_id = %agent.agent_id, "Agent identity loaded");
@@ -354,6 +358,9 @@ impl Sensor {
                     CollectorState::Degraded | CollectorState::Unsupported
                 ) || c.statistics_error.is_some()
                     || c.decode_failures > 0
+                    || c.linux_audit
+                        .as_ref()
+                        .is_some_and(|s| s.quality_uncertain())
                     || c.endpoint_security.as_ref().is_some_and(|s| {
                         s.sequence_drops > 0
                             || s.sequence_discontinuities > 0
@@ -808,7 +815,7 @@ mod tests {
                 assert_eq!(*events_total, 0);
                 assert_eq!(*events_dropped, 0);
                 // Include disabled / unsupported platform collectors.
-                assert_eq!(collectors.len(), 4);
+                assert_eq!(collectors.len(), 5);
             }
             _ => panic!("expected SensorHealth event"),
         }

@@ -85,6 +85,9 @@ impl RuntimeHealth {
                 || s.decode_failures > 0
                 || lost
                 || s.statistics_error.is_some()
+                || s.linux_audit
+                    .as_ref()
+                    .is_some_and(|s| s.quality_uncertain())
                 || s.endpoint_security.as_ref().is_some_and(|v| {
                     v.sequence_drops > 0
                         || v.sequence_discontinuities > 0
@@ -110,6 +113,9 @@ impl RuntimeHealth {
     pub fn endpoint_security(&self, stats: crate::macos_events::EndpointSecurityStats) {
         self.update(|s| s.endpoint_security = Some(stats));
     }
+    pub fn linux_audit(&self, stats: crate::linux_events::LinuxAuditStats) {
+        self.update(|s| s.linux_audit = Some(stats));
+    }
 
     pub fn lost_before_queue(&self) {
         self.decoded(true, true);
@@ -129,14 +135,14 @@ impl RuntimeHealth {
 
 /// Owns the lifetime of a blocking collector task. Dropping signals shutdown;
 /// explicit stop also waits for its callbacks to release their resources.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub struct Worker {
     stop: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<()>,
     health: RuntimeHealth,
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl Worker {
     pub fn spawn(
         health: RuntimeHealth,
@@ -178,7 +184,7 @@ impl Worker {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
@@ -188,6 +194,22 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audit_overruns_are_not_invented_event_drop_counts_and_survive_stop() {
+        let health = RuntimeHealth::new("LinuxAudit");
+        health.starting();
+        health.running();
+        health.linux_audit(crate::linux_events::LinuxAuditStats {
+            socket_overruns: 2,
+            ..Default::default()
+        });
+        let status = health.snapshot(0);
+        assert_eq!(status.state, CollectorState::Degraded);
+        assert_eq!(status.events_lost_before_queue, 0);
+        assert_eq!(status.queue_events_dropped, 0);
+        health.stopped();
+        assert_eq!(health.snapshot(0).linux_audit.unwrap().socket_overruns, 2);
+    }
 
     #[test]
     fn decoder_loss_is_not_reported_as_queue_backpressure() {

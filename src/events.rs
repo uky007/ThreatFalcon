@@ -180,6 +180,7 @@ impl ThreatEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventSource {
+    LinuxAudit,
     EndpointSecurity,
     Etw { provider: String },
     Sysmon { event_id: u16 },
@@ -214,6 +215,9 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EventData {
+    LinuxAudit {
+        record: Box<crate::linux_events::LinuxAuditEvent>,
+    },
     MacosEndpointSecurity {
         record: Box<crate::macos_events::MacosRecord>,
     },
@@ -369,6 +373,8 @@ pub enum EventData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_audit: Option<crate::linux_events::LinuxAuditStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_security: Option<crate::macos_events::EndpointSecurityStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_mode: Option<String>,
@@ -401,6 +407,7 @@ pub struct CollectorStatus {
 impl CollectorStatus {
     pub fn new(name: &str, state: CollectorState) -> Self {
         Self {
+            linux_audit: None,
             endpoint_security: None,
             recovery_mode: None,
             checkpoint_committed_events: 0,
@@ -541,6 +548,7 @@ impl EventData {
     /// separately by the process cache (insert / evict).
     pub fn acting_pid(&self) -> Option<u32> {
         match self {
+            Self::LinuxAudit { record } => record.pid(),
             Self::MacosEndpointSecurity { record } => Some(record.actor.identity.pid),
             Self::FileCreate { pid, .. }
             | Self::FileDelete { pid, .. }

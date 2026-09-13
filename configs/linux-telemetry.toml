@@ -1,0 +1,23 @@
+# Read-only Linux Audit multicast, opt-in; see docs/LINUX_SENSOR.md.
+# Requires CAP_AUDIT_READ, host namespaces and administrator-managed rules.
+# Keep output outside audited file watches to avoid self-IO amplification.
+# Protect executable/config/data; relative paths use this config directory.
+hostname = "LINUX-HOST"
+state_path = "linux.state"
+health_interval_secs = 30
+
+[output]
+type = "file"
+path = "linux-events.jsonl"
+rotation_size_mb = 100
+
+[collectors.linux_audit]
+enabled = true
+[collectors.macos]
+enabled = false
+[collectors.etw]
+enabled = false
+[collectors.sysmon]
+enabled = false
+[collectors.evasion]
+enabled = false

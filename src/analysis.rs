@@ -15,6 +15,8 @@ pub struct Coverage {
     pub stable_process_guid_events: u64,
     pub macos_native_identity_events: u64,
     pub macos_event_kinds: BTreeMap<String, u64>,
+    pub linux_audit_events: u64,
+    pub linux_audit_record_types: BTreeMap<u16, u64>,
     pub native_only_events: u64,
     pub quality_issues: BTreeMap<String, u64>,
     pub sysmon_event_ids: BTreeMap<u16, u64>,
@@ -110,6 +112,35 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
                 }
             }
         }
+        if let EventData::LinuxAudit { record } = &event.data {
+            coverage.linux_audit_events += 1;
+            coverage.source_time_events += 1;
+            for native in &record.records {
+                if coverage.linux_audit_record_types.len() < 128
+                    || coverage
+                        .linux_audit_record_types
+                        .contains_key(&native.native_type)
+                {
+                    *coverage
+                        .linux_audit_record_types
+                        .entry(native.native_type)
+                        .or_default() += 1;
+                }
+            }
+            for issue in record
+                .issues
+                .iter()
+                .chain(record.records.iter().flat_map(|r| &r.issues))
+            {
+                let code: String = issue.chars().take(80).collect();
+                if coverage.quality_issues.len() < 128
+                    || coverage.quality_issues.contains_key(&code)
+                {
+                    *coverage.quality_issues.entry(code).or_default() += 1;
+                }
+                coverage.recorded_loss_or_degradation = true;
+            }
+        }
         if matches!(event.data, EventData::NativeTelemetry { .. }) {
             coverage.native_only_events += 1;
         }
@@ -125,6 +156,9 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
                     c.decode_failures > 0
                         || c.events_lost_before_queue > 0
                         || c.queue_events_dropped > 0
+                        || c.linux_audit
+                            .as_ref()
+                            .is_some_and(|s| s.quality_uncertain())
                         || c.endpoint_security.as_ref().is_some_and(|s| {
                             s.sequence_drops > 0
                                 || s.sequence_discontinuities > 0
@@ -165,6 +199,15 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
     }
     if malformed_lines > 0 {
         limitations.push("malformed_input_skipped");
+    }
+    if agents.values().any(|c| c.linux_audit_events > 0) {
+        limitations.extend([
+            "linux_detection_rules_not_implemented",
+            "linux_audit_pid_is_not_process_lifetime_identity",
+            "linux_audit_policy_and_total_kernel_loss_not_verified",
+            "linux_audit_selected_records_only_live_best_effort_no_outage_replay",
+            "linux_audit_eoe_is_not_proof_of_complete_delivery",
+        ]);
     }
     Ok(Report {
         report_version: 1,
@@ -234,6 +277,19 @@ pub fn run(path: &Path, lang: Language, json: bool) -> Result<()> {
                 },
                 c.macos_native_identity_events,
                 c.macos_event_kinds
+            )?;
+        }
+        if c.linux_audit_events > 0 {
+            writeln!(
+                out,
+                "{}: {} / {:?}",
+                if ja {
+                    "Linux Auditイベント / レコード種別（検知ルールは未実装・PID相関なし）"
+                } else {
+                    "Linux Audit events / record types (no detection rules or PID-only correlation)"
+                },
+                c.linux_audit_events,
+                c.linux_audit_record_types
             )?;
         }
     }

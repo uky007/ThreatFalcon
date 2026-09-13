@@ -41,6 +41,30 @@ impl Language {
 
     fn error(self, code: &str) -> &'static str {
         match code {
+            "audit_permission_denied" => self.text(
+                "Linux Audit requires CAP_AUDIT_READ in the host namespace; no policy changes were attempted",
+                "Linux Auditにはホスト名前空間のCAP_AUDIT_READが必要です。監査設定は変更していません",
+            ),
+            "audit_boot_identity_failed" => self.text(
+                "Linux boot ID unavailable; collection was not started",
+                "Linuxの起動IDを取得できないため収集を開始しませんでした",
+            ),
+            "audit_start_timeout" => self.text(
+                "Linux Audit subscription did not become ready",
+                "Linux Audit購読の準備完了を確認できませんでした",
+            ),
+            "audit_socket_open_failed" => self.text(
+                "Linux Audit multicast socket could not open; check kernel support, namespace and permissions",
+                "Linux Auditソケットを開けません。カーネル対応・名前空間・権限を確認してください",
+            ),
+            "audit_invalid_sender" => self.text(
+                "Unexpected Audit sender; collection stopped",
+                "予期しないAudit送信元を検出し、収集を停止しました",
+            ),
+            "audit_receive_failed" | "audit_netlink_error" => self.text(
+                "Linux Audit reception failed; evidence may be missing",
+                "Linux Auditの受信に失敗しました。証跡が欠落した可能性があります",
+            ),
             "es_not_entitled" => self.text(
                 "Apple-approved Endpoint Security entitlement/signing required",
                 "Apple承認済みEndpoint Security entitlementと適切な署名が必要です",
@@ -351,6 +375,37 @@ pub fn run(
                     stats.sequence_discontinuities,
                     stats.sequence_unavailable
                 )?;
+            }
+            if let Some(stats) = &c.linux_audit {
+                writeln!(
+                    out,
+                    "  {}: {} / {} / {}",
+                    lang.text(
+                        "Audit records received / filtered / fields omitted",
+                        "Audit受信レコード / 対象外レコード / 除外フィールド"
+                    ),
+                    stats.records_received,
+                    stats.records_filtered,
+                    stats.fields_omitted
+                )?;
+                writeln!(out, "  {}: {} / {}", lang.text(
+                    "Audit socket overrun notifications / truncated datagrams (not lost event counts)",
+                    "Auditソケット溢れ通知 / 切断データグラム（欠落イベント数ではありません）"),
+                    stats.socket_overruns, stats.truncated_datagrams)?;
+                writeln!(out, "  {}: {} / {} / {} / {} / {}", lang.text(
+                    "Malformed records / datagrams / without EOE / capacity flushes / late records",
+                    "不正レコード / データグラム / EOE未受信 / 容量超過 / 遅延レコード"),
+                    stats.malformed_records, stats.malformed_datagrams, stats.events_without_eoe,
+                    stats.capacity_flushes, stats.late_records)?;
+                writeln!(
+                    out,
+                    "  {}: {}",
+                    lang.text("Audit receive buffer bytes", "Audit受信バッファ（バイト）"),
+                    stats.receive_buffer_bytes
+                )?;
+                writeln!(out, "  {}", lang.text(
+                    "Best-effort live subscription; audit policy, total kernel loss and coverage are not verified",
+                    "ベストエフォートのライブ購読です。監査設定・カーネル全体の欠落・収集範囲は未確認です"))?;
             }
             if let Some(mode) = &c.recovery_mode {
                 let description = match mode.as_str() {

@@ -139,10 +139,17 @@ pub enum SinkType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectorConfig {
+    pub linux_audit: LinuxAuditConfig,
     pub macos: MacosConfig,
     pub etw: EtwConfig,
     pub sysmon: SysmonConfig,
     pub evasion: EvasionConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinuxAuditConfig {
+    pub enabled: bool,
 }
 
 /// Explicit opt-in: native ES requires approved signing, root and Full Disk Access.
@@ -155,6 +162,23 @@ pub struct MacosConfig {
 #[cfg(test)]
 mod macos_config_tests {
     use super::*;
+    #[test]
+    fn linux_profile_is_opt_in_local_only_and_disables_other_collectors() {
+        let config: SensorConfig =
+            toml::from_str(include_str!("../configs/linux-telemetry.toml")).unwrap();
+        config.validate().unwrap();
+        assert!(config.collectors.linux_audit.enabled);
+        assert!(!config.collectors.macos.enabled);
+        assert!(!config.collectors.etw.enabled);
+        assert!(!config.collectors.sysmon.enabled);
+        assert!(!config.collectors.evasion.enabled);
+        assert_eq!(config.output.sink_type, SinkType::File);
+        assert!(config.output.url.is_none());
+        assert!(!SensorConfig::default().collectors.linux_audit.enabled);
+        assert!(
+            toml::from_str::<LinuxAuditConfig>("enabled = true\ncollect_arguments = true").is_err()
+        );
+    }
     #[test]
     fn macos_profile_is_explicit_local_only_and_disables_windows_collectors() {
         let config: SensorConfig =
@@ -511,6 +535,7 @@ impl Default for OutputConfig {
 impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
+            linux_audit: LinuxAuditConfig::default(),
             macos: MacosConfig::default(),
             etw: EtwConfig::default(),
             sysmon: SysmonConfig::default(),

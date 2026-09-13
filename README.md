@@ -3,13 +3,18 @@
 [![crates.io](https://img.shields.io/crates/v/threatfalcon.svg)](https://crates.io/crates/threatfalcon)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-ThreatFalcon is an experimental Windows/macOS endpoint telemetry sensor written in Rust.
+ThreatFalcon is an experimental Windows/macOS/Linux endpoint telemetry sensor written in Rust.
 
 The project is aimed at a transparent, explainable, open source sensor that collects host telemetry and normalizes it into structured JSONL events.
 
 ## Status
 
 ThreatFalcon is early-stage software.
+
+New: opt-in [Linux Audit multicast collector](docs/LINUX_SENSOR.md), with bounded
+multi-record assembly, argument/proctitle exclusion and Japanese/English loss diagnostics.
+Linux向けの読み取り専用収集基盤を追加しました。監査ルールは自動変更せず、既存auditdと
+共存する設計です。実Linuxでの収集検証とLinux専用の脅威検知ルールは未完了です。
 
 New: opt-in [native macOS Endpoint Security collector](docs/MACOS_SENSOR.md), with
 process/file events, audit-token identity, signing metadata and loss diagnostics.
@@ -77,6 +82,7 @@ It currently collects from:
 - Sysmon
 - an in-process evasion-oriented signal collector
 - macOS Endpoint Security (native NOTIFY-only, explicitly opt-in; see scope above)
+- Linux Audit (read-only multicast, explicitly opt-in; requires administrator-managed audit rules)
 
 ThreatFalcon normalizes these inputs into a unified `ThreatEvent` model for downstream inspection and comparison.
 
@@ -84,7 +90,7 @@ ThreatFalcon normalizes these inputs into a unified `ThreatEvent` model for down
 
 Windows is the first production target. The platform strategy, data-minimisation rules, and staged plan for macOS/Linux are documented in [docs/RESEARCH.md](docs/RESEARCH.md) (日本語/English). The shared sensor and optional on-premises/hosted control-server boundary is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Windows is developed first because ETW and Sysmon already provide the strongest implementation base in this repository. macOS uses the shared `ThreatEvent` envelope with platform-native payload semantics; Linux collection remains planned. The control server is optional so local collection remains useful during network outages or in isolated environments.
+Windows is developed first because ETW and Sysmon already provide the strongest implementation base in this repository. macOS and Linux use the shared `ThreatEvent` envelope with platform-native payload semantics. The control server is optional so local collection remains useful during network outages or in isolated environments.
 
 ## Default Behavior
 
@@ -95,6 +101,7 @@ The built-in default configuration currently does the following:
 - enables ETW collection
 - disables Sysmon collection by default
 - disables macOS Endpoint Security by default (opt-in profile: `configs/macos-telemetry.toml`)
+- disables Linux Audit by default (opt-in profile: `configs/linux-telemetry.toml`)
 - enables evasion-oriented checks
 - emits periodic health events every 60 seconds by default
 - disk spool for the HTTP sink is disabled by default (opt-in via `spool_dir`)

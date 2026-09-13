@@ -4,9 +4,14 @@ Implementation update: [native macOS sensor](MACOS_SENSOR.md) now provides the f
 process/file collector. Live validation and macOS detection rules remain pending.
 macOSの初期収集基盤を実装しました。実イベント収集・検知品質の検証はこれからです。
 
+Implementation update: [Linux Audit multicast sensor](LINUX_SENSOR.md) adds a
+read-only, policy-dependent baseline alongside auditd. Native Linux validation,
+eBPF supplementation and Linux detection rules remain pending.
+Linuxは読み取り専用Audit購読を初期基盤とし、eBPF補完と実機検証を次段階に分けます。
+
 ## Scope / 対象
 
-ThreatFalcon is a telemetry sensor first. Detection and response decisions must be explainable, auditable, and optional. The first production target is Windows; macOS and Linux are planned through the same normalized event contract.
+ThreatFalcon is a telemetry sensor first. Detection and response decisions must be explainable, auditable, and optional. The first production target is Windows. Experimental macOS and Linux collectors now use the shared envelope with native payload semantics; see [macOS status](MACOS_SENSOR.md) and [Linux status](LINUX_SENSOR.md) for implementation and validation limits.
 
 ThreatFalconはまずテレメトリ収集センサとして開発する。検知・対応の判断は説明可能で監査でき、必要に応じて無効化できることを原則とする。最初の本番対象はWindowsとし、macOS/Linuxは同じ正規化イベント契約で拡張する。
 
@@ -16,7 +21,7 @@ ThreatFalconはまずテレメトリ収集センサとして開発する。検�
 |---|---|---|---|
 | Windows | ETW kernel and security providers; optional Sysmon | process, file, registry, image load, network, DNS, script/AMSI | provider permissions, ETW buffer loss, Windows service lifecycle |
 | macOS | Endpoint Security; evaluate Network Extension separately for network flows | exec, fork/exit, file, signing, login where supported; network coverage requires separate validation | user approval, system extension/entitlement, OS version differences |
-| Linux | auditd for portable baseline; eBPF for richer process/file/network context | exec, credential, file, socket, namespace/container | kernel version, capabilities, verifier and distro packaging |
+| Linux | Initial read-only Audit multicast alongside auditd; eBPF planned for richer context | Selected syscall/exec/file/socket/credential audit records; namespace/container coverage planned | audit rules, CAP_AUDIT_READ, host namespaces, best-effort loss, distro/kernel validation |
 
 ETW is appropriate for the Windows baseline because it supports real-time and file consumers, but its session statistics include lost events and buffers; those values must become health telemetry rather than hidden implementation details. macOS Endpoint Security explicitly exposes execution notifications and related file/process event types. Linux eBPF programs are verifier-checked, but deployment depends on kernel features and capabilities, so auditd remains the fallback.
 
