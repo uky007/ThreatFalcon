@@ -1,5 +1,9 @@
 # ThreatFalcon telemetry research / テレメトリ収集リサーチ
 
+Implementation update: [native macOS sensor](MACOS_SENSOR.md) now provides the first
+process/file collector. Live validation and macOS detection rules remain pending.
+macOSの初期収集基盤を実装しました。実イベント収集・検知品質の検証はこれからです。
+
 ## Scope / 対象
 
 ThreatFalcon is a telemetry sensor first. Detection and response decisions must be explainable, auditable, and optional. The first production target is Windows; macOS and Linux are planned through the same normalized event contract.

@@ -85,6 +85,11 @@ impl RuntimeHealth {
                 || s.decode_failures > 0
                 || lost
                 || s.statistics_error.is_some()
+                || s.endpoint_security.as_ref().is_some_and(|v| {
+                    v.sequence_drops > 0
+                        || v.sequence_discontinuities > 0
+                        || v.sequence_unavailable > 0
+                })
                 || s.providers.iter().any(|p| !p.enabled))
         {
             s.state = CollectorState::Degraded;
@@ -100,6 +105,10 @@ impl RuntimeHealth {
                 .saturating_add(u64::from(not_normalized));
             s.decode_failures = s.decode_failures.saturating_add(u64::from(failed));
         });
+    }
+
+    pub fn endpoint_security(&self, stats: crate::macos_events::EndpointSecurityStats) {
+        self.update(|s| s.endpoint_security = Some(stats));
     }
 
     pub fn lost_before_queue(&self) {
@@ -120,14 +129,14 @@ impl RuntimeHealth {
 
 /// Owns the lifetime of a blocking collector task. Dropping signals shutdown;
 /// explicit stop also waits for its callbacks to release their resources.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub struct Worker {
     stop: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<()>,
     health: RuntimeHealth,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl Worker {
     pub fn spawn(
         health: RuntimeHealth,
@@ -169,7 +178,7 @@ impl Worker {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);

@@ -51,6 +51,10 @@ impl Sensor {
                 config.collectors.evasion.clone(),
                 agent.clone(),
             )),
+            Box::new(crate::collectors::macos::MacosCollector::new(
+                config.collectors.macos.clone(),
+                agent.clone(),
+            )),
         ];
 
         info!(agent_id = %agent.agent_id, "Agent identity loaded");
@@ -339,6 +343,7 @@ impl Sensor {
                 .saturating_add(c.queue_events_dropped)
                 .saturating_add(c.events_lost_before_queue)
                 .saturating_add(c.etw.as_ref().map_or(0, |s| s.events_lost))
+                .saturating_add(c.endpoint_security.as_ref().map_or(0, |s| s.sequence_drops))
         });
         let severity = if collectors.iter().any(|c| c.state == CollectorState::Error) {
             Severity::Medium
@@ -349,6 +354,11 @@ impl Sensor {
                     CollectorState::Degraded | CollectorState::Unsupported
                 ) || c.statistics_error.is_some()
                     || c.decode_failures > 0
+                    || c.endpoint_security.as_ref().is_some_and(|s| {
+                        s.sequence_drops > 0
+                            || s.sequence_discontinuities > 0
+                            || s.sequence_unavailable > 0
+                    })
                     || c.providers.iter().any(|p| !p.enabled)
                     || c.etw
                         .as_ref()
@@ -797,8 +807,8 @@ mod tests {
             } => {
                 assert_eq!(*events_total, 0);
                 assert_eq!(*events_dropped, 0);
-                // All 3 collectors should be present
-                assert_eq!(collectors.len(), 3);
+                // Include disabled / unsupported platform collectors.
+                assert_eq!(collectors.len(), 4);
             }
             _ => panic!("expected SensorHealth event"),
         }

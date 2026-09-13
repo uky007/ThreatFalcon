@@ -4,6 +4,7 @@ pub mod etw_normalize;
 mod tdh;
 pub mod evasion;
 pub mod health;
+pub mod macos;
 pub mod sysmon;
 pub mod sysmon_parser;
 

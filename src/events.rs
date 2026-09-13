@@ -180,6 +180,7 @@ impl ThreatEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventSource {
+    EndpointSecurity,
     Etw { provider: String },
     Sysmon { event_id: u16 },
     EvasionDetector,
@@ -213,6 +214,9 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EventData {
+    MacosEndpointSecurity {
+        record: Box<crate::macos_events::MacosRecord>,
+    },
     /// Schema unavailable, partially decoded, or not yet normalized. Never silently discarded.
     NativeTelemetry {
         pid: Option<u32>,
@@ -365,6 +369,8 @@ pub enum EventData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_security: Option<crate::macos_events::EndpointSecurityStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_mode: Option<String>,
     #[serde(default)]
     pub checkpoint_committed_events: u64,
@@ -395,6 +401,7 @@ pub struct CollectorStatus {
 impl CollectorStatus {
     pub fn new(name: &str, state: CollectorState) -> Self {
         Self {
+            endpoint_security: None,
             recovery_mode: None,
             checkpoint_committed_events: 0,
             checkpoint_last_commit_at: None,
@@ -534,6 +541,7 @@ impl EventData {
     /// separately by the process cache (insert / evict).
     pub fn acting_pid(&self) -> Option<u32> {
         match self {
+            Self::MacosEndpointSecurity { record } => Some(record.actor.identity.pid),
             Self::FileCreate { pid, .. }
             | Self::FileDelete { pid, .. }
             | Self::NetworkConnect { pid, .. }

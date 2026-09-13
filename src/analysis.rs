@@ -13,6 +13,8 @@ pub struct Coverage {
     pub events: u64,
     pub source_time_events: u64,
     pub stable_process_guid_events: u64,
+    pub macos_native_identity_events: u64,
+    pub macos_event_kinds: BTreeMap<String, u64>,
     pub native_only_events: u64,
     pub quality_issues: BTreeMap<String, u64>,
     pub sysmon_event_ids: BTreeMap<u16, u64>,
@@ -91,6 +93,23 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         if let EventSource::Sysmon { event_id } = event.source {
             *coverage.sysmon_event_ids.entry(event_id).or_default() += 1;
         }
+        if let EventData::MacosEndpointSecurity { record } = &event.data {
+            coverage.source_time_events += u64::from(record.original_time);
+            coverage.macos_native_identity_events +=
+                u64::from(!record.boot_session_uuid.is_nil() && !event.agent_id.is_nil());
+            *coverage
+                .macos_event_kinds
+                .entry(format!("{:?}", record.kind))
+                .or_default() += 1;
+            for issue in &record.issues {
+                let code: String = issue.chars().take(80).collect();
+                if coverage.quality_issues.len() < 128
+                    || coverage.quality_issues.contains_key(&code)
+                {
+                    *coverage.quality_issues.entry(code).or_default() += 1;
+                }
+            }
+        }
         if matches!(event.data, EventData::NativeTelemetry { .. }) {
             coverage.native_only_events += 1;
         }
@@ -106,6 +125,11 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
                     c.decode_failures > 0
                         || c.events_lost_before_queue > 0
                         || c.queue_events_dropped > 0
+                        || c.endpoint_security.as_ref().is_some_and(|s| {
+                            s.sequence_drops > 0
+                                || s.sequence_discontinuities > 0
+                                || s.sequence_unavailable > 0
+                        })
                         || matches!(c.state, CollectorState::Error | CollectorState::Degraded)
                         || c.etw.as_ref().is_some_and(|s| {
                             s.events_lost > 0
@@ -134,6 +158,10 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
     ];
     if agents.values().any(|c| c.health_records == 0) {
         limitations.push("collection_loss_unknown_without_health");
+    }
+    if agents.values().any(|c| !c.macos_event_kinds.is_empty()) {
+        limitations.push("macos_detection_rules_not_implemented");
+        limitations.push("macos_live_only_no_outage_replay");
     }
     if malformed_lines > 0 {
         limitations.push("malformed_input_skipped");
@@ -195,6 +223,19 @@ pub fn run(path: &Path, lang: Language, json: bool) -> Result<()> {
     for (agent, c) in &report.agents {
         writeln!(out,"agent={agent} events={} source_time={} process_guid={} native_only={} recorded_loss={}",
             c.events,c.source_time_events,c.stable_process_guid_events,c.native_only_events,c.recorded_loss_or_degradation)?;
+        if !c.macos_event_kinds.is_empty() {
+            writeln!(
+                out,
+                "{}: {} / {:?}",
+                if ja {
+                    "macOSネイティブ識別情報（検知ルールは未実装）"
+                } else {
+                    "macOS native identities (detection rules not implemented)"
+                },
+                c.macos_native_identity_events,
+                c.macos_event_kinds
+            )?;
+        }
     }
     for e in &report.findings {
         if let EventData::CorrelationDetection {

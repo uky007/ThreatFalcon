@@ -53,6 +53,11 @@ impl ProcessCache {
     ///   then evict the entry.
     /// - **Activity events**: look up by PID and attach full context.
     pub fn enrich(&mut self, event: &mut ThreatEvent) {
+        // ES supplies event-time metadata and boot-scoped native identities.
+        // Never replace it with this legacy Windows PID cache.
+        if matches!(event.source, crate::events::EventSource::EndpointSecurity) {
+            return;
+        }
         // Sysmon's native ProcessGuid is authoritative, even when the process
         // predates the sensor. Never join it to another feed solely by PID.
         if matches!(event.source, crate::events::EventSource::Sysmon { .. }) {

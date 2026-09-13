@@ -521,6 +521,7 @@ fn severity_str(sev: &Severity) -> &'static str {
 
 fn source_index_fields(source: &EventSource) -> (&'static str, Option<String>) {
     match source {
+        EventSource::EndpointSecurity => ("endpointsecurity", None),
         EventSource::Etw { provider } => ("etw", Some(provider.clone())),
         EventSource::Sysmon { event_id } => ("sysmon", Some(event_id.to_string())),
         EventSource::EvasionDetector => ("evasion", None),
@@ -548,6 +549,7 @@ fn category_short(cat: &EventCategory) -> &'static str {
 /// keep this module self-contained).
 fn event_pid(data: &EventData) -> Option<u32> {
     match data {
+        EventData::MacosEndpointSecurity { record } => Some(record.subject().identity.pid),
         EventData::ProcessCreate { pid, .. }
         | EventData::ProcessTerminate { pid, .. }
         | EventData::FileCreate { pid, .. }

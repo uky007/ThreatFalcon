@@ -1,0 +1,20 @@
+# Native Endpoint Security: explicit opt-in; see docs/MACOS_SENSOR.md.
+# Protect the executable, configuration and data directories before a root run.
+# Relative paths are anchored to the configuration directory.
+hostname = "MACOS-HOST"
+state_path = "macos.state"
+health_interval_secs = 30
+
+[output]
+type = "file"
+path = "macos-events.jsonl"
+rotation_size_mb = 100
+
+[collectors.macos]
+enabled = true
+[collectors.etw]
+enabled = false
+[collectors.sysmon]
+enabled = false
+[collectors.evasion]
+enabled = false

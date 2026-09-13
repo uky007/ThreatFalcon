@@ -1,1 +1,6 @@
 /target
+
+# Local output from the opt-in macOS example profile is not source evidence.
+/configs/macos.state
+/configs/macos-events.jsonl
+/configs/macos-events.jsonl.*

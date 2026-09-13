@@ -41,6 +41,50 @@ impl Language {
 
     fn error(self, code: &str) -> &'static str {
         match code {
+            "es_not_entitled" => self.text(
+                "Apple-approved Endpoint Security entitlement/signing required",
+                "Apple承認済みEndpoint Security entitlementと適切な署名が必要です",
+            ),
+            "es_not_permitted" => self.text(
+                "Full Disk Access approval required; no collection started",
+                "フルディスクアクセスの承認が必要です。収集は開始していません",
+            ),
+            "es_not_privileged" => self.text(
+                "Endpoint Security requires root privileges",
+                "Endpoint Securityの利用にはroot権限が必要です",
+            ),
+            "es_too_many_clients" => self.text(
+                "Endpoint Security client limit reached",
+                "Endpoint Securityクライアント数の上限に達しています",
+            ),
+            "es_boot_identity_failed" => self.text(
+                "Boot session identity unavailable; collection stopped to avoid ambiguous process identity",
+                "起動セッションIDを取得できないため、不確かなプロセス識別を避けて収集を停止しました",
+            ),
+            "es_subscribe_failed" => self.text(
+                "Endpoint Security notification subscription failed",
+                "Endpoint Security通知イベントの購読に失敗しました",
+            ),
+            "es_self_mute_failed" => self.text(
+                "Cannot mute sensor's own IO; subscription not started",
+                "センサ自身のI/Oを除外できないため購読を開始しませんでした",
+            ),
+            "es_delete_failed" => self.text(
+                "Endpoint Security native cleanup failed; resources may remain until process exit",
+                "Endpoint Securityの解放に失敗しました。プロセス終了まで資源が残る可能性があります",
+            ),
+            "es_start_timeout" => self.text(
+                "Endpoint Security subscription did not become ready",
+                "Endpoint Security購読の準備完了を確認できませんでした",
+            ),
+            "es_callback_panic" => self.text(
+                "Endpoint Security callback failed; evidence may be missing",
+                "Endpoint Security処理に失敗し、証跡が欠落した可能性があります",
+            ),
+            "es_invalid_argument" | "es_internal_error" | "es_open_failed" => self.text(
+                "Endpoint Security client creation failed; inspect native error code",
+                "Endpoint Securityクライアントの作成に失敗しました。ネイティブエラーコードを確認してください",
+            ),
             "etw_start_failed" => self.text(
                 "ETW session could not start",
                 "ETWセッションの起動に失敗しました",
@@ -293,6 +337,19 @@ pub fn run(
                     p.error_code
                         .map(|v| format!(" (OS: {v})"))
                         .unwrap_or_default()
+                )?;
+            }
+            if let Some(stats) = &c.endpoint_security {
+                writeln!(
+                    out,
+                    "  {}: {} / {} / {}",
+                    lang.text(
+                        "ES sequence drops (lower bound) / discontinuities / unavailable",
+                        "ESシーケンス欠落（下限）/ 不連続 / 取得不可"
+                    ),
+                    stats.sequence_drops,
+                    stats.sequence_discontinuities,
+                    stats.sequence_unavailable
                 )?;
             }
             if let Some(mode) = &c.recovery_mode {

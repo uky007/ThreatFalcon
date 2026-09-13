@@ -1205,6 +1205,7 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
             }
             crate::events::EventSource::EvasionDetector => "EvasionDetector".into(),
             crate::events::EventSource::Sensor => "Sensor".into(),
+            crate::events::EventSource::EndpointSecurity => "EndpointSecurity".into(),
         };
         *by_source.entry(src_label).or_default() += 1;
 
@@ -4018,6 +4019,7 @@ fn source_matches(source: &crate::events::EventSource, filter: &str) -> bool {
             filter_lower == "evasion" || filter_lower == "evasiondetector"
         }
         crate::events::EventSource::Sensor => filter_lower == "sensor",
+        crate::events::EventSource::EndpointSecurity => filter_lower == "endpointsecurity",
     }
 }
 
@@ -4107,6 +4109,7 @@ fn find_event<'a>(events: &'a [ThreatEvent], id: &str) -> Result<&'a ThreatEvent
 /// Extract PID from any EventData variant.
 fn event_pid(data: &EventData) -> Option<u32> {
     match data {
+        EventData::MacosEndpointSecurity { record } => Some(record.subject().identity.pid),
         EventData::ProcessCreate { pid, .. }
         | EventData::ProcessTerminate { pid, .. }
         | EventData::FileCreate { pid, .. }
@@ -4156,12 +4159,14 @@ fn source_display(source: &crate::events::EventSource) -> String {
         crate::events::EventSource::Sysmon { event_id } => format!("Sysmon / event {event_id}"),
         crate::events::EventSource::EvasionDetector => "EvasionDetector".into(),
         crate::events::EventSource::Sensor => "Sensor".into(),
+        crate::events::EventSource::EndpointSecurity => "EndpointSecurity".into(),
     }
 }
 
 /// One-line summary of an EventData variant for timeline display.
 fn event_summary(data: &EventData) -> String {
     match data {
+        EventData::MacosEndpointSecurity { record } => format!("EndpointSecurity {:?} pid:{} {}", record.kind, record.subject().identity.pid, record.subject().executable.path.value),
         EventData::NativeTelemetry { reason, .. } => format!("NativeTelemetry {reason}"),
         EventData::CorrelationDetection { rule_id, title_en, .. } => format!("Detection {rule_id} {title_en}"),
         EventData::NetworkTraffic { pid, dst_addr, dst_port, bytes, .. } => format!("NetworkTraffic pid:{pid} {dst_addr}:{dst_port} bytes:{bytes}"),

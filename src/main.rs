@@ -1,15 +1,16 @@
-mod collectors;
-mod checkpoint;
-mod delivery;
-mod config;
-mod diagnostics;
-mod detection;
 mod analysis;
+mod checkpoint;
+mod collectors;
+mod config;
+mod delivery;
+mod detection;
+mod diagnostics;
 mod events;
 #[cfg(test)]
 mod fixtures;
 mod index;
 mod investigate;
+mod macos_events;
 mod output;
 #[allow(dead_code)] // some methods only used by evasion collector on Windows
 mod pe;
@@ -37,7 +38,7 @@ mod exit_code {
     pub const RUNTIME_ERROR: i32 = 2;
 }
 
-/// ThreatFalcon — lightweight endpoint telemetry sensor for Windows
+/// ThreatFalcon — experimental endpoint telemetry sensor for Windows and macOS
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -178,7 +179,10 @@ fn run_install_service(config_path: Option<PathBuf>) -> ! {
     {
         match service::install(config_path.as_deref()) {
             Ok(()) => {
-                eprintln!("Service '{}' installed successfully.", service::SERVICE_NAME);
+                eprintln!(
+                    "Service '{}' installed successfully.",
+                    service::SERVICE_NAME
+                );
                 if let Some(ref p) = config_path {
                     eprintln!("Config: {}", p.display());
                 }
@@ -205,7 +209,10 @@ fn run_uninstall_service() -> ! {
     {
         match service::uninstall() {
             Ok(()) => {
-                eprintln!("Service '{}' uninstalled successfully.", service::SERVICE_NAME);
+                eprintln!(
+                    "Service '{}' uninstalled successfully.",
+                    service::SERVICE_NAME
+                );
                 std::process::exit(exit_code::SUCCESS);
             }
             Err(e) => {
@@ -226,8 +233,7 @@ fn run_uninstall_service() -> ! {
 /// Separated from service mode so each entrypoint owns its own runtime
 /// and shutdown wiring.
 async fn run_foreground(cli: Cli) -> Result<()> {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     fmt()
         .with_env_filter(filter)
@@ -237,8 +243,10 @@ async fn run_foreground(cli: Cli) -> Result<()> {
 
     tracing::info!("ThreatFalcon Sensor v{}", env!("CARGO_PKG_VERSION"));
 
-    #[cfg(not(target_os = "windows"))]
-    tracing::warn!("ThreatFalcon is designed for Windows — running in development mode");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    tracing::warn!(
+        "Native collection is not implemented on this OS — offline tools remain available"
+    );
 
     let config_path = cli.config.as_deref();
     let mut config = SensorConfig::load_from(config_path)?;

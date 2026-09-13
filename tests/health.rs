@@ -21,6 +21,43 @@ fn event(agent: &str, timestamp: &str) -> Value {
 const AGENT: &str = "00000000-0000-0000-0000-000000000001";
 
 #[test]
+fn macos_permissions_and_sequence_diagnostics_are_bilingual() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("macos-health.jsonl");
+    for (code, ja, en) in [
+        ("es_not_privileged", "root権限", "root privileges"),
+        ("es_not_entitled", "Apple承認済み", "Apple-approved"),
+        (
+            "es_not_permitted",
+            "フルディスクアクセス",
+            "Full Disk Access",
+        ),
+    ] {
+        let mut sample = event(AGENT, "2026-09-13T00:00:00Z");
+        sample["data"]["collectors"] = json!([{
+            "name":"EndpointSecurity", "state":"Error", "recovery_mode":"future_only",
+            "error":{"code":code},
+            "endpoint_security":{"sequence_drops":7,"sequence_discontinuities":1,"sequence_unavailable":2}
+        }]);
+        fs::write(&path, sample.to_string()).unwrap();
+        for (lang, explanation, sequence) in [
+            ("ja", ja, "ESシーケンス欠落"),
+            ("en", en, "ES sequence drops"),
+        ] {
+            cmd()
+                .args(["health", "--input", path.to_str().unwrap(), "--lang", lang])
+                .assert()
+                .success()
+                .stdout(
+                    predicate::str::contains(explanation)
+                        .and(predicate::str::contains(sequence))
+                        .and(predicate::str::contains("7 / 1 / 2")),
+                );
+        }
+    }
+}
+
+#[test]
 fn invalid_utf8_tail_does_not_hide_later_health() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("events.jsonl");
