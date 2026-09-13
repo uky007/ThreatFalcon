@@ -53,12 +53,19 @@ impl ProcessCache {
     ///   then evict the entry.
     /// - **Activity events**: look up by PID and attach full context.
     pub fn enrich(&mut self, event: &mut ThreatEvent) {
+        // PowerShell supplies a script ID, not a process lifetime ID. A cached
+        // ETW process with the same numeric PID is not sufficient evidence.
+        if crate::collectors::etw_normalize::is_powershell_script(event) {
+            return;
+        }
         // ES supplies event-time metadata and boot-scoped native identities.
-        // Linux Audit has no stable process-lifetime identity. Never join
-        // either native feed to this legacy Windows PID cache.
+        // Linux Audit and WFP audit have no stable process-lifetime identity.
+        // Never join these native feeds to this legacy Windows PID cache.
         if matches!(
             event.source,
-            crate::events::EventSource::EndpointSecurity | crate::events::EventSource::LinuxAudit
+            crate::events::EventSource::EndpointSecurity
+                | crate::events::EventSource::LinuxAudit
+                | crate::events::EventSource::WindowsSecurity { .. }
         ) {
             return;
         }

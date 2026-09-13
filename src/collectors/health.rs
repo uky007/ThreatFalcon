@@ -116,6 +116,9 @@ impl RuntimeHealth {
     pub fn linux_audit(&self, stats: crate::linux_events::LinuxAuditStats) {
         self.update(|s| s.linux_audit = Some(stats));
     }
+    pub fn wfp_audit(&self, stats: crate::wfp_events::WfpAuditStats) {
+        self.update(|s| s.wfp_audit = Some(stats));
+    }
 
     pub fn lost_before_queue(&self) {
         self.decoded(true, true);

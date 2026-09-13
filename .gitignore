@@ -7,3 +7,9 @@
 /configs/linux.state
 /configs/linux-events.jsonl
 /configs/linux-events.jsonl.*
+/configs/wfp-audit.state
+/configs/wfp-audit-events.jsonl
+/configs/wfp-audit-events.jsonl.*
+/configs/powershell.state
+/configs/powershell-events.jsonl
+/configs/powershell-events.jsonl.*

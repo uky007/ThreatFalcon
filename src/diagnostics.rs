@@ -41,6 +41,22 @@ impl Language {
 
     fn error(self, code: &str) -> &'static str {
         match code {
+            "wfp_access_denied" => self.text(
+                "Security log access denied; privileges and audit policy were not changed",
+                "Securityログへのアクセスが拒否されました。権限・監査設定は変更していません",
+            ),
+            "wfp_subscription_failed" => self.text(
+                "WFP audit subscription failed; check Security log access and Event Log service",
+                "WFP監査の購読に失敗しました。Securityログの権限とEvent Logサービスを確認してください",
+            ),
+            "wfp_start_timeout" => self.text(
+                "WFP audit subscription did not become ready",
+                "WFP監査購読の準備完了を確認できませんでした",
+            ),
+            "wfp_read_failed" | "wfp_invalid_batch" | "wfp_queue_closed" | "wfp_signal_failed" => self.text(
+                "WFP audit collection stopped; evidence may be missing and no automatic replay is available",
+                "WFP監査の収集が停止しました。証跡欠落の可能性があり、自動再読込はありません",
+            ),
             "audit_permission_denied" => self.text(
                 "Linux Audit requires CAP_AUDIT_READ in the host namespace; no policy changes were attempted",
                 "Linux Auditにはホスト名前空間のCAP_AUDIT_READが必要です。監査設定は変更していません",
@@ -362,6 +378,21 @@ pub fn run(
                         .map(|v| format!(" (OS: {v})"))
                         .unwrap_or_default()
                 )?;
+            }
+            if let Some(stats) = &c.wfp_audit {
+                writeln!(
+                    out,
+                    "  {}: {} / {}",
+                    lang.text(
+                        "WFP audit records read / fields omitted",
+                        "WFP監査読込レコード / 除外フィールド"
+                    ),
+                    stats.records_read,
+                    stats.fields_omitted
+                )?;
+                writeln!(out, "  {}", lang.text(
+                    "Authorization audit only, not established flows. Audit policy and complete coverage are unverified",
+                    "接続認可の監査のみで、通信成立を示しません。監査設定と網羅性は未確認です"))?;
             }
             if let Some(stats) = &c.endpoint_security {
                 writeln!(

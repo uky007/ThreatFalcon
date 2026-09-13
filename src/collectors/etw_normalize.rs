@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 pub const PROCESS: &str = "22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716";
 pub const NETWORK: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 pub const POWERSHELL: &str = "a0c1853b-5c40-4b15-8766-3cf1c58f985a";
+pub const POWERSHELL_CORE: &str = "f90714a8-5509-434a-bf6d-b1624c8a19a2";
 pub const DNS: &str = "1c95126e-7eea-49a9-a3fe-a378b03ddb4d";
 
 pub fn filetime(ticks: u64) -> Option<DateTime<Utc>> {
@@ -38,7 +39,15 @@ pub fn normalize(
     if time.is_none() {
         origin.issues.push("invalid_source_time".into());
     }
-    let mapped = if origin.issues.is_empty() {
+    let mapped = if origin.issues.is_empty() && powershell_4104(&origin) {
+        match script_fragment(&origin, header_pid) {
+            Ok(data) => Some((EventCategory::Script, data)),
+            Err(code) => {
+                origin.issues.push(code.into());
+                None
+            }
+        }
+    } else if origin.issues.is_empty() {
         map(&origin, header_pid)
     } else {
         None
@@ -186,16 +195,6 @@ fn map(p: &EventProvenance, header_pid: u32) -> Option<(EventCategory, EventData
             };
             Some((EventCategory::Network, data))
         }
-        POWERSHELL if p.event_id == 4104 => Some((
-            EventCategory::Script,
-            EventData::ScriptBlock {
-                pid: header_pid,
-                script_engine: "PowerShell".into(),
-                content: field(&["ScriptBlockText"])?,
-                script_path: field(&["Path"]),
-                script_block_id: field(&["ScriptBlockId"]),
-            },
-        )),
         DNS if matches!(p.event_id, 3006 | 3008) => Some((
             EventCategory::Dns,
             EventData::DnsQuery {
@@ -210,6 +209,113 @@ fn map(p: &EventProvenance, header_pid: u32) -> Option<(EventCategory, EventData
         _ => None,
     }
 }
+
+fn powershell_4104(p: &EventProvenance) -> bool {
+    p.event_id == 4104 && matches!(p.provider_guid.as_str(), POWERSHELL | POWERSHELL_CORE)
+}
+
+/// Provider identity, not the configurable display name, selects this source.
+pub fn is_powershell_script(event: &ThreatEvent) -> bool {
+    matches!(event.source, EventSource::Etw { .. })
+        && event.provenance.as_ref().is_some_and(powershell_4104)
+}
+
+/// A script ID groups a logged script's fragments, not an entire process lifetime.
+pub fn script_identity(event: &ThreatEvent) -> Option<(uuid::Uuid, String, u32, uuid::Uuid)> {
+    if !is_powershell_script(event) || event.agent_id.is_nil() {
+        return None;
+    }
+    let p = event.provenance.as_ref()?;
+    if !p.original_time || !p.issues.is_empty() {
+        return None;
+    }
+    let EventData::ScriptBlock {
+        pid,
+        script_block_id: Some(id),
+        ..
+    } = &event.data
+    else {
+        return None;
+    };
+    let id = uuid::Uuid::parse_str(id).ok().filter(|id| !id.is_nil())?;
+    if *pid == 0 || *pid == u32::MAX || event.data.script_fragment_position().is_none() {
+        return None;
+    }
+    Some((event.agent_id, p.provider_guid.clone(), *pid, id))
+}
+
+fn script_fragment(p: &EventProvenance, pid: u32) -> Result<EventData, &'static str> {
+    // Runtime TDH schema supplies names/types; raw version/opcode remain in provenance.
+    // Reject case-ambiguous aliases instead of picking whichever sorts first.
+    for name in [
+        "MessageNumber",
+        "MessageTotal",
+        "ScriptBlockId",
+        "ScriptBlockText",
+        "Path",
+    ] {
+        if p.fields
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(name))
+            .count()
+            > 1
+        {
+            return Err("powershell_ambiguous_field_names");
+        }
+    }
+    let field = |name: &str| {
+        let mut values = p
+            .fields
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name));
+        let value = values.next().map(|(_, value)| value.clone());
+        if values.next().is_some() {
+            None
+        } else {
+            value
+        }
+    };
+    let positive_i32 = |name: &str| {
+        field(name).and_then(|s| {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse::<i32>().ok().filter(|v| *v > 0).map(|v| v as u32)
+        })
+    };
+    if pid == 0 || pid == u32::MAX {
+        return Err("powershell_invalid_header_pid");
+    }
+    let number = positive_i32("MessageNumber").ok_or("powershell_invalid_message_number")?;
+    let total = positive_i32("MessageTotal").ok_or("powershell_invalid_message_total")?;
+    if number > total {
+        return Err("powershell_invalid_fragment_range");
+    }
+    let id = field("ScriptBlockId").ok_or("powershell_missing_script_id")?;
+    if uuid::Uuid::parse_str(&id).ok().is_none_or(|id| id.is_nil()) {
+        return Err("powershell_invalid_script_id");
+    }
+    let content = field("ScriptBlockText").ok_or("powershell_missing_script_text")?;
+    // Keep logged text as-is, including CMS ciphertext. Do not decrypt, evaluate,
+    // concatenate fragments, or claim that the source preserves original file bytes.
+    Ok(EventData::ScriptBlock {
+        pid,
+        script_engine: if p.provider_guid == POWERSHELL_CORE {
+            "PowerShellCore"
+        } else {
+            "PowerShell"
+        }
+        .into(),
+        content,
+        script_path: field("Path"),
+        script_block_id: Some(id),
+        message_number: Some(number),
+        message_total: Some(total),
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod powershell_tests;
 
 #[cfg(test)]
 mod tests {

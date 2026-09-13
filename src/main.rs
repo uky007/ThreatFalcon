@@ -21,6 +21,7 @@ mod sensor;
 mod service;
 mod spool;
 mod state;
+mod wfp_events;
 
 use std::path::PathBuf;
 

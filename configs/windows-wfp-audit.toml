@@ -1,0 +1,25 @@
+# Opt-in read-only Security log reader. See docs/WINDOWS_WFP_AUDIT.md.
+# Administrator-managed Filtering Platform Connection audit policy required.
+# No policy/privilege/firewall changes are made by the collector.
+# Protect executable/config/data; relative paths use this config directory.
+hostname = "WINDOWS-HOST"
+state_path = "wfp-audit.state"
+health_interval_secs = 30
+
+[output]
+type = "file"
+path = "wfp-audit-events.jsonl"
+rotation_size_mb = 100
+
+[collectors.wfp_audit]
+enabled = true
+[collectors.linux_audit]
+enabled = false
+[collectors.macos]
+enabled = false
+[collectors.etw]
+enabled = false
+[collectors.sysmon]
+enabled = false
+[collectors.evasion]
+enabled = false

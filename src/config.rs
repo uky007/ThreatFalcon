@@ -139,11 +139,19 @@ pub enum SinkType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectorConfig {
+    pub wfp_audit: WfpAuditConfig,
     pub linux_audit: LinuxAuditConfig,
     pub macos: MacosConfig,
     pub etw: EtwConfig,
     pub sysmon: SysmonConfig,
     pub evasion: EvasionConfig,
+}
+
+/// Read-only Security log subscription; never enables audit policy itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WfpAuditConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -162,6 +170,58 @@ pub struct MacosConfig {
 #[cfg(test)]
 mod macos_config_tests {
     use super::*;
+    #[test]
+    fn powershell_profile_is_explicit_local_only_and_preserves_defaults() {
+        let config: SensorConfig =
+            toml::from_str(include_str!("../configs/windows-powershell.toml")).unwrap();
+        config.validate().unwrap();
+        assert!(config.collectors.etw.enabled);
+        let guids: Vec<_> = config
+            .collectors
+            .etw
+            .providers
+            .iter()
+            .map(|p| p.guid.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            guids,
+            [
+                crate::collectors::etw_normalize::POWERSHELL,
+                crate::collectors::etw_normalize::POWERSHELL_CORE
+            ]
+        );
+        assert!(!config.collectors.sysmon.enabled);
+        assert!(!config.collectors.wfp_audit.enabled);
+        assert!(!config.collectors.evasion.enabled);
+        assert!(!config.collectors.macos.enabled);
+        assert!(!config.collectors.linux_audit.enabled);
+        assert_eq!(config.output.sink_type, SinkType::File);
+        assert!(config.output.url.is_none());
+        assert!(!SensorConfig::default()
+            .collectors
+            .etw
+            .providers
+            .iter()
+            .any(|p| p
+                .guid
+                .eq_ignore_ascii_case(crate::collectors::etw_normalize::POWERSHELL_CORE)));
+    }
+    #[test]
+    fn wfp_profile_is_opt_in_local_only() {
+        let config: SensorConfig =
+            toml::from_str(include_str!("../configs/windows-wfp-audit.toml")).unwrap();
+        config.validate().unwrap();
+        assert!(config.collectors.wfp_audit.enabled);
+        assert!(!config.collectors.etw.enabled);
+        assert!(!config.collectors.sysmon.enabled);
+        assert!(!config.collectors.evasion.enabled);
+        assert!(!config.collectors.macos.enabled);
+        assert!(!config.collectors.linux_audit.enabled);
+        assert_eq!(config.output.sink_type, SinkType::File);
+        assert!(config.output.url.is_none());
+        assert!(!SensorConfig::default().collectors.wfp_audit.enabled);
+        assert!(toml::from_str::<WfpAuditConfig>("enabled = true\nchange_policy = true").is_err());
+    }
     #[test]
     fn linux_profile_is_opt_in_local_only_and_disables_other_collectors() {
         let config: SensorConfig =
@@ -535,6 +595,7 @@ impl Default for OutputConfig {
 impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
+            wfp_audit: WfpAuditConfig::default(),
             linux_audit: LinuxAuditConfig::default(),
             macos: MacosConfig::default(),
             etw: EtwConfig::default(),

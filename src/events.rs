@@ -180,6 +180,7 @@ impl ThreatEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventSource {
+    WindowsSecurity { event_id: u16 },
     LinuxAudit,
     EndpointSecurity,
     Etw { provider: String },
@@ -215,6 +216,9 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EventData {
+    WfpConnectionAudit {
+        record: Box<crate::wfp_events::WfpConnectionAudit>,
+    },
     LinuxAudit {
         record: Box<crate::linux_events::LinuxAuditEvent>,
     },
@@ -322,6 +326,11 @@ pub enum EventData {
         /// GUID linking multi-part script blocks from the same script.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         script_block_id: Option<String>,
+        /// Position in the provider's logged fragment set, not execution count.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_number: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_total: Option<u32>,
     },
     AmsiScan {
         pid: u32,
@@ -373,6 +382,8 @@ pub enum EventData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wfp_audit: Option<crate::wfp_events::WfpAuditStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux_audit: Option<crate::linux_events::LinuxAuditStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_security: Option<crate::macos_events::EndpointSecurityStats>,
@@ -407,6 +418,7 @@ pub struct CollectorStatus {
 impl CollectorStatus {
     pub fn new(name: &str, state: CollectorState) -> Self {
         Self {
+            wfp_audit: None,
             linux_audit: None,
             endpoint_security: None,
             recovery_mode: None,
@@ -543,11 +555,26 @@ pub fn amsi_result_name(result: u32) -> &'static str {
 }
 
 impl EventData {
+    /// Old or malformed records have unknown fragment position, never implicit 1/1.
+    pub fn script_fragment_position(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::ScriptBlock {
+                message_number: Some(number),
+                message_total: Some(total),
+                ..
+            } if *number > 0 && number <= total && *total <= i32::MAX as u32 => {
+                Some((*number, *total))
+            }
+            _ => None,
+        }
+    }
+
     /// Return the PID of the process that performed the action, if applicable.
     /// ProcessCreate and ProcessTerminate are excluded — they are handled
     /// separately by the process cache (insert / evict).
     pub fn acting_pid(&self) -> Option<u32> {
         match self {
+            Self::WfpConnectionAudit { record } => record.pid,
             Self::LinuxAudit { record } => record.pid(),
             Self::MacosEndpointSecurity { record } => Some(record.actor.identity.pid),
             Self::FileCreate { pid, .. }

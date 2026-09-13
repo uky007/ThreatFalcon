@@ -39,6 +39,10 @@ impl Sensor {
         };
 
         let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(crate::collectors::wfp_audit::WfpAuditCollector::new(
+                config.collectors.wfp_audit.clone(),
+                agent.clone(),
+            )),
             Box::new(EtwCollector::new(
                 config.collectors.etw.clone(),
                 agent.clone(),
@@ -815,7 +819,7 @@ mod tests {
                 assert_eq!(*events_total, 0);
                 assert_eq!(*events_dropped, 0);
                 // Include disabled / unsupported platform collectors.
-                assert_eq!(collectors.len(), 5);
+                assert_eq!(collectors.len(), 6);
             }
             _ => panic!("expected SensorHealth event"),
         }

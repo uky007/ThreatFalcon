@@ -17,6 +17,13 @@ pub struct Coverage {
     pub macos_event_kinds: BTreeMap<String, u64>,
     pub linux_audit_events: u64,
     pub linux_audit_record_types: BTreeMap<u16, u64>,
+    pub windows_security_event_ids: BTreeMap<u16, u64>,
+    pub wfp_audit_coverage_unknown: bool,
+    pub powershell_4104_events: u64,
+    pub powershell_unparsed_events: u64,
+    pub script_single_part_events: u64,
+    pub script_multipart_events: u64,
+    pub script_fragment_position_unknown: u64,
     pub native_only_events: u64,
     pub quality_issues: BTreeMap<String, u64>,
     pub sysmon_event_ids: BTreeMap<u16, u64>,
@@ -95,6 +102,35 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         if let EventSource::Sysmon { event_id } = event.source {
             *coverage.sysmon_event_ids.entry(event_id).or_default() += 1;
         }
+        if crate::collectors::etw_normalize::is_powershell_script(&event) {
+            coverage.powershell_4104_events += 1;
+            if !matches!(event.data, EventData::ScriptBlock { .. }) {
+                coverage.powershell_unparsed_events += 1;
+                coverage.recorded_loss_or_degradation = true;
+            }
+        }
+        if matches!(event.data, EventData::ScriptBlock { .. }) {
+            match event.data.script_fragment_position() {
+                Some((1, 1)) => coverage.script_single_part_events += 1,
+                Some(_) => coverage.script_multipart_events += 1,
+                None => coverage.script_fragment_position_unknown += 1,
+            }
+        }
+        if let EventSource::WindowsSecurity { event_id } = event.source {
+            if coverage.windows_security_event_ids.len() < 128
+                || coverage.windows_security_event_ids.contains_key(&event_id)
+            {
+                *coverage
+                    .windows_security_event_ids
+                    .entry(event_id)
+                    .or_default() += 1;
+            }
+            coverage.wfp_audit_coverage_unknown = true;
+            coverage.recorded_loss_or_degradation |= event
+                .provenance
+                .as_ref()
+                .is_some_and(|p| !p.issues.is_empty());
+        }
         if let EventData::MacosEndpointSecurity { record } = &event.data {
             coverage.source_time_events += u64::from(record.original_time);
             coverage.macos_native_identity_events +=
@@ -151,6 +187,7 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         } = &event.data
         {
             coverage.health_records += 1;
+            coverage.wfp_audit_coverage_unknown |= collectors.iter().any(|c| c.wfp_audit.is_some());
             coverage.recorded_loss_or_degradation |= *events_dropped > 0
                 || collectors.iter().any(|c| {
                     c.decode_failures > 0
@@ -207,6 +244,29 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
             "linux_audit_policy_and_total_kernel_loss_not_verified",
             "linux_audit_selected_records_only_live_best_effort_no_outage_replay",
             "linux_audit_eoe_is_not_proof_of_complete_delivery",
+        ]);
+    }
+    if agents.values().any(|c| c.wfp_audit_coverage_unknown) {
+        limitations.extend([
+            "wfp_audit_authorization_is_not_established_flow_or_threat_verdict",
+            "wfp_audit_policy_and_complete_coverage_not_verified",
+            "wfp_audit_pid_is_not_process_lifetime_identity",
+            "wfp_audit_live_only_no_outage_replay_or_exact_source_loss_count",
+            "wfp_audit_detection_rules_not_implemented",
+        ]);
+    }
+    if agents.values().any(|c| {
+        c.powershell_4104_events > 0
+            || c.script_single_part_events > 0
+            || c.script_multipart_events > 0
+            || c.script_fragment_position_unknown > 0
+    }) {
+        limitations.extend([
+            "script_fragments_are_not_reassembled_or_deduplicated",
+            "script_logged_content_may_be_sensitive_or_protected_ciphertext",
+            "script_logging_is_not_proof_of_successful_execution",
+            "powershell_logging_policy_and_manifest_registration_not_verified",
+            "powershell_script_id_is_not_process_lifetime_identity",
         ]);
     }
     Ok(Report {
@@ -266,6 +326,25 @@ pub fn run(path: &Path, lang: Language, json: bool) -> Result<()> {
     for (agent, c) in &report.agents {
         writeln!(out,"agent={agent} events={} source_time={} process_guid={} native_only={} recorded_loss={}",
             c.events,c.source_time_events,c.stable_process_guid_events,c.native_only_events,c.recorded_loss_or_degradation)?;
+        if c.powershell_4104_events > 0
+            || c.script_single_part_events > 0
+            || c.script_multipart_events > 0
+            || c.script_fragment_position_unknown > 0
+        {
+            writeln!(
+                out,
+                "{}: {} / {} / {} / {}",
+                if ja {
+                    "スクリプト単一部イベント / 複数部の断片 / 分割情報不明 / PowerShell未正規化（再構成・実行成功の保証なし）"
+                } else {
+                    "Single-part script events / multipart fragments / unknown position / unparsed PowerShell (no reassembly or execution guarantee)"
+                },
+                c.script_single_part_events,
+                c.script_multipart_events,
+                c.script_fragment_position_unknown,
+                c.powershell_unparsed_events
+            )?;
+        }
         if !c.macos_event_kinds.is_empty() {
             writeln!(
                 out,
@@ -290,6 +369,18 @@ pub fn run(path: &Path, lang: Language, json: bool) -> Result<()> {
                 },
                 c.linux_audit_events,
                 c.linux_audit_record_types
+            )?;
+        }
+        if c.wfp_audit_coverage_unknown {
+            writeln!(
+                out,
+                "{}: {:?}",
+                if ja {
+                    "Windows Security監査ID（接続認可のみ・監査設定と網羅性は未確認・検知ルールなし）"
+                } else {
+                    "Windows Security audit IDs (authorization only; policy/coverage unverified; no detection rules)"
+                },
+                c.windows_security_event_ids
             )?;
         }
     }

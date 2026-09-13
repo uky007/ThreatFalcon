@@ -522,6 +522,7 @@ fn severity_str(sev: &Severity) -> &'static str {
 
 fn source_index_fields(source: &EventSource) -> (&'static str, Option<String>) {
     match source {
+        EventSource::WindowsSecurity { event_id } => ("windowssecurity", Some(event_id.to_string())),
         EventSource::LinuxAudit => ("linuxaudit", None),
         EventSource::EndpointSecurity => ("endpointsecurity", None),
         EventSource::Etw { provider } => ("etw", Some(provider.clone())),
@@ -551,6 +552,7 @@ fn category_short(cat: &EventCategory) -> &'static str {
 /// keep this module self-contained).
 fn event_pid(data: &EventData) -> Option<u32> {
     match data {
+        EventData::WfpConnectionAudit { record } => record.pid,
         EventData::LinuxAudit { record } => record.pid(),
         EventData::MacosEndpointSecurity { record } => Some(record.subject().identity.pid),
         EventData::ProcessCreate { pid, .. }

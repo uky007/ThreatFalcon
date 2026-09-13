@@ -2567,6 +2567,88 @@ mod windows_tests {
     use super::*;
     use crate::events::{CollectorState, EventData};
 
+    /// Opt-in only, using an operator-installed executable and logging policy.
+    /// No policy changes, profile execution, private keys, or content inspection.
+    #[tokio::test]
+    #[ignore = "requires an isolated Windows VM, approved PowerShell Core executable and script logging; see docs/WINDOWS_POWERSHELL.md"]
+    async fn windows_powershell_core_etw_smoke() {
+        assert_eq!(
+            std::env::var("TF_WINDOWS_POWERSHELL_TEST").as_deref(),
+            Ok("1")
+        );
+        let executable = std::path::PathBuf::from(
+            std::env::var_os("TF_PWSH_TEST_EXE")
+                .expect("operator-approved absolute pwsh.exe path required"),
+        );
+        assert!(executable.is_absolute() && executable.is_file());
+        assert!(executable
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("pwsh.exe")));
+        let config: crate::config::SensorConfig =
+            toml::from_str(include_str!("../../configs/windows-powershell.toml")).unwrap();
+        let mut etw = config.collectors.etw;
+        etw.providers.retain(|p| {
+            p.guid
+                .eq_ignore_ascii_case(super::super::etw_normalize::POWERSHELL_CORE)
+        });
+        let mut collector = EtwCollector::new(
+            etw,
+            AgentInfo {
+                hostname: "CONTROLLED-PS-TEST".into(),
+                agent_id: uuid::Uuid::new_v4(),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(1024);
+        collector
+            .start(tx)
+            .await
+            .expect("ETW subscription must succeed");
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut child = tokio::process::Command::new(&executable)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Write-Output 'ThreatFalcon telemetry validation'",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("missing test child PID"))?;
+            anyhow::ensure!(
+                child.wait().await?.success(),
+                "benign PowerShell command failed"
+            );
+            while let Some(event) = rx.recv().await {
+                if event.data.acting_pid() == Some(pid)
+                    && super::super::etw_normalize::script_identity(&event).is_some()
+                    && event.provenance.as_ref().is_some_and(|p| {
+                        p.provider_guid == super::super::etw_normalize::POWERSHELL_CORE
+                    })
+                {
+                    return Ok::<_, anyhow::Error>(event);
+                }
+            }
+            anyhow::bail!("ETW ended before a valid test-child script event")
+        })
+        .await;
+        collector.stop().await.unwrap();
+        let event = observed
+            .expect("No valid child 4104 observed: check operator-managed manifest/logging policy")
+            .unwrap();
+        assert!(event.data.script_fragment_position().is_some());
+        assert!(event.provenance.as_ref().unwrap().original_time);
+        assert!(event.process_context.is_none());
+        assert_eq!(collector.status().unwrap().state, CollectorState::Stopped);
+        // A child-origin event proves only this provider path, not that all
+        // child scripts were seen or the exact command text was preserved.
+    }
+
     /// Run alone in an elevated, disposable Windows VM. Only a benign process
     /// is started; this is a real ETW integration check, not a detection test.
     #[tokio::test]

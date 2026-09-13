@@ -78,7 +78,7 @@ pub enum Command {
         #[arg(long)]
         rule_id: Option<String>,
 
-        /// Filter by event source type (etw, sysmon, evasion, sensor)
+        /// Filter by source (etw, sysmon, windowssecurity, endpointsecurity, linuxaudit, evasion, sensor)
         #[arg(long)]
         source: Option<String>,
 
@@ -338,7 +338,7 @@ pub enum Command {
         #[arg(long)]
         rule_id: Option<String>,
 
-        /// Filter by event source type (etw, sysmon, evasion, sensor)
+        /// Filter by source (etw, sysmon, windowssecurity, endpointsecurity, linuxaudit, evasion, sensor)
         #[arg(long)]
         source: Option<String>,
 
@@ -719,8 +719,9 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
     let target = find_event(&events, event_id)?;
 
     // --- Build timeline ---
-    let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
-    let target_pid = target.data.acting_pid();
+    let native_script = crate::collectors::etw_normalize::is_powershell_script(target);
+    let process_key = target.process_context.as_ref().filter(|_| !native_script).map(|c| c.process_key.as_str());
+    let target_pid = target.data.acting_pid().filter(|_| !native_script);
     let window = chrono::Duration::minutes(window_mins as i64);
     let t_start = target.timestamp - window;
     let t_end = target.timestamp + window;
@@ -753,6 +754,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
     timeline.sort_by_key(|e| e.timestamp);
 
     // --- JSON output ---
+    timeline.retain(|event| !crate::collectors::etw_normalize::is_powershell_script(event));
     if json {
         let script_activity = build_script_activity(target, &events, window_mins);
         let output = ExplainOutput {
@@ -794,7 +796,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
             )?;
         }
     } else {
-        writeln!(stdout, "\nNo process_context — cannot build timeline.")?;
+        writeln!(stdout, "{}", if native_script { "\nNo verified PowerShell process lifetime identity — no process timeline." } else { "\nNo process_context — cannot build timeline." })?;
     }
 
     // --- Script / AMSI correlation ---
@@ -922,6 +924,7 @@ fn run_bundle(
     let process_key = target
         .process_context
         .as_ref()
+        .filter(|_| !crate::collectors::etw_normalize::is_powershell_script(&target))
         .map(|c| c.process_key.clone());
 
     let mut related: Vec<ThreatEvent> = if let Some(ref key) = process_key {
@@ -1199,6 +1202,7 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
 
         // Source
         let src_label = match &event.source {
+            crate::events::EventSource::WindowsSecurity { event_id } => format!("WindowsSecurity/{event_id}"),
             crate::events::EventSource::Etw { provider } => format!("ETW/{provider}"),
             crate::events::EventSource::Sysmon { event_id } => {
                 format!("Sysmon/{event_id}")
@@ -3770,11 +3774,13 @@ fn run_explain_indexed(
     };
 
     // Find related events by process_key (or PID fallback) within window
+    let native_script = crate::collectors::etw_normalize::is_powershell_script(&target);
     let process_key = target
         .process_context
         .as_ref()
+        .filter(|_| !native_script)
         .map(|c| c.process_key.as_str());
-    let target_pid = target.data.acting_pid();
+    let target_pid = target.data.acting_pid().filter(|_| !native_script);
     let window = chrono::Duration::minutes(window_mins as i64);
     let t_start = target.timestamp - window;
     let t_end = target.timestamp + window;
@@ -3793,9 +3799,15 @@ fn run_explain_indexed(
     };
     timeline.sort_by_key(|e| e.timestamp);
 
-    // Script / AMSI correlation — use the same build_script_activity()
-    // function as the full-scan path so PID-based fallback is preserved.
-    let script_activity = build_script_activity(&target, &timeline, window_mins);
+    timeline.retain(|event| !crate::collectors::etw_normalize::is_powershell_script(event));
+    // PID is only a preliminary index filter for native script candidates;
+    // build_script_activity also checks agent/provider/ScriptBlockId/time.
+    let script_activity = if native_script {
+        if let Some(pid) = target.data.acting_pid() {
+            let locs = idx.find_by_pid(pid, &from_str, &to_str)?;
+            build_script_activity(&target, &index::fetch_events(input, &locs)?, window_mins)
+        } else { vec![] }
+    } else { build_script_activity(&target, &timeline, window_mins) };
 
     if json {
         let output = ExplainOutput {
@@ -3836,7 +3848,7 @@ fn run_explain_indexed(
             )?;
         }
     } else {
-        writeln!(stdout, "\nNo process_context — cannot build timeline.")?;
+        writeln!(stdout, "{}", if native_script { "\nNo verified PowerShell process lifetime identity — no process timeline." } else { "\nNo process_context — cannot build timeline." })?;
     }
 
     // Script / AMSI correlation
@@ -3920,6 +3932,7 @@ fn run_bundle_indexed(
     let process_key = target
         .process_context
         .as_ref()
+        .filter(|_| !crate::collectors::etw_normalize::is_powershell_script(&target))
         .map(|c| c.process_key.clone());
 
     let mut related = if let Some(ref key) = process_key {
@@ -4011,6 +4024,7 @@ fn parse_severity(s: &str) -> Result<crate::events::Severity> {
 fn source_matches(source: &crate::events::EventSource, filter: &str) -> bool {
     let filter_lower = filter.to_ascii_lowercase();
     match source {
+        crate::events::EventSource::WindowsSecurity { .. } => filter_lower == "windowssecurity",
         crate::events::EventSource::Etw { provider } => {
             filter_lower == "etw"
                 || provider.to_ascii_lowercase().contains(&filter_lower)
@@ -4111,6 +4125,7 @@ fn find_event<'a>(events: &'a [ThreatEvent], id: &str) -> Result<&'a ThreatEvent
 /// Extract PID from any EventData variant.
 fn event_pid(data: &EventData) -> Option<u32> {
     match data {
+        EventData::WfpConnectionAudit { record } => record.pid,
         EventData::LinuxAudit { record } => record.pid(),
         EventData::MacosEndpointSecurity { record } => Some(record.subject().identity.pid),
         EventData::ProcessCreate { pid, .. }
@@ -4158,6 +4173,7 @@ fn category_short(cat: &EventCategory) -> &'static str {
 /// Display string for EventSource.
 fn source_display(source: &crate::events::EventSource) -> String {
     match source {
+        crate::events::EventSource::WindowsSecurity { event_id } => format!("Windows Security / event {event_id}"),
         crate::events::EventSource::Etw { provider } => format!("ETW / {provider}"),
         crate::events::EventSource::Sysmon { event_id } => format!("Sysmon / event {event_id}"),
         crate::events::EventSource::EvasionDetector => "EvasionDetector".into(),
@@ -4170,6 +4186,7 @@ fn source_display(source: &crate::events::EventSource) -> String {
 /// One-line summary of an EventData variant for timeline display.
 fn event_summary(data: &EventData) -> String {
     match data {
+        EventData::WfpConnectionAudit { record } => format!("WFP audit {:?} pid:{:?} {:?}:{:?} -> {:?}:{:?} (authorization only)", record.decision, record.pid, record.source_address, record.source_port, record.destination_address, record.destination_port),
         EventData::LinuxAudit { record } => format!(
             "LinuxAudit serial:{} pid:{:?} records:{} {:?}",
             record.stamp.serial,
@@ -4251,7 +4268,8 @@ fn event_summary(data: &EventData) -> String {
                 .as_deref()
                 .map(|p| format!(" {p}"))
                 .unwrap_or_default();
-            format!("ScriptBlock       pid:{pid} {script_engine}{path_suffix}")
+            let position = data.script_fragment_position().map(|(n, total)| format!("{n}/{total}")).unwrap_or_else(|| "unknown".into());
+            format!("ScriptBlock       pid:{pid} {script_engine}{path_suffix} fragment:{position} (as logged; not reassembled)")
         }
         EventData::AmsiScan {
             pid,
@@ -4327,10 +4345,25 @@ fn build_script_activity(
     let t_start = target.timestamp - window;
     let t_end = target.timestamp + window;
 
+    // Native PowerShell fragments group only by agent/provider/PID/ScriptBlockId,
+    // not by a cached process key or a matching PID in another feed. No assembly.
+    if crate::collectors::etw_normalize::is_powershell_script(target) {
+        let Some(key) = crate::collectors::etw_normalize::script_identity(target) else { return vec![]; };
+        let mut fragments: Vec<_> = events.iter().filter(|event| {
+            event.timestamp >= t_start && event.timestamp <= t_end
+                && crate::collectors::etw_normalize::script_identity(event).as_ref() == Some(&key)
+        }).cloned().collect();
+        fragments.sort_by_key(|event| event.timestamp);
+        return fragments;
+    }
+
     let mut result: Vec<ThreatEvent> = events
         .iter()
         .filter(|e| {
             if !is_script_or_amsi(&e.data) {
+                return false;
+            }
+            if crate::collectors::etw_normalize::is_powershell_script(e) {
                 return false;
             }
             if e.timestamp < t_start || e.timestamp > t_end {
@@ -5115,6 +5148,35 @@ mod tests {
 
     // ---- Script / AMSI correlation tests ------------------------------------
 
+    #[test]
+    fn powershell_native_fragments_do_not_join_other_agents_providers_scripts_or_amsi_by_pid() {
+        use crate::collectors::etw_normalize::{powershell_tests::fixture, POWERSHELL, POWERSHELL_CORE};
+        let target = fixture(POWERSHELL_CORE, "1", "2");
+        let same_script = fixture(POWERSHELL_CORE, "2", "2");
+        let mut other_agent = fixture(POWERSHELL_CORE, "1", "2");
+        other_agent.agent_id = uuid::Uuid::from_u128(999);
+        let other_provider = fixture(POWERSHELL, "1", "2");
+        let mut other_script = fixture(POWERSHELL_CORE, "1", "2");
+        if let EventData::ScriptBlock { script_block_id, .. } = &mut other_script.data {
+            *script_block_id = Some(uuid::Uuid::from_u128(99).to_string());
+        }
+        let mut legacy = make_amsi_scan(4242, "", "synthetic", 0);
+        legacy.process_context = None;
+        legacy.timestamp = target.timestamp;
+        let events = vec![target.clone(), same_script.clone(), other_agent, other_provider, other_script, legacy.clone()];
+        let group = build_script_activity(&target, &events, 5);
+        assert_eq!(group.len(), 2);
+        assert!(group.iter().any(|e| e.id == same_script.id));
+        let reverse = build_script_activity(&legacy, &events, 5);
+        assert_eq!(reverse.len(), 1);
+        assert_eq!(reverse[0].id, legacy.id);
+        assert!(event_summary(&target.data).contains("fragment:1/2"));
+        let mut missing = target.clone();
+        if let EventData::ScriptBlock { message_number, .. } = &mut missing.data { *message_number = None; }
+        assert!(build_script_activity(&missing, &events, 5).is_empty());
+        assert!(event_summary(&missing.data).contains("fragment:unknown"));
+    }
+
     fn make_script_block(pid: u32, key: &str, content: &str) -> ThreatEvent {
         let mut evt = ThreatEvent::new(
             &test_agent(),
@@ -5129,6 +5191,8 @@ mod tests {
                 content: content.into(),
                 script_path: Some(r"C:\Users\test\malware.ps1".into()),
                 script_block_id: Some("abc-123".into()),
+                message_number: None,
+                message_total: None,
             },
         );
         evt.process_context = Some(ProcessContext {
@@ -5187,6 +5251,8 @@ mod tests {
             content: String::new(),
             script_path: None,
             script_block_id: None,
+            message_number: None,
+            message_total: None,
         }));
         assert!(is_script_related(&EventData::AmsiScan {
             pid: 1,
@@ -5365,6 +5431,8 @@ mod tests {
             content: "Get-Process".into(),
             script_path: Some(r"C:\test.ps1".into()),
             script_block_id: Some("abc".into()),
+            message_number: None,
+            message_total: None,
         });
         assert!(summary.contains(r"C:\test.ps1"));
     }
@@ -5377,6 +5445,8 @@ mod tests {
             content: "Get-Process".into(),
             script_path: None,
             script_block_id: None,
+            message_number: None,
+            message_total: None,
         });
         assert!(summary.contains("PowerShell"));
         assert!(!summary.contains("null"));

@@ -8,6 +8,7 @@ pub mod macos;
 pub mod linux_audit;
 pub mod sysmon;
 pub mod sysmon_parser;
+pub mod wfp_audit;
 
 use anyhow::Result;
 use async_trait::async_trait;

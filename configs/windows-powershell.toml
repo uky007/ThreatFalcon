@@ -1,0 +1,35 @@
+# Opt-in script telemetry validation for Windows PowerShell and PowerShell Core.
+# Content is preserved AS LOGGED and may contain secrets or CMS ciphertext.
+# Review docs/WINDOWS_POWERSHELL.md before use. No OS policy or provider registration changes.
+hostname = "WINDOWS-HOST"
+state_path = "powershell.state"
+health_interval_secs = 30
+
+[output]
+type = "file"
+path = "powershell-events.jsonl"
+rotation_size_mb = 100
+
+[collectors.etw]
+enabled = true
+[[collectors.etw.providers]]
+name = "Microsoft-Windows-PowerShell"
+guid = "A0C1853B-5C40-4B15-8766-3CF1C58F985A"
+level = 5
+keywords = "0xFFFFFFFFFFFFFFFF"
+[[collectors.etw.providers]]
+name = "PowerShellCore"
+guid = "F90714A8-5509-434A-BF6D-B1624C8A19A2"
+level = 5
+keywords = "0xFFFFFFFFFFFFFFFF"
+
+[collectors.sysmon]
+enabled = false
+[collectors.wfp_audit]
+enabled = false
+[collectors.evasion]
+enabled = false
+[collectors.macos]
+enabled = false
+[collectors.linux_audit]
+enabled = false

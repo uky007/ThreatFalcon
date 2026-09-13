@@ -103,6 +103,190 @@ fn empty_analysis_is_not_a_clean_bill_of_health() {
 }
 
 #[test]
+fn powershell_fragment_analysis_is_bilingual_and_legacy_position_is_unknown() {
+    use serde_json::json;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("scripts.jsonl");
+    let mut event = json!({
+        "id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "agent_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "hostname":"synthetic-windows", "sensor_version":"0.3.0", "timestamp":"2026-09-13T00:00:00Z",
+        "source":{"Etw":{"provider":"PowerShellCore"}}, "category":"Script", "severity":"Info",
+        "data":{"type":"ScriptBlock","pid":4242,"script_engine":"PowerShellCore","content":"Write-Output 'test'",
+            "script_block_id":"cccccccc-cccc-cccc-cccc-cccccccccccc", "message_number":1,"message_total":2}
+    });
+    let first = event.to_string();
+    event["id"] = "dddddddd-dddd-dddd-dddd-dddddddddddd".into();
+    event["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("message_number");
+    event["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("message_total");
+    std::fs::write(&path, format!("{first}\n{event}\n")).unwrap();
+    for (lang, label) in [
+        ("ja", "再構成・実行成功の保証なし"),
+        ("en", "no reassembly or execution guarantee"),
+    ] {
+        cmd()
+            .args(["analyze", "--input", path.to_str().unwrap(), "--lang", lang])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(label).and(predicate::str::contains("0 / 1 / 1 / 0")));
+    }
+    for no_index in [true, false] {
+        let mut command = cmd();
+        command.args([
+            "query",
+            "--input",
+            path.to_str().unwrap(),
+            "--source",
+            "PowerShellCore",
+            "--pid",
+            "4242",
+        ]);
+        if no_index {
+            command.arg("--no-index");
+        }
+        command
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("message_number"));
+    }
+    let result = cmd()
+        .args(["analyze", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["malformed_lines"], 0);
+    assert!(report["findings"].as_array().unwrap().is_empty());
+    assert_eq!(
+        report["agents"]["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]
+            ["script_fragment_position_unknown"],
+        1
+    );
+}
+
+#[test]
+fn powershell_native_explain_never_makes_a_pid_only_process_timeline() {
+    use serde_json::json;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("native-scripts.jsonl");
+    let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let target = json!({
+        "id":target_id,"agent_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "hostname":"synthetic-windows","sensor_version":"0.3.0","timestamp":"2026-09-13T00:00:00Z",
+        "source":{"Etw":{"provider":"PowerShellCore"}},"category":"Script","severity":"Info",
+        "provenance":{"provider_guid":"f90714a8-5509-434a-bf6d-b1624c8a19a2","event_id":4104,"original_time":true},
+        "process_context":{"process_key":"unverified-legacy-cache"},
+        "data":{"type":"ScriptBlock","pid":4242,"script_engine":"PowerShellCore","content":"Write-Output 'test'",
+            "script_block_id":"cccccccc-cccc-cccc-cccc-cccccccccccc","message_number":1,"message_total":2}
+    });
+    let mut second = target.clone();
+    second["id"] = "dddddddd-dddd-dddd-dddd-dddddddddddd".into();
+    second["data"]["message_number"] = 2.into();
+    let mut other = target.clone();
+    other["id"] = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".into();
+    other["agent_id"] = "ffffffff-ffff-ffff-ffff-ffffffffffff".into();
+    let mut amsi = target.clone();
+    amsi["id"] = "11111111-1111-1111-1111-111111111111".into();
+    amsi.as_object_mut().unwrap().remove("provenance");
+    amsi["data"] = json!({"type":"AmsiScan","pid":4242,"app_name":"PowerShell","content_name":"test","content_size":4,"scan_result":0});
+    std::fs::write(&path, format!("{target}\n{second}\n{other}\n{amsi}\n")).unwrap();
+    for no_index in [true, false] {
+        let mut command = cmd();
+        command.args([
+            "explain",
+            "--input",
+            path.to_str().unwrap(),
+            "--event",
+            target_id,
+            "--json",
+        ]);
+        if no_index {
+            command.arg("--no-index");
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(output["timeline"].as_array().unwrap().is_empty());
+        assert!(output.get("process_key").is_none());
+        assert_eq!(output["script_amsi_activity"].as_array().unwrap().len(), 2);
+        assert!(output["script_amsi_activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["agent_id"] == target["agent_id"] && e["data"]["type"] == "ScriptBlock"));
+    }
+}
+
+#[test]
+fn wfp_audit_is_queryable_but_never_a_flow_or_threat_verdict() {
+    use serde_json::json;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wfp.jsonl");
+    let event = json!({
+        "id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "agent_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "hostname":"synthetic-windows", "sensor_version":"0.3.0", "timestamp":"2026-09-13T00:00:00Z",
+        "source":{"WindowsSecurity":{"event_id":5157}}, "category":"Network", "severity":"Info",
+        "data":{"type":"WfpConnectionAudit", "record":{
+            "decision":"Blocked", "pid":4242, "application":"synthetic.exe", "source_address":"192.0.2.1",
+            "source_port":51000, "destination_address":"198.51.100.2", "destination_port":443,
+            "protocol":6, "direction_token":"%%14592", "filter_runtime_id":1,"layer_runtime_id":48,"omitted_fields":[]
+        }}
+    });
+    std::fs::write(&path, format!("{event}\n")).unwrap();
+    for (lang, explanation) in [
+        ("ja", "接続認可のみ・監査設定と網羅性は未確認"),
+        ("en", "authorization only; policy/coverage unverified"),
+    ] {
+        cmd()
+            .args(["analyze", "--input", path.to_str().unwrap(), "--lang", lang])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains(explanation).and(predicate::str::contains(
+                    "wfp_audit_detection_rules_not_implemented",
+                )),
+            );
+    }
+    for indexed in [false, true] {
+        let mut command = cmd();
+        command.args([
+            "query",
+            "--input",
+            path.to_str().unwrap(),
+            "--source",
+            "windowssecurity",
+            "--pid",
+            "4242",
+        ]);
+        if !indexed {
+            command.arg("--no-index");
+        }
+        command
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("WfpConnectionAudit"));
+    }
+    let result = cmd()
+        .args(["analyze", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(report["findings"].as_array().unwrap().is_empty());
+    assert_eq!(report["analysis"]["eligible_events"], 0);
+    assert_eq!(report["malformed_lines"], 0);
+}
+
+#[test]
 fn linux_audit_is_queryable_and_analysis_limits_are_bilingual() {
     use serde_json::json;
     let dir = TempDir::new().unwrap();
@@ -143,7 +327,7 @@ fn linux_audit_is_queryable_and_analysis_limits_are_bilingual() {
             "linuxaudit",
             "--pid",
             "42",
-        "--no-index",
+            "--no-index",
         ])
         .assert()
         .success()

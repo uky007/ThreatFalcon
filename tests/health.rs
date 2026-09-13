@@ -21,6 +21,52 @@ fn event(agent: &str, timestamp: &str) -> Value {
 const AGENT: &str = "00000000-0000-0000-0000-000000000001";
 
 #[test]
+fn wfp_health_is_bilingual_and_zero_records_does_not_verify_coverage() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("wfp-health.jsonl");
+    let mut sample = event(AGENT, "2026-09-13T00:00:00Z");
+    sample["data"]["collectors"] = json!([{
+        "name":"WfpAudit", "state":"Error", "recovery_mode":"future_only",
+        "error":{"code":"wfp_access_denied"}, "wfp_audit":{"audit_policy_verified":false,"records_read":0,"fields_omitted":0}
+    }]);
+    fs::write(&path, sample.to_string()).unwrap();
+    for (lang, label, limitation) in [
+        (
+            "ja",
+            "権限・監査設定は変更していません",
+            "監査設定と網羅性は未確認",
+        ),
+        (
+            "en",
+            "privileges and audit policy were not changed",
+            "Audit policy and complete coverage are unverified",
+        ),
+    ] {
+        cmd()
+            .args(["health", "--input", path.to_str().unwrap(), "--lang", lang])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(label).and(predicate::str::contains(limitation)));
+    }
+    let result = cmd()
+        .args(["analyze", "--input", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["agents"][AGENT]["wfp_audit_coverage_unknown"], true);
+    assert_eq!(
+        report["agents"][AGENT]["recorded_loss_or_degradation"],
+        true
+    );
+    assert!(report["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "wfp_audit_policy_and_complete_coverage_not_verified"));
+}
+
+#[test]
 fn linux_audit_health_is_bilingual_and_does_not_claim_exact_loss_or_coverage() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("linux-health.jsonl");

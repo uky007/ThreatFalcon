@@ -5,6 +5,16 @@
 
 ThreatFalcon is an experimental Windows/macOS/Linux endpoint telemetry sensor written in Rust.
 
+New: [Windows PowerShell / PowerShell Core script telemetry](docs/WINDOWS_POWERSHELL.md)
+preserves fragment positions and avoids native script PID-only process/AMSI joins in `explain`.
+PowerShell 7向けの明示的な収集設定と、分割ログの保存・品質表示を追加しました。
+実Windows収集・断片の再構成・新規の検知ルールは今回の完了範囲に含みません。
+
+New: opt-in [Windows WFP authorization audit reader](docs/WINDOWS_WFP_AUDIT.md) for Security events
+5156/5157, with bounded parsing and JA/EN diagnostics. Native Windows collection remains unvalidated.
+Windowsの接続許可・遮断の監査収集を追加しました。通信成立や脅威判定を示すものではなく、
+独自WFPドライバではありません。監査設定は自動変更しません。
+
 The project is aimed at a transparent, explainable, open source sensor that collects host telemetry and normalizes it into structured JSONL events.
 
 ## Status
@@ -66,7 +76,7 @@ ThreatFalcon currently emits normalized telemetry for:
 - registry events
 - image load events
 - DNS events
-- script-related events (PowerShell fragments with path/ID metadata; multipart assembly is not yet implemented)
+- script-related events (Windows PowerShell / opt-in PowerShell Core fragments with path/ID/position metadata; multipart assembly is not yet implemented)
 - evasion-oriented signal events for selected techniques
 - sensor health events (periodic heartbeat with uptime, throughput, and collector status)
 
@@ -80,6 +90,7 @@ It currently collects from:
 
 - ETW
 - Sysmon
+- Windows Security WFP authorization audit (5156/5157, explicitly opt-in; native validation pending)
 - an in-process evasion-oriented signal collector
 - macOS Endpoint Security (native NOTIFY-only, explicitly opt-in; see scope above)
 - Linux Audit (read-only multicast, explicitly opt-in; requires administrator-managed audit rules)
@@ -100,6 +111,7 @@ The built-in default configuration currently does the following:
 - rotates output at `100 MB`
 - enables ETW collection
 - disables Sysmon collection by default
+- disables WFP audit by default (opt-in profile: `configs/windows-wfp-audit.toml`)
 - disables macOS Endpoint Security by default (opt-in profile: `configs/macos-telemetry.toml`)
 - disables Linux Audit by default (opt-in profile: `configs/linux-telemetry.toml`)
 - enables evasion-oriented checks
@@ -566,7 +578,7 @@ threatfalcon explain --event <UUID> --input events.jsonl --json
 The human-readable output includes:
 - Target event details (ID, timestamp, category, severity, source, process context)
 - Process timeline showing all events from the same `process_key` within the window
-- Script / AMSI activity section (when the target is a ScriptBlock, AmsiScan, or AMSI bypass detection — shows correlated script executions and AMSI scan results for the same process)
+- Script / AMSI activity section (native PowerShell targets use scoped script-fragment identity, not PID-only AMSI or process joins; legacy heuristics remain for other targets)
 - Detection rule details (if the event is a detection)
 
 The `--json` flag outputs a single JSON object containing:
@@ -1160,7 +1172,7 @@ Evidence includes the decoded instruction, raw bytes, amsi.dll base address in t
 
 ### Script / AMSI Correlation
 
-When using `explain` on a ScriptBlock, AmsiScan, or AMSI bypass detection event, ThreatFalcon shows a dedicated "Script / AMSI Activity" section. This section lists all PowerShell script block executions and AMSI scan results from the same process, making the script execution → AMSI scan → bypass chain visible and explainable.
+When using `explain` on script-related events, ThreatFalcon can show a "Script / AMSI Activity" section. Native PowerShell 4104 targets group only fragments with matching agent/provider/PID/ScriptBlockId and usable source time within the selected window; they are not joined to AMSI by PID. Fragment text is not reassembled, decrypted or evidence of successful execution. Legacy association heuristics remain for other event types. See [PowerShell telemetry](docs/WINDOWS_POWERSHELL.md) for scope and limitations.
 
 Note: TF-EVA-004 detects the **presence** of syscall stubs in non-system modules. It does not confirm that the stubs were executed or that ntdll hooks were actively bypassed. Confidence is Medium to reflect this distinction.
 
