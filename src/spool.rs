@@ -33,9 +33,10 @@ impl DiskSpool {
         let mut current_bytes = 0u64;
         let mut file_count = 0u64;
 
-        for entry in fs::read_dir(dir)?.flatten() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
             if is_spool_file(&entry) {
-                current_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                current_bytes += entry.metadata()?.len();
                 file_count += 1;
             }
         }
@@ -74,7 +75,7 @@ impl DiskSpool {
 
         let name = self.next_filename();
         let dest = self.dir.join(&name);
-        tmp.persist(&dest)?;
+        tmp.persist_noclobber(&dest)?;
 
         self.current_bytes += len;
         self.file_count += 1;
@@ -85,7 +86,8 @@ impl DiskSpool {
     pub fn pending(&self) -> Result<Vec<PathBuf>> {
         let mut files: Vec<PathBuf> = Vec::new();
 
-        for entry in fs::read_dir(&self.dir)?.flatten() {
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
             if is_spool_file(&entry) {
                 files.push(entry.path());
             }

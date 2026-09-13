@@ -18,6 +18,44 @@ use crate::index;
 /// Investigation subcommands for local JSONL analysis.
 #[derive(Subcommand)]
 pub enum Command {
+    /// Import UTF-8 Sysmon XML as evidence-preserving JSONL / Sysmon XMLをJSONLに変換
+    ImportSysmon {
+        #[arg(long)]
+        input: PathBuf,
+        /// Stable agent ID of the source host / 元端末の固定エージェントID
+        #[arg(long)]
+        agent_id: uuid::Uuid,
+        /// Must match System/Computer when present / Computerと一致する元端末名
+        #[arg(long)]
+        hostname: String,
+    },
+    /// Correlate native evidence and report coverage gaps / 証拠の相関分析と欠損診断
+    Analyze {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, value_enum, default_value = "en")]
+        lang: crate::diagnostics::Language,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show recorded sensor health / 記録されたセンサ稼働状況を表示
+    Health {
+        /// JSONL telemetry file / JSONLテレメトリファイル
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        /// Select an agent in a combined log / 対象エージェントID
+        #[arg(long)]
+        agent_id: Option<uuid::Uuid>,
+        /// Display language / 表示言語 (JSON is language independent)
+        #[arg(long, value_enum, default_value = "en")]
+        lang: crate::diagnostics::Language,
+        /// Emit a machine-readable report / JSON形式で出力
+        #[arg(long)]
+        json: bool,
+        /// Mark older records as stale / 古い記録と判定する秒数
+        #[arg(long, default_value = "180")]
+        max_age_secs: u64,
+    },
     /// Query events from a JSONL telemetry file
     Query {
         /// Path to JSONL event file
@@ -321,6 +359,11 @@ pub enum Command {
 /// Run an investigation subcommand.
 pub fn run(command: Command) -> Result<()> {
     match command {
+        Command::ImportSysmon { input, agent_id, hostname } => crate::analysis::import_sysmon(&input, agent_id, hostname),
+        Command::Analyze { input, lang, json } => crate::analysis::run(&input, lang, json),
+        Command::Health { input, agent_id, lang, json, max_age_secs } => {
+            crate::diagnostics::run(&input, agent_id, lang, json, max_age_secs)
+        }
         Command::Query {
             input,
             pid,
@@ -1457,7 +1500,7 @@ fn run_score(input: &Path, limit: usize, json: bool, rules: &RulesConfig) -> Res
                 signed,
                 ..
             } => {
-                if !signed {
+                if *signed == Some(false) && event.schema_version >= 2 {
                     let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
                     let acc = acc_map.entry(key).or_insert_with(|| ProcAcc {
                         pid: *pid,
@@ -1951,6 +1994,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, r
         timestamps: Vec<DateTime<Utc>>,
     }
     let mut beacon_map: HashMap<String, BeaconAcc> = HashMap::new();
+    let mut beacon_seen = std::collections::HashSet::new();
 
     // Collected ProcessCreate events — sorted by timestamp after the scan
     // so that parent lookup is temporal, not file-order dependent.
@@ -2024,7 +2068,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, r
             } => {
                 // Rule: unsigned-dll
                 // Uses the event's own process_context — no parent dependency.
-                if run_rule("unsigned-dll") && !signed {
+                if run_rule("unsigned-dll") && *signed == Some(false) && event.schema_version >= 2 {
                     let proc_image = event
                         .process_context
                         .as_ref()
@@ -2047,22 +2091,32 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, r
                 pid,
                 dst_addr,
                 image_path,
+                dst_port,
+                direction,
+                protocol,
                 ..
             } => {
-                // Rule: beaconing — accumulate for post-processing.
-                // Key by process_key to avoid merging traffic across PID reuse.
-                if run_rule("beaconing") && is_public_ip(dst_addr) {
-                    let pkey = event_key
-                        .clone()
-                        .unwrap_or_else(|| format!("pid:{pid}"));
-                    let key = format!("{dst_addr}|{pkey}");
+                // Only native-time, GUID-backed TCP connection observations
+                // can support a periodicity claim. Old PID/packet logs cannot.
+                let native_guid = event.provenance.as_ref().filter(|p| event.schema_version>=2 && p.original_time
+                    && p.issues.is_empty() && p.event_id==3 && p.provider_guid.eq_ignore_ascii_case("5770385f-c22a-43e0-bf4c-06f5698ffbd9")
+                    && matches!(event.source,crate::events::EventSource::Sysmon {event_id:3}))
+                    .and_then(|p|p.process_guid).filter(|g|!g.is_nil());
+                if run_rule("beaconing") && is_public_ip(dst_addr) && native_guid.is_some()
+                    && matches!(direction,crate::events::NetworkDirection::Outbound) && protocol.eq_ignore_ascii_case("tcp")
+                    && beacon_seen.insert((event.agent_id,event.id)) {
+                    let pkey = format!("sysmon:{}",native_guid.unwrap());
+                    let key = format!("{dst_addr}:{dst_port}|{}|{pkey}",event.agent_id);
                     let acc = beacon_map.entry(key).or_insert_with(|| BeaconAcc {
                         image: image_path.clone(),
                         pid: *pid,
-                        process_key: event_key.clone(),
+                        process_key: Some(pkey),
                         timestamps: Vec::new(),
                     });
                     acc.timestamps.push(ts);
+                    if let Some(latest)=acc.timestamps.iter().max().copied() {
+                        acc.timestamps.retain(|t|(latest-*t).num_seconds()<=600);
+                    }
                 }
             }
 
@@ -2125,10 +2179,10 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, r
     }
 
     // Post-processing: beaconing detection
-    // Flag connections to the same IP from the same process ≥ threshold
+    // Require interval regularity in addition to a minimum connection count.
     if run_rule("beaconing") {
         for (key, acc) in &beacon_map {
-            if acc.timestamps.len() >= rules.hunt.beaconing_threshold {
+            if let Some((mean,cv)) = crate::detection::periodicity(&acc.timestamps,rules.hunt.beaconing_threshold) {
                 let dst = key.split('|').next().unwrap_or("?");
                 let earliest = acc
                     .timestamps
@@ -2144,7 +2198,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, r
                     pid: acc.pid,
                     process_key: acc.process_key.clone(),
                     detail: format!(
-                        "{} connections to {} from {}",
+                        "{} connections to {} from {}; mean_interval_secs={mean:.3}; interval_cv={cv:.4}; benign scheduled traffic may also match",
                         acc.timestamps.len(),
                         dst,
                         basename(&acc.image)
@@ -3248,7 +3302,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
                         signed,
                         ..
                     } => {
-                        if !signed {
+                        if *signed == Some(false) && event.schema_version >= 2 {
                             let key = event_key.unwrap_or_else(|| format!("pid:{pid}"));
                             let proc_image = event
                                 .process_context
@@ -4058,6 +4112,7 @@ fn event_pid(data: &EventData) -> Option<u32> {
         | EventData::FileCreate { pid, .. }
         | EventData::FileDelete { pid, .. }
         | EventData::NetworkConnect { pid, .. }
+        | EventData::NetworkTraffic { pid, .. }
         | EventData::RegistryEvent { pid, .. }
         | EventData::ImageLoad { pid, .. }
         | EventData::DnsQuery { pid, .. }
@@ -4067,7 +4122,8 @@ fn event_pid(data: &EventData) -> Option<u32> {
         EventData::EvasionDetected { pid, .. } => *pid,
         EventData::CreateRemoteThread { source_pid, .. } => Some(*source_pid),
         EventData::ProcessAccess { source_pid, .. } => Some(*source_pid),
-        EventData::SensorHealth { .. } => None,
+        EventData::NativeTelemetry { pid, .. } => *pid,
+        EventData::SensorHealth { .. } | EventData::CorrelationDetection { .. } => None,
     }
 }
 
@@ -4088,6 +4144,8 @@ fn category_short(cat: &EventCategory) -> &'static str {
         EventCategory::Evasion => "Evasion",
         EventCategory::Script => "Script",
         EventCategory::Health => "Health",
+        EventCategory::Telemetry => "Telemetry",
+        EventCategory::Detection => "Detection",
     }
 }
 
@@ -4104,6 +4162,9 @@ fn source_display(source: &crate::events::EventSource) -> String {
 /// One-line summary of an EventData variant for timeline display.
 fn event_summary(data: &EventData) -> String {
     match data {
+        EventData::NativeTelemetry { reason, .. } => format!("NativeTelemetry {reason}"),
+        EventData::CorrelationDetection { rule_id, title_en, .. } => format!("Detection {rule_id} {title_en}"),
+        EventData::NetworkTraffic { pid, dst_addr, dst_port, bytes, .. } => format!("NetworkTraffic pid:{pid} {dst_addr}:{dst_port} bytes:{bytes}"),
         EventData::ProcessCreate {
             pid,
             image_path,
@@ -4153,7 +4214,7 @@ fn event_summary(data: &EventData) -> String {
             signed,
             ..
         } => {
-            let sig = if *signed { "signed" } else { "unsigned" };
+            let sig = match signed { Some(true) => "signed", Some(false) => "unsigned", None => "unknown" };
             format!("ImageLoad         pid:{pid} {image_name} ({sig})")
         }
         EventData::DnsQuery {

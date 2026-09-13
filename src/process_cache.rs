@@ -28,6 +28,7 @@ struct CacheEntry {
 /// reuse within the sensor's lifetime.
 pub struct ProcessCache {
     entries: HashMap<u32, CacheEntry>,
+    guid_entries: HashMap<(uuid::Uuid, uuid::Uuid), CacheEntry>,
     /// Maximum number of entries. When exceeded, the oldest entries are
     /// not proactively evicted — the HashMap grows until ProcessTerminate
     /// events drain it. The cap serves as a circuit-breaker: inserts are
@@ -39,6 +40,7 @@ impl ProcessCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            guid_entries: HashMap::new(),
             capacity,
         }
     }
@@ -51,6 +53,60 @@ impl ProcessCache {
     ///   then evict the entry.
     /// - **Activity events**: look up by PID and attach full context.
     pub fn enrich(&mut self, event: &mut ThreatEvent) {
+        // Sysmon's native ProcessGuid is authoritative, even when the process
+        // predates the sensor. Never join it to another feed solely by PID.
+        if matches!(event.source, crate::events::EventSource::Sysmon { .. }) {
+            if let Some(guid) = event.provenance.as_ref().and_then(|p| p.process_guid) {
+                let key = (event.agent_id, guid);
+                let process_key = format!("sysmon:{guid}");
+                if let EventData::ProcessCreate {
+                    ppid,
+                    image_path,
+                    command_line,
+                    user,
+                    integrity_level,
+                    ..
+                } = &event.data
+                {
+                    let entry = CacheEntry {
+                        process_key: process_key.clone(),
+                        create_time: None,
+                        image_path: image_path.clone(),
+                        command_line: command_line.clone(),
+                        user: user.clone(),
+                        integrity_level: integrity_level.clone(),
+                        ppid: *ppid,
+                    };
+                    event.process_context = Some(build_context(&entry));
+                    if self.guid_entries.len() < self.capacity
+                        || self.guid_entries.contains_key(&key)
+                    {
+                        self.guid_entries.insert(key, entry);
+                    }
+                } else {
+                    event.process_context =
+                        Some(self.guid_entries.get(&key).map(build_context).unwrap_or(
+                            ProcessContext {
+                                process_key,
+                                image_path: None,
+                                command_line: None,
+                                user: None,
+                                integrity_level: None,
+                                ppid: None,
+                            },
+                        ));
+                    if matches!(event.data, EventData::ProcessTerminate { .. }) {
+                        self.guid_entries.remove(&key);
+                    }
+                }
+                return;
+            }
+            if event.schema_version >= 2 {
+                // Missing native identity must remain missing, not borrowed.
+                event.process_context = None;
+                return;
+            }
+        }
         match &event.data {
             EventData::ProcessCreate {
                 pid,
@@ -194,6 +250,37 @@ mod tests {
     use super::*;
     use crate::events::*;
     use uuid::Uuid;
+
+    #[test]
+    fn sysmon_guids_survive_pid_reuse_and_do_not_borrow_metadata() {
+        use crate::fixtures::*;
+        let mut cache = ProcessCache::new(10);
+        let mut old = sysmon(1, 0, ACTOR);
+        cache.enrich(&mut old);
+        let mut new = sysmon(1, 5, OTHER);
+        cache.enrich(&mut new);
+        let mut late_old = sysmon(3, 3, ACTOR);
+        cache.enrich(&mut late_old);
+        assert_eq!(
+            late_old.process_context.unwrap().process_key,
+            format!("sysmon:{ACTOR}")
+        );
+        let mut unknown = sysmon(3, 10, TARGET);
+        cache.enrich(&mut unknown);
+        let context = unknown.process_context.unwrap();
+        assert_eq!(context.process_key, format!("sysmon:{TARGET}"));
+        assert!(context.command_line.is_none());
+    }
+    #[test]
+    fn sysmon_missing_guid_never_uses_an_etw_pid_entry() {
+        let mut cache = ProcessCache::new(10);
+        let mut create = process_create_event(100, Some(123));
+        cache.enrich(&mut create);
+        let mut activity = crate::fixtures::sysmon(3, 1, crate::fixtures::ACTOR);
+        activity.provenance.as_mut().unwrap().process_guid = None;
+        cache.enrich(&mut activity);
+        assert!(activity.process_context.is_none());
+    }
 
     fn test_agent() -> AgentInfo {
         AgentInfo {
@@ -340,7 +427,10 @@ mod tests {
 
         let ctx = net.process_context.unwrap();
         assert_eq!(ctx.process_key, "200:12345");
-        assert_eq!(ctx.image_path.as_deref(), Some("C:\\Windows\\System32\\cmd.exe"));
+        assert_eq!(
+            ctx.image_path.as_deref(),
+            Some("C:\\Windows\\System32\\cmd.exe")
+        );
         assert_eq!(ctx.command_line.as_deref(), Some("cmd.exe /c whoami"));
         assert_eq!(ctx.user.as_deref(), Some("DESKTOP\\admin"));
         assert_eq!(ctx.integrity_level.as_deref(), Some("High"));
@@ -360,7 +450,10 @@ mod tests {
         // Terminate event should get full context
         let ctx = term.process_context.unwrap();
         assert_eq!(ctx.process_key, "300:999");
-        assert_eq!(ctx.image_path.as_deref(), Some("C:\\Windows\\System32\\cmd.exe"));
+        assert_eq!(
+            ctx.image_path.as_deref(),
+            Some("C:\\Windows\\System32\\cmd.exe")
+        );
 
         // Cache should be empty
         assert_eq!(cache.len(), 0);
@@ -534,10 +627,7 @@ mod tests {
 
         let mut net = network_event(1);
         cache.enrich(&mut net);
-        assert_eq!(
-            net.process_context.unwrap().process_key,
-            "1:30"
-        );
+        assert_eq!(net.process_context.unwrap().process_key, "1:30");
     }
 
     #[test]
@@ -668,10 +758,7 @@ mod tests {
         // Sysmon first (no create_time)
         let mut sysmon_create = process_create_event(100, None);
         cache.enrich(&mut sysmon_create);
-        assert_eq!(
-            sysmon_create.process_context.unwrap().process_key,
-            "100:0"
-        );
+        assert_eq!(sysmon_create.process_context.unwrap().process_key, "100:0");
 
         // ETW arrives later (has real create_time) — should replace
         let mut etw_create = process_create_event(100, Some(8888));

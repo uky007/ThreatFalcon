@@ -1,6 +1,13 @@
 mod collectors;
+mod checkpoint;
+mod delivery;
 mod config;
+mod diagnostics;
+mod detection;
+mod analysis;
 mod events;
+#[cfg(test)]
+mod fixtures;
 mod index;
 mod investigate;
 mod output;

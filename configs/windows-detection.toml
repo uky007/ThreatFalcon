@@ -1,0 +1,19 @@
+# Controlled Windows pilot. Requires Sysmon installed/configured separately.
+# 検証用Windows設定。別途Sysmonの導入・設定が必要です。
+# Do not assume zero alerts means clean. See docs/DETECTION_VALIDATION.md.
+health_interval_secs = 30
+state_path = "threatfalcon.state"
+
+[output]
+type = "file"
+path = "threatfalcon_events.jsonl"
+rotation_size_mb = 100
+
+[collectors.etw]
+enabled = true
+
+[collectors.sysmon]
+enabled = true
+
+[collectors.evasion]
+enabled = false

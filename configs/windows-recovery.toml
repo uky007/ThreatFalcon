@@ -1,0 +1,21 @@
+# Experimental Windows/Sysmon recovery pilot, local disk only.
+# Windows/Sysmonの再開位置保存を検証する設定。本番品質の認定ではありません。
+# Requires preinstalled/configured Sysmon; never installs or replaces its policy.
+# Read docs/WINDOWS_RECOVERY.md before use. First run reads retained old records.
+health_interval_secs = 30
+state_path = "threatfalcon.state"
+
+[output]
+type = "file"
+path = "threatfalcon_events.jsonl"
+rotation_size_mb = 100
+
+[collectors.etw]
+enabled = true
+
+[collectors.sysmon]
+enabled = true
+checkpoint_path = "sysmon-checkpoint.db"
+
+[collectors.evasion]
+enabled = false

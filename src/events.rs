@@ -12,8 +12,21 @@ pub struct AgentInfo {
 /// Unified telemetry event from all collection sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreatEvent {
+    /// Runtime-only delivery receipt. Never serialized into telemetry or imported from logs.
+    #[serde(skip)]
+    pub delivery: Option<crate::delivery::Receipt>,
+    /// Version 1 logs did not distinguish observation and occurrence time.
+    #[serde(default = "legacy_schema_version")]
+    pub schema_version: u16,
     pub id: Uuid,
     pub timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+    /// Native evidence is retained independently of normalized fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<EventProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis_status: Option<crate::detection::DetectionStats>,
     pub hostname: String,
     pub agent_id: Uuid,
     pub sensor_version: String,
@@ -30,6 +43,35 @@ pub struct ThreatEvent {
     /// ProcessCreate observations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_context: Option<ProcessContext>,
+}
+
+fn legacy_schema_version() -> u16 {
+    1
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EventProvenance {
+    pub provider_guid: String,
+    pub event_id: u16,
+    #[serde(default)]
+    pub version: u8,
+    #[serde(default)]
+    pub opcode: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<u64>,
+    #[serde(default)]
+    pub original_time: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_guid: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_guid: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_process_guid: Option<Uuid>,
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// Stable diagnostic codes; missing/undecodable evidence is not clean evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
 }
 
 /// Stable process identity and cached metadata, attached to events by the
@@ -86,8 +128,13 @@ impl ThreatEvent {
         data: EventData,
     ) -> Self {
         Self {
+            schema_version: 2,
+            delivery: None,
             id: Uuid::new_v4(),
             timestamp: Utc::now(),
+            observed_at: Some(Utc::now()),
+            provenance: None,
+            analysis_status: None,
             hostname: agent.hostname.clone(),
             agent_id: agent.agent_id,
             sensor_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -111,8 +158,13 @@ impl ThreatEvent {
         rule: RuleMetadata,
     ) -> Self {
         Self {
+            schema_version: 2,
+            delivery: None,
             id: Uuid::new_v4(),
             timestamp: Utc::now(),
+            observed_at: Some(Utc::now()),
+            provenance: None,
+            analysis_status: None,
             hostname: agent.hostname.clone(),
             agent_id: agent.agent_id,
             sensor_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -136,6 +188,8 @@ pub enum EventSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventCategory {
+    Telemetry,
+    Detection,
     Process,
     File,
     Network,
@@ -159,6 +213,23 @@ pub enum Severity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum EventData {
+    /// Schema unavailable, partially decoded, or not yet normalized. Never silently discarded.
+    NativeTelemetry {
+        pid: Option<u32>,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_hex: Option<String>,
+    },
+    CorrelationDetection {
+        rule_id: String,
+        title_en: String,
+        title_ja: String,
+        evidence_ids: Vec<Uuid>,
+        process_key: String,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+        details: String,
+    },
     ProcessCreate {
         pid: u32,
         ppid: u32,
@@ -199,6 +270,17 @@ pub enum EventData {
         dst_port: u16,
         direction: NetworkDirection,
     },
+    /// Send/receive observations are traffic, not new connections.
+    NetworkTraffic {
+        pid: u32,
+        protocol: String,
+        src_addr: String,
+        src_port: u16,
+        dst_addr: String,
+        dst_port: u16,
+        direction: NetworkDirection,
+        bytes: u64,
+    },
     RegistryEvent {
         pid: u32,
         operation: RegistryOperation,
@@ -210,7 +292,9 @@ pub enum EventData {
         pid: u32,
         image_path: String,
         image_name: String,
-        signed: bool,
+        /// None = not checked, not supplied, or unknown. Never equivalent to unsigned.
+        #[serde(default)]
+        signed: Option<bool>,
         signature: Option<String>,
         hashes: Option<String>,
     },
@@ -280,8 +364,79 @@ pub enum EventData {
 /// Status of a single collector, included in health events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_mode: Option<String>,
+    #[serde(default)]
+    pub checkpoint_committed_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_last_commit_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub events_lost_before_queue: u64,
+    #[serde(default)]
+    pub events_observed: u64,
+    #[serde(default)]
+    pub events_not_normalized: u64,
+    #[serde(default)]
+    pub decode_failures: u64,
     pub name: String,
     pub state: CollectorState,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queue_events_dropped: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etw: Option<EtwSessionStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<CollectorError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statistics_error: Option<CollectorError>,
+}
+
+impl CollectorStatus {
+    pub fn new(name: &str, state: CollectorState) -> Self {
+        Self {
+            recovery_mode: None,
+            checkpoint_committed_events: 0,
+            checkpoint_last_commit_at: None,
+            events_lost_before_queue: 0,
+            events_observed: 0,
+            events_not_normalized: 0,
+            decode_failures: 0,
+            name: name.into(),
+            state,
+            queue_events_dropped: 0,
+            providers: Vec::new(),
+            etw: None,
+            error: None,
+            statistics_error: None,
+        }
+    }
+}
+
+/// Stable codes for machine consumers; human explanations are localized by the CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorError {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_code: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderStatus {
+    pub name: String,
+    pub guid: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<u32>,
+}
+
+/// Raw session counters. Buffers are NOT event counts and must not be summed with them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EtwSessionStats {
+    pub events_lost: u64,
+    pub log_buffers_lost: u64,
+    pub realtime_buffers_lost: u64,
+    pub collected_at: DateTime<Utc>,
 }
 
 /// Status of the output sink, included in health events.
@@ -303,9 +458,12 @@ fn is_zero(v: &u64) -> bool {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CollectorState {
+    Starting,
     Running,
+    Degraded,
     Stopped,
     Disabled,
+    Unsupported,
     Error,
 }
 
@@ -322,6 +480,7 @@ pub enum FileOperation {
 pub enum NetworkDirection {
     Outbound,
     Inbound,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +537,7 @@ impl EventData {
             Self::FileCreate { pid, .. }
             | Self::FileDelete { pid, .. }
             | Self::NetworkConnect { pid, .. }
+            | Self::NetworkTraffic { pid, .. }
             | Self::RegistryEvent { pid, .. }
             | Self::ImageLoad { pid, .. }
             | Self::DnsQuery { pid, .. }
@@ -385,6 +545,9 @@ impl EventData {
             | Self::AmsiScan { pid, .. }
             | Self::PipeEvent { pid, .. } => Some(*pid),
             Self::EvasionDetected { pid, .. } => *pid,
+            Self::NativeTelemetry { pid, .. } => *pid,
+            Self::CreateRemoteThread { source_pid, .. }
+            | Self::ProcessAccess { source_pid, .. } => Some(*source_pid),
             _ => None,
         }
     }
@@ -414,14 +577,8 @@ mod tests {
                 events_dropped: 3,
                 sink: None,
                 collectors: vec![
-                    CollectorStatus {
-                        name: "ETW".into(),
-                        state: CollectorState::Running,
-                    },
-                    CollectorStatus {
-                        name: "Sysmon".into(),
-                        state: CollectorState::Disabled,
-                    },
+                    CollectorStatus::new("ETW", CollectorState::Running),
+                    CollectorStatus::new("Sysmon", CollectorState::Disabled),
                 ],
             },
         );
@@ -500,7 +657,10 @@ mod tests {
                 create_time: None,
             },
         );
-        assert!(event.rule.is_none(), "telemetry events must not carry rules");
+        assert!(
+            event.rule.is_none(),
+            "telemetry events must not carry rules"
+        );
     }
 
     #[test]

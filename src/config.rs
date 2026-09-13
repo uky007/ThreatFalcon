@@ -202,7 +202,10 @@ where
         }
 
         fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<u64, E> {
-            let s = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+            let s = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
             u64::from_str_radix(s, 16).map_err(de::Error::custom)
         }
     }
@@ -221,6 +224,8 @@ where
 #[serde(default)]
 pub struct SysmonConfig {
     pub enabled: bool,
+    /// Opt-in acknowledged EventLog resume. Only supported with local file output.
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,10 +256,31 @@ pub fn find_config_file(cwd_override: Option<&std::path::Path>) -> Option<PathBu
     if cwd_path.exists() {
         Some(cwd_path)
     } else if let Some(ref pp) = platform_path {
-        if pp.exists() { Some(pp.clone()) } else { None }
+        if pp.exists() {
+            Some(pp.clone())
+        } else {
+            None
+        }
     } else {
         None
     }
+}
+
+/// SCM starts services from a different working directory. Pin and validate an
+/// existing configuration before registration; never persist a relative path.
+#[allow(dead_code)] // Windows installer; portable validation tests.
+pub fn validated_service_config(path: &std::path::Path) -> Result<PathBuf> {
+    use anyhow::Context;
+    let absolute = path
+        .canonicalize()
+        .context("service installation requires an existing configuration file")?;
+    anyhow::ensure!(absolute.is_file(), "service configuration is not a file");
+    let config = SensorConfig::load_from(Some(&absolute))?;
+    anyhow::ensure!(
+        config.output.sink_type != SinkType::Stdout,
+        "stdout sink is not supported in service mode"
+    );
+    Ok(absolute)
 }
 
 impl SensorConfig {
@@ -297,9 +323,7 @@ impl SensorConfig {
                         .map(|p| p.to_path_buf());
                     (cfg, anchor)
                 } else {
-                    tracing::info!(
-                        "No config file found — using defaults"
-                    );
+                    tracing::info!("No config file found — using defaults");
                     // Anchor to the executable's directory.
                     let anchor = std::env::current_exe()
                         .ok()
@@ -309,13 +333,20 @@ impl SensorConfig {
             }
         };
 
-        Ok(config.resolve_paths(anchor))
+        let config = config.resolve_paths(anchor);
+        config.validate()?;
+        Ok(config)
     }
 
     /// Resolve relative paths against `anchor` so they are stable
     /// regardless of process working directory.
     fn resolve_paths(mut self, anchor: Option<PathBuf>) -> Self {
         if let Some(ref base) = anchor {
+            if let Some(path) = &mut self.collectors.sysmon.checkpoint_path {
+                if path.is_relative() {
+                    *path = base.join(&*path);
+                }
+            }
             if self.state_path.is_relative() {
                 self.state_path = base.join(&self.state_path);
             }
@@ -333,6 +364,30 @@ impl SensorConfig {
 }
 
 impl SensorConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.collectors.sysmon.enabled {
+            if let Some(checkpoint) = &self.collectors.sysmon.checkpoint_path {
+                anyhow::ensure!(
+                    self.output.sink_type == SinkType::File,
+                    "acknowledged Sysmon resume currently requires local file output"
+                );
+                let state = path_identity(&self.state_path)?;
+                let output = path_identity(&self.output.path)?;
+                for suffix in ["", "-journal", "-wal", "-shm"] {
+                    let mut candidate = checkpoint.as_os_str().to_os_string();
+                    candidate.push(suffix);
+                    let path = path_identity(std::path::Path::new(&candidate))?;
+                    let rotated_output = path
+                        .strip_prefix(&format!("{output}."))
+                        .is_some_and(|s| s.parse::<u32>().is_ok_and(|n| n > 0));
+                    anyhow::ensure!(path != state && path != output && !rotated_output,
+                        "checkpoint and SQLite sidecars must not share paths with agent state, event output or rotated logs");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build defaults rooted at `base`. When `Some`, paths are absolute
     /// under that directory (used on Windows with ProgramData). When
     /// `None`, paths are relative (development / non-Windows).
@@ -355,6 +410,37 @@ impl Default for SensorConfig {
     fn default() -> Self {
         Self::with_base_dir(default_base_dir().as_deref())
     }
+}
+
+fn path_identity(path: &std::path::Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normal = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            _ => normal.push(part.as_os_str()),
+        }
+    }
+    let normal = normal.canonicalize().unwrap_or_else(|_| {
+        normal
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| normal.file_name().map(|n| p.join(n)))
+            .unwrap_or(normal.clone())
+    });
+    let key = normal.to_string_lossy().into_owned();
+    Ok(if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    })
 }
 
 impl Default for SinkType {
@@ -414,7 +500,10 @@ impl Default for EtwConfig {
 
 impl Default for SysmonConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            checkpoint_path: None,
+        }
     }
 }
 
@@ -583,6 +672,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_configuration_is_pinned_and_invalid_configuration_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("日本語 config.toml");
+        std::fs::write(&path, "[output]\ntype='file'\n").unwrap();
+        let validated = validated_service_config(&path).unwrap();
+        assert!(validated.is_absolute());
+        assert_eq!(validated, path.canonicalize().unwrap());
+        std::fs::write(&path, "[output]\ntype='stdout'\n").unwrap();
+        assert!(validated_service_config(&path).is_err());
+        std::fs::write(&path, "invalid toml [").unwrap();
+        assert!(validated_service_config(&path).is_err());
+        assert!(validated_service_config(&dir.path().join("missing.toml")).is_err());
+        assert!(validated_service_config(dir.path()).is_err());
+    }
+
+    #[test]
+    fn relative_service_configuration_is_resolved_before_scm_registration() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix(".threatfalcon-service-test-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let path = dir.path().join("日本語 config.toml");
+        std::fs::write(&path, "[output]\ntype='file'\n").unwrap();
+        let relative = path.strip_prefix(&cwd).unwrap();
+        assert!(relative.is_relative());
+        assert_eq!(
+            validated_service_config(relative).unwrap(),
+            path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn acknowledged_resume_rejects_non_durable_sinks_and_path_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = SensorConfig::with_base_dir(Some(dir.path()));
+        cfg.collectors.sysmon.enabled = true;
+        cfg.collectors.sysmon.checkpoint_path = Some(dir.path().join("resume.db"));
+        assert!(cfg.validate().is_ok());
+        for sink_type in [SinkType::Stdout, SinkType::Http] {
+            cfg.output.sink_type = sink_type;
+            assert!(cfg.validate().is_err());
+        }
+        cfg.output.sink_type = SinkType::File;
+        cfg.collectors.sysmon.checkpoint_path = Some(cfg.output.path.clone());
+        assert!(cfg.validate().is_err());
+        cfg.collectors.sysmon.checkpoint_path =
+            Some(dir.path().join("unused/../threatfalcon.state"));
+        assert!(cfg.validate().is_err());
+        cfg.collectors.sysmon.checkpoint_path =
+            Some(dir.path().join("threatfalcon_events.jsonl.1"));
+        assert!(cfg.validate().is_err());
+        cfg.collectors.sysmon.checkpoint_path = Some(dir.path().join("resume.db"));
+        cfg.output.path = dir.path().join("resume.db-journal");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn checkpoint_path_is_anchored_to_config_not_service_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sensor.toml");
+        std::fs::write(
+            &path,
+            "[collectors.sysmon]\nenabled=true\ncheckpoint_path='state/sysmon.db'\n",
+        )
+        .unwrap();
+        let cfg = SensorConfig::load_from(Some(&path)).unwrap();
+        assert_eq!(
+            cfg.collectors.sysmon.checkpoint_path,
+            Some(dir.path().canonicalize().unwrap().join("state/sysmon.db"))
+        );
+    }
+
+    #[test]
     fn default_config_is_valid() {
         let cfg = SensorConfig::default();
         assert!(cfg.collectors.etw.enabled);
@@ -648,7 +811,10 @@ mod tests {
         "#;
         let cfg: SensorConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.output.sink_type, SinkType::Http);
-        assert_eq!(cfg.output.url.as_deref(), Some("https://example.com/api/events"));
+        assert_eq!(
+            cfg.output.url.as_deref(),
+            Some("https://example.com/api/events")
+        );
         assert_eq!(cfg.output.batch_size, 50);
         assert_eq!(cfg.output.timeout_secs, 30);
     }
@@ -724,7 +890,10 @@ mod tests {
         let cfg = SensorConfig::default();
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let cfg2: SensorConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(cfg.collectors.etw.providers.len(), cfg2.collectors.etw.providers.len());
+        assert_eq!(
+            cfg.collectors.etw.providers.len(),
+            cfg2.collectors.etw.providers.len()
+        );
         assert_eq!(cfg.output.rotation_size_mb, cfg2.output.rotation_size_mb);
     }
 
@@ -753,13 +922,14 @@ mod tests {
     }
 
     #[test]
-    fn load_from_none_uses_defaults_when_no_file() {
-        // Run in a temp dir where no threatfalcon.toml exists
-        let dir = tempfile::TempDir::new().unwrap();
-        let _guard = std::env::set_current_dir(dir.path());
+    fn load_from_none_does_not_mutate_working_directory() {
+        // Tests run concurrently. set_current_dir changes the entire process
+        // and its Result is not a restoration guard; never use it here.
+        let before = std::env::current_dir().unwrap();
         // This may or may not find a file depending on the test runner's cwd,
         // but load_from(None) should never panic.
         let _ = SensorConfig::load_from(None);
+        assert_eq!(std::env::current_dir().unwrap(), before);
     }
 
     #[test]
@@ -804,8 +974,14 @@ mod tests {
         let resolved = cfg.resolve_paths(Some(PathBuf::from("/other/dir")));
         // Absolute paths should not be rewritten
         assert_eq!(resolved.state_path, PathBuf::from("/absolute/state.file"));
-        assert_eq!(resolved.output.path, PathBuf::from("/absolute/events.jsonl"));
-        assert_eq!(resolved.output.spool_dir, Some(PathBuf::from("/absolute/spool")));
+        assert_eq!(
+            resolved.output.path,
+            PathBuf::from("/absolute/events.jsonl")
+        );
+        assert_eq!(
+            resolved.output.spool_dir,
+            Some(PathBuf::from("/absolute/spool"))
+        );
     }
 
     #[test]
@@ -853,10 +1029,7 @@ mod tests {
 
         let cfg = SensorConfig::load_from(Some(&config_path)).unwrap();
         let expected_dir = dir.path().canonicalize().unwrap();
-        assert_eq!(
-            cfg.output.spool_dir,
-            Some(expected_dir.join("spool")),
-        );
+        assert_eq!(cfg.output.spool_dir, Some(expected_dir.join("spool")),);
     }
 
     #[test]
@@ -884,16 +1057,16 @@ mod tests {
         let conf_dir = dir.path().join("conf");
         let config_path = conf_dir.join("sensor.toml");
         std::fs::create_dir_all(&conf_dir).unwrap();
-        std::fs::write(
-            &config_path,
-            "state_path = \"my.state\"\n",
-        )
-        .unwrap();
+        std::fs::write(&config_path, "state_path = \"my.state\"\n").unwrap();
 
         let cfg = SensorConfig::load_from(Some(&config_path)).unwrap();
         // state_path should be anchored to the config file's directory,
         // not the process cwd.
-        assert!(cfg.state_path.is_absolute(), "state_path should be absolute: {:?}", cfg.state_path);
+        assert!(
+            cfg.state_path.is_absolute(),
+            "state_path should be absolute: {:?}",
+            cfg.state_path
+        );
         // Canonicalize the expected dir to handle platform symlinks (e.g.
         // /var → /private/var on macOS).
         let expected_dir = conf_dir.canonicalize().unwrap();
@@ -911,8 +1084,14 @@ mod tests {
         // Hunt defaults
         assert_eq!(rules.hunt.beaconing_threshold, 10);
         assert!(rules.hunt.lolbins.contains(&"certutil.exe".to_string()));
-        assert!(rules.hunt.suspicious_parents.contains(&"winword.exe".to_string()));
-        assert!(rules.hunt.suspicious_children.contains(&"cmd.exe".to_string()));
+        assert!(rules
+            .hunt
+            .suspicious_parents
+            .contains(&"winword.exe".to_string()));
+        assert!(rules
+            .hunt
+            .suspicious_children
+            .contains(&"cmd.exe".to_string()));
         // Score weights
         assert_eq!(rules.score.detection, 40);
         assert_eq!(rules.score.suspicious_parent, 20);
@@ -957,7 +1136,11 @@ mod tests {
         let cfg: SensorConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.rules.hunt.lolbins, vec!["custom.exe", "another.exe"]);
         // suspicious_parents still has defaults
-        assert!(cfg.rules.hunt.suspicious_parents.contains(&"winword.exe".to_string()));
+        assert!(cfg
+            .rules
+            .hunt
+            .suspicious_parents
+            .contains(&"winword.exe".to_string()));
     }
 
     #[test]

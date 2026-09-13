@@ -6,8 +6,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::EtwConfig;
-use crate::events::{AgentInfo, ThreatEvent};
+use crate::events::{AgentInfo, CollectorStatus, ThreatEvent};
 
+use super::health::RuntimeHealth;
 use super::Collector;
 
 pub struct EtwCollector {
@@ -15,10 +16,9 @@ pub struct EtwCollector {
     #[allow(dead_code)] // used on Windows only
     agent: AgentInfo,
     dropped: Arc<AtomicU64>,
+    health: RuntimeHealth,
     #[cfg(target_os = "windows")]
-    stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    #[cfg(target_os = "windows")]
-    instance_lock: Option<isize>,
+    session: Option<platform::Session>,
 }
 
 impl EtwCollector {
@@ -27,10 +27,9 @@ impl EtwCollector {
             config,
             agent,
             dropped: Arc::new(AtomicU64::new(0)),
+            health: RuntimeHealth::new("ETW"),
             #[cfg(target_os = "windows")]
-            stop_flag: None,
-            #[cfg(target_os = "windows")]
-            instance_lock: None,
+            session: None,
         }
     }
 }
@@ -88,9 +87,7 @@ pub(crate) mod parser {
             if self.pos + 4 > self.data.len() {
                 return None;
             }
-            let v = u32::from_le_bytes(
-                self.data[self.pos..self.pos + 4].try_into().ok()?,
-            );
+            let v = u32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().ok()?);
             self.pos += 4;
             Some(v)
         }
@@ -99,9 +96,7 @@ pub(crate) mod parser {
             if self.pos + 8 > self.data.len() {
                 return None;
             }
-            let v = u64::from_le_bytes(
-                self.data[self.pos..self.pos + 8].try_into().ok()?,
-            );
+            let v = u64::from_le_bytes(self.data[self.pos..self.pos + 8].try_into().ok()?);
             self.pos += 8;
             Some(v)
         }
@@ -129,8 +124,8 @@ pub(crate) mod parser {
             let b = &self.data[self.pos..self.pos + 16];
             self.pos += 16;
             let addr = std::net::Ipv6Addr::from([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
-                b[10], b[11], b[12], b[13], b[14], b[15],
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12],
+                b[13], b[14], b[15],
             ]);
             Some(addr.to_string())
         }
@@ -139,10 +134,7 @@ pub(crate) mod parser {
         pub fn read_utf16_nul(&mut self) -> String {
             let start = self.pos;
             while self.pos + 2 <= self.data.len() {
-                let c = u16::from_le_bytes([
-                    self.data[self.pos],
-                    self.data[self.pos + 1],
-                ]);
+                let c = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
                 self.pos += 2;
                 if c == 0 {
                     return self.decode_utf16(start, self.pos - 2);
@@ -206,7 +198,6 @@ pub(crate) mod parser {
 #[cfg(target_os = "windows")]
 mod platform {
     use super::*;
-    use super::parser::{UserDataReader, dns_query_type_name};
     use crate::events::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -248,10 +239,10 @@ mod platform {
                 let last_err = unsafe { GetLastError() };
                 if last_err == WIN32_ERROR(183) {
                     // ERROR_ALREADY_EXISTS — another instance holds the mutex
-                    unsafe { let _ = CloseHandle(h); }
-                    anyhow::bail!(
-                        "Another ThreatFalcon instance is already running"
-                    );
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
+                    anyhow::bail!("Another ThreatFalcon instance is already running");
                 }
                 Ok(h.0 as isize)
             }
@@ -273,33 +264,6 @@ mod platform {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Extract the UserData payload from an EVENT_RECORD as a byte slice.
-    ///
-    /// # Safety
-    /// The EVENT_RECORD must contain a valid UserData pointer.
-    unsafe fn user_data_slice<'a>(rec: &'a EVENT_RECORD) -> Option<&'a [u8]> {
-        let ptr = rec.UserData as *const u8;
-        let len = rec.UserDataLength as usize;
-        if ptr.is_null() || len == 0 {
-            return None;
-        }
-        Some(std::slice::from_raw_parts(ptr, len))
-    }
-
-    /// Determine pointer size from EVENT_HEADER flags.
-    fn ptr_size(rec: &EVENT_RECORD) -> usize {
-        const FLAG_32BIT: u16 = 0x0020;
-        const FLAG_64BIT: u16 = 0x0040;
-        let flags = rec.EventHeader.Flags;
-        if flags & FLAG_64BIT != 0 {
-            8
-        } else if flags & FLAG_32BIT != 0 {
-            4
-        } else {
-            8 // default to 64-bit on modern Windows
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Existing session management (unchanged)
     // -----------------------------------------------------------------------
@@ -307,7 +271,12 @@ mod platform {
     fn parse_guid(s: &str) -> Result<GUID> {
         let s = s.trim_matches(|c| c == '{' || c == '}');
         let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 5 {
+        if parts.len() != 5
+            || !parts
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
             anyhow::bail!("Invalid GUID format: {}", s);
         }
         let d1 = u32::from_str_radix(parts[0], 16)?;
@@ -329,94 +298,219 @@ mod platform {
     struct CallbackContext {
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
-        stop: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
+        decoder: std::sync::Mutex<super::super::tdh::Decoder>,
+        health: RuntimeHealth,
     }
 
-    /// Start an ETW real-time trace session, enable the configured providers,
-    /// and spawn a blocking thread that consumes events.
-    ///
-    /// Returns `(stop_flag, instance_lock_handle)`.  The caller must keep
-    /// `instance_lock_handle` alive for the session's lifetime and pass it
-    /// to `stop_session()` on shutdown.
+    // The C header requires an aligned properties structure followed by room
+    // for both names. Vec<u8> does not guarantee the required alignment.
+    #[repr(C)]
+    struct TraceProperties {
+        props: EVENT_TRACE_PROPERTIES,
+        logger_name: [u16; 1024],
+        file_name: [u16; 1024],
+    }
+
+    impl TraceProperties {
+        fn new() -> Self {
+            let mut buffer = Self {
+                props: EVENT_TRACE_PROPERTIES::default(),
+                logger_name: [0; 1024],
+                file_name: [0; 1024],
+            };
+            buffer.props.Wnode.BufferSize = std::mem::size_of::<Self>() as u32;
+            buffer.props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+            buffer.props.LoggerNameOffset = std::mem::offset_of!(Self, logger_name) as u32;
+            buffer.props.LogFileNameOffset = std::mem::offset_of!(Self, file_name) as u32;
+            buffer
+        }
+
+        fn stats(&self) -> crate::events::EtwSessionStats {
+            crate::events::EtwSessionStats {
+                events_lost: self.props.EventsLost as u64,
+                log_buffers_lost: self.props.LogBuffersLost as u64,
+                realtime_buffers_lost: self.props.RealTimeBuffersLost as u64,
+                collected_at: chrono::Utc::now(),
+            }
+        }
+    }
+
+    pub struct Session {
+        handle: CONTROLTRACE_HANDLE,
+        instance_lock: isize,
+        trace: Option<PROCESSTRACE_HANDLE>,
+        worker: Option<tokio::task::JoinHandle<()>>,
+        stopping: Arc<AtomicBool>,
+        health: super::RuntimeHealth,
+    }
+
+    impl Session {
+        pub fn refresh_statistics(&self) {
+            if self.handle.Value == 0 {
+                return;
+            }
+            let mut buffer = TraceProperties::new();
+            let status = unsafe {
+                ControlTraceW(
+                    self.handle,
+                    windows::core::PCWSTR::null(),
+                    &mut buffer.props,
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            };
+            if status.0 == 0 {
+                self.health.statistics(buffer.stats());
+            } else {
+                self.health.statistics_failed(status.0);
+            }
+            if !self.stopping.load(Ordering::Acquire)
+                && self.worker.as_ref().is_some_and(|w| w.is_finished())
+                && self.health.snapshot(0).state != CollectorState::Error
+            {
+                self.health.fail("etw_consumer_ended", None);
+            }
+        }
+
+        fn stop_trace(&mut self) -> Result<()> {
+            if self.handle.Value == 0 {
+                return Ok(());
+            }
+            let mut buffer = TraceProperties::new();
+            let status = unsafe {
+                ControlTraceW(
+                    self.handle,
+                    windows::core::PCWSTR::null(),
+                    &mut buffer.props,
+                    EVENT_TRACE_CONTROL_STOP,
+                )
+            };
+            if status.0 == 0 {
+                self.health.statistics(buffer.stats());
+                self.handle = CONTROLTRACE_HANDLE::default();
+                Ok(())
+            } else {
+                self.health.fail("etw_stop_failed", Some(status.0));
+                anyhow::bail!("ControlTraceW(STOP) failed: {}", status.0)
+            }
+        }
+
+        pub async fn stop(&mut self) -> Result<()> {
+            self.stopping.store(true, Ordering::Release);
+            let result = self.stop_trace();
+            // CloseTrace unblocks ProcessTrace if stopping the session failed.
+            if result.is_err() {
+                if let Some(trace) = self.trace.take() {
+                    unsafe {
+                        let _ = CloseTrace(trace);
+                    }
+                }
+            }
+            if let Some(worker) = self.worker.as_mut() {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), worker).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        self.health.fail("collector_worker_failed", None);
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        self.health.fail("collector_stop_timeout", None);
+                        return Err(e.into());
+                    }
+                }
+            }
+            self.worker = None;
+            if result.is_ok() {
+                self.health.stopped();
+            }
+            result
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            self.stopping.store(true, Ordering::Release);
+            let _ = self.stop_trace();
+            if let Some(trace) = self.trace.take() {
+                unsafe {
+                    let _ = CloseTrace(trace);
+                }
+            }
+            release_instance_lock(self.instance_lock);
+        }
+    }
+
+    /// Return only once OpenTrace succeeds. Session owns cleanup on every
+    /// failure path and never stops a session without owning the instance lock.
     pub fn start_session(
         providers: &[crate::config::EtwProviderConfig],
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
-    ) -> Result<(Arc<AtomicBool>, isize)> {
-        let stop = Arc::new(AtomicBool::new(false));
-
-        // ---- multi-instance guard via named mutex ---------------------------
-        let instance_lock = acquire_instance_lock()?;
-
-        // ---- allocate EVENT_TRACE_PROPERTIES --------------------------------
+        health: super::RuntimeHealth,
+    ) -> Result<Session> {
+        let guids: Vec<GUID> = providers
+            .iter()
+            .map(|p| parse_guid(&p.guid))
+            .collect::<Result<_>>()?;
+        let mut session = Session {
+            handle: CONTROLTRACE_HANDLE::default(),
+            instance_lock: acquire_instance_lock()?,
+            trace: None,
+            worker: None,
+            stopping: Arc::new(AtomicBool::new(false)),
+            health,
+        };
         let session_name_wide: Vec<u16> = SESSION_NAME
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
 
-        let init_props = |buf: &mut Vec<u8>| {
-            let extra = session_name_wide.len() * 2;
-            let total =
-                std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + extra;
-            buf.resize(total, 0);
-            buf.fill(0);
-            let props = unsafe {
-                &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES)
-            };
-            props.Wnode.BufferSize = total as u32;
-            props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-            props.Wnode.ClientContext = 1; // QPC
-            props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-            props.LoggerNameOffset =
-                std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-            props
+        let start = |handle: &mut CONTROLTRACE_HANDLE| {
+            let mut buffer = TraceProperties::new();
+            buffer.props.Wnode.ClientContext = 1; // QPC
+            buffer.props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+            buffer.props.LogFileNameOffset = 0; // real-time only; no ETL file
+            unsafe {
+                StartTraceW(
+                    handle,
+                    windows::core::PCWSTR(session_name_wide.as_ptr()),
+                    &mut buffer.props,
+                )
+            }
         };
-
-        let mut buf = Vec::new();
-        let props = init_props(&mut buf);
-
-        // ---- start trace ----------------------------------------------------
-        let mut handle = CONTROLTRACE_HANDLE::default();
-        let mut status = unsafe {
-            StartTraceW(
-                &mut handle,
-                windows::core::PCWSTR(session_name_wide.as_ptr()),
-                props,
-            )
-        };
+        let mut status = start(&mut session.handle);
 
         // ERROR_ALREADY_EXISTS (183): a stale session from a previous crash.
         // We hold the named mutex, so no other live instance owns this
         // session — safe to stop and retry.
         if status.0 == 183 {
-            tracing::warn!(
-                "Stale ETW session found — stopping and retrying"
-            );
-            stop_trace();
-
-            let props = init_props(&mut buf);
-            status = unsafe {
-                StartTraceW(
-                    &mut handle,
+            tracing::warn!("Stale ETW session found — stopping and retrying");
+            let mut buffer = TraceProperties::new();
+            unsafe {
+                let _ = ControlTraceW(
+                    CONTROLTRACE_HANDLE::default(),
                     windows::core::PCWSTR(session_name_wide.as_ptr()),
-                    props,
-                )
-            };
+                    &mut buffer.props,
+                    EVENT_TRACE_CONTROL_STOP,
+                );
+            }
+            status = start(&mut session.handle);
         }
 
         if status != WIN32_ERROR(0) {
+            session.handle = CONTROLTRACE_HANDLE::default();
+            session.health.fail("etw_start_failed", Some(status.0));
             anyhow::bail!("StartTraceW failed: {status:?}");
         }
 
         // ---- enable providers -----------------------------------------------
-        for p in providers {
-            let guid = parse_guid(&p.guid)?;
+        let mut provider_statuses = Vec::new();
+        for (p, guid) in providers.iter().zip(&guids) {
             let status = unsafe {
                 EnableTraceEx2(
-                    handle,
-                    &guid,
+                    session.handle,
+                    guid,
                     EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
                     p.level,
                     p.keywords,
@@ -434,86 +528,59 @@ mod platform {
             } else {
                 tracing::info!(provider = %p.name, "ETW provider enabled");
             }
+            provider_statuses.push(crate::events::ProviderStatus {
+                name: p.name.clone(),
+                guid: p.guid.clone(),
+                enabled: status.0 == 0,
+                error_code: (status.0 != 0).then_some(status.0),
+            });
+        }
+        let any_enabled = provider_statuses.iter().any(|p| p.enabled);
+        session.health.providers(provider_statuses);
+        if !any_enabled {
+            session.health.fail("etw_no_providers", None);
+            anyhow::bail!("No ETW providers could be enabled");
         }
 
         // ---- consume events in a blocking thread ----------------------------
-        let stop_clone = stop.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let session_wide: Vec<u16> = SESSION_NAME
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-
-            let ctx = Box::new(CallbackContext {
-                agent,
-                tx,
-                stop: stop_clone,
-                dropped,
-            });
-            let ctx_ptr = Box::into_raw(ctx);
-
-            let mut logfile = EVENT_TRACE_LOGFILEW::default();
-            logfile.LoggerName =
-                windows::core::PWSTR(session_wide.as_ptr() as *mut u16);
-            logfile.Anonymous1.ProcessTraceMode =
-                PROCESS_TRACE_MODE_REAL_TIME
-                    | PROCESS_TRACE_MODE_EVENT_RECORD;
-            logfile.Context = ctx_ptr as *mut std::ffi::c_void;
-            logfile.Anonymous2.EventRecordCallback =
-                Some(event_callback);
-
-            let trace = unsafe { OpenTraceW(&mut logfile) };
-            if trace.Value == u64::MAX {
-                tracing::error!("OpenTraceW failed");
-                unsafe {
-                    drop(Box::from_raw(ctx_ptr));
-                }
-                return;
-            }
-
-            let status = unsafe { ProcessTrace(&[trace], None, None) };
-            if status != WIN32_ERROR(0) {
-                tracing::warn!(error = ?status, "ProcessTrace ended");
-            }
-
+        let ctx_ptr = Box::into_raw(Box::new(CallbackContext {
+            agent,
+            tx,
+            dropped,
+            decoder: std::sync::Mutex::new(super::super::tdh::Decoder::default()),
+            health: session.health.clone(),
+        }));
+        let mut logfile = EVENT_TRACE_LOGFILEW::default();
+        logfile.LoggerName = windows::core::PWSTR(session_name_wide.as_ptr() as *mut u16);
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Context = ctx_ptr as *mut std::ffi::c_void;
+        logfile.Anonymous2.EventRecordCallback = Some(event_callback);
+        let trace = unsafe { OpenTraceW(&mut logfile) };
+        if trace.Value == u64::MAX {
+            let error = unsafe { GetLastError() }.0;
             unsafe {
-                let _ = CloseTrace(trace);
                 drop(Box::from_raw(ctx_ptr));
             }
-        });
-
-        Ok((stop, instance_lock))
-    }
-
-    /// Stop the ETW trace (causes ProcessTrace to return) without releasing
-    /// the instance lock.  Used internally for stale-session cleanup.
-    fn stop_trace() {
-        let session_name_wide: Vec<u16> = SESSION_NAME
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
-        let mut buf = vec![0u8; total];
-        let props =
-            unsafe { &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
-        props.Wnode.BufferSize = total as u32;
-
-        unsafe {
-            let _ = ControlTraceW(
-                CONTROLTRACE_HANDLE::default(),
-                windows::core::PCWSTR(session_name_wide.as_ptr()),
-                props,
-                EVENT_TRACE_CONTROL_STOP,
-            );
+            session.health.fail("etw_open_failed", Some(error));
+            anyhow::bail!("OpenTraceW failed: {error}");
         }
-    }
-
-    /// Stop the ETW trace session and release the instance lock.
-    pub fn stop_session(instance_lock: isize) {
-        stop_trace();
-        release_instance_lock(instance_lock);
+        session.trace = Some(trace);
+        session.health.running();
+        let health = session.health.clone();
+        let stopping = session.stopping.clone();
+        // The context is owned solely by this worker after OpenTrace succeeds.
+        let context_address = ctx_ptr as usize;
+        session.worker = Some(tokio::task::spawn_blocking(move || {
+            let status = unsafe { ProcessTrace(&[trace], None, None) };
+            if !stopping.load(Ordering::Acquire) {
+                health.fail("etw_consumer_ended", Some(status.0));
+            }
+            unsafe {
+                drop(Box::from_raw(context_address as *mut CallbackContext));
+            }
+        }));
+        Ok(session)
     }
 
     // -----------------------------------------------------------------------
@@ -522,22 +589,22 @@ mod platform {
 
     unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         let rec = unsafe { &*record };
-        let ctx =
-            unsafe { &*(rec.UserContext as *const CallbackContext) };
+        let ctx = unsafe { &*(rec.UserContext as *const CallbackContext) };
 
-        if ctx.stop.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let pid = rec.EventHeader.ProcessId;
-        let provider = rec.EventHeader.ProviderId;
-        let event_id = rec.EventHeader.EventDescriptor.Id;
-
-        let provider_name = provider_display_name(&provider);
-
-        if let Some(event) =
-            unsafe { map_event(rec, provider_name, event_id, pid, &ctx.agent) }
-        {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            ctx.decoder
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .decode(rec, &ctx.agent)
+        }));
+        if let Ok(event) = result {
+            ctx.health.decoded(
+                matches!(event.data, EventData::NativeTelemetry { .. }),
+                event
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.issues.iter().any(|i| i.starts_with("tdh_"))),
+            );
             if let Err(_) = ctx.tx.try_send(event) {
                 let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() || n % 1000 == 0 {
@@ -547,992 +614,9 @@ mod platform {
                     );
                 }
             }
-        }
-    }
-
-    fn provider_display_name(guid: &GUID) -> &'static str {
-        match guid.data1 {
-            0x22FB2CD6 => "Microsoft-Windows-Kernel-Process",
-            0xEDD08927 => "Microsoft-Windows-Kernel-File",
-            0x7DD42A49 => "Microsoft-Windows-Kernel-Network",
-            0x70EB4F03 => "Microsoft-Windows-Kernel-Registry",
-            0x1C95126E => "Microsoft-Windows-DNS-Client",
-            0xA0C1853B => "Microsoft-Windows-PowerShell",
-            0x2A576B87 => "Microsoft-Antimalware-Scan-Interface",
-            0xF4E1897C => "Microsoft-Windows-Threat-Intelligence",
-            _ => "Unknown",
-        }
-    }
-
-    /// Map SE_SIGNING_TYPE to a human-readable signer name.
-    fn signature_type_name(sig_type: u8) -> String {
-        match sig_type {
-            0 => "None".into(),
-            1 => "Embedded".into(),
-            2 => "Cached".into(),
-            3 => "CatalogCached".into(),
-            4 => "CatalogNotCached".into(),
-            5 => "CatalogHint".into(),
-            6 => "PackageCatalog".into(),
-            _ => format!("Type{sig_type}"),
-        }
-    }
-
-    /// Map a raw ETW event into a `ThreatEvent`, parsing UserData payload.
-    ///
-    /// # Safety
-    /// `rec` must point to a valid EVENT_RECORD with valid UserData.
-    unsafe fn map_event(
-        rec: &EVENT_RECORD,
-        provider: &str,
-        event_id: u16,
-        pid: u32,
-        agent: &crate::events::AgentInfo,
-    ) -> Option<ThreatEvent> {
-        let data = unsafe { user_data_slice(rec) };
-        let ps = ptr_size(rec);
-
-        let (cat, sev, event_data) = match provider {
-            // -----------------------------------------------------------
-            // Kernel-Process
-            // -----------------------------------------------------------
-            "Microsoft-Windows-Kernel-Process" => match event_id {
-                1 => {
-                    // ProcessStart v2+: PID(u32), CreateTime(u64),
-                    //   ParentPID(u32), SessionID(u32), Flags(u32),
-                    //   ImageName(wstr), CommandLine(wstr)
-                    let (process_id, create_time, ppid, image, cmdline) = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            let process_id = r.read_u32()?;
-                            let create_time = r.read_u64()?;
-                            let ppid = r.read_u32()?;
-                            let _session_id = r.read_u32()?;
-                            let _flags = r.read_u32()?;
-                            let image = r.read_utf16_nul();
-                            let cmdline = r.read_utf16_nul();
-                            Some((process_id, Some(create_time), ppid, image, cmdline))
-                        })
-                        .unwrap_or((pid, None, 0, String::new(), String::new()));
-                    (
-                        EventCategory::Process,
-                        Severity::Info,
-                        EventData::ProcessCreate {
-                            pid: process_id,
-                            ppid,
-                            image_path: image,
-                            command_line: cmdline,
-                            user: String::new(),
-                            integrity_level: String::new(),
-                            hashes: None,
-                            create_time,
-                        },
-                    )
-                }
-                2 => {
-                    // ProcessStop: PID(u32), CreateTime(u64),
-                    //   ExitTime(u64), ExitCode(u32), ImageName(wstr)
-                    let (process_id, create_time, image) = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            let process_id = r.read_u32()?;
-                            let create_time = r.read_u64()?;
-                            let _exit_time = r.read_u64()?;
-                            let _exit_code = r.read_u32()?;
-                            let image = r.read_utf16_nul();
-                            Some((process_id, Some(create_time), image))
-                        })
-                        .unwrap_or((pid, None, String::new()));
-                    (
-                        EventCategory::Process,
-                        Severity::Info,
-                        EventData::ProcessTerminate {
-                            pid: process_id,
-                            image_path: image,
-                            create_time,
-                        },
-                    )
-                }
-                5 => {
-                    // ImageLoad: ProcessId(u32), ImageBase(ptr),
-                    //   ImageSize(ptr), ImageCheckSum(u32),
-                    //   TimeDateStamp(u32), DefaultBase(ptr),
-                    //   SignatureLevel(u8), SignatureType(u8),
-                    //   ...padding/flags..., FileName(wstr)
-                    let (process_id, sig_level, sig_type, file_name) = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            let process_id = r.read_u32()?;
-                            let _image_base = r.read_pointer()?;
-                            let _image_size = r.read_pointer()?;
-                            let _checksum = r.read_u32()?;
-                            let _timestamp = r.read_u32()?;
-                            let _default_base = r.read_pointer()?;
-                            let sig_level = r.read_u8()?;
-                            let sig_type = r.read_u8()?;
-                            r.skip(2); // padding/flags
-                            let file_name = r.read_utf16_nul();
-                            Some((process_id, sig_level, sig_type, file_name))
-                        })
-                        .unwrap_or((pid, 0, 0, String::new()));
-                    let image_name = file_name
-                        .rsplit('\\')
-                        .next()
-                        .unwrap_or(&file_name)
-                        .to_string();
-                    // SE_SIGNING_LEVEL: 0=Unchecked, 1=Unsigned,
-                    // 4+=Authenticode/Microsoft/Windows
-                    let signed = sig_level >= 4;
-                    let signature = if signed {
-                        Some(signature_type_name(sig_type))
-                    } else {
-                        None
-                    };
-                    (
-                        EventCategory::ImageLoad,
-                        Severity::Info,
-                        EventData::ImageLoad {
-                            pid: process_id,
-                            image_path: file_name,
-                            image_name,
-                            signed,
-                            signature,
-                            hashes: None,
-                        },
-                    )
-                }
-                _ => return None,
-            },
-
-            // -----------------------------------------------------------
-            // Kernel-File
-            // -----------------------------------------------------------
-            "Microsoft-Windows-Kernel-File" => match event_id {
-                10 => {
-                    // NameCreate: FileObject(ptr), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?;
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::Create,
-                        },
-                    )
-                }
-                11 => {
-                    // NameDelete: FileObject(ptr), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?;
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileDelete { pid, path },
-                    )
-                }
-                12 => {
-                    // Create: IrpPtr(ptr), FileObject(ptr), TTID(u32),
-                    //   CreateOptions(u32), CreateAttributes(u32),
-                    //   ShareAccess(u32), OpenPath(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?; // IrpPtr
-                            r.read_pointer()?; // FileObject
-                            r.read_u32()?; // TTID
-                            r.read_u32()?; // CreateOptions
-                            r.read_u32()?; // CreateAttributes
-                            r.read_u32()?; // ShareAccess
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::Create,
-                        },
-                    )
-                }
-                13 => {
-                    // SetInfo: IrpPtr(ptr), FileObject(ptr), TTID(u32),
-                    //   InfoClass(u32), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?; // IrpPtr
-                            r.read_pointer()?; // FileObject
-                            r.read_u32()?; // TTID
-                            r.read_u32()?; // InfoClass
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::SetInfo,
-                        },
-                    )
-                }
-                14 => {
-                    // Rename: IrpPtr(ptr), FileObject(ptr), TTID(u32),
-                    //   InfoClass(u32), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?; // IrpPtr
-                            r.read_pointer()?; // FileObject
-                            r.read_u32()?; // TTID
-                            r.read_u32()?; // InfoClass
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::Rename,
-                        },
-                    )
-                }
-                _ => return None,
-            },
-
-            // -----------------------------------------------------------
-            // Kernel-Network
-            // -----------------------------------------------------------
-            "Microsoft-Windows-Kernel-Network" => match event_id {
-                // TcpSendIPv4 (10) / TcpRecvIPv4 (12):
-                //   PID(u32), size(u32), daddr(4), saddr(4),
-                //   dport(u16 BE), sport(u16 BE), ...
-                10 | 12 => {
-                    let parsed = data.and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        let _pid = r.read_u32()?;
-                        let _size = r.read_u32()?;
-                        let daddr = r.read_ipv4()?;
-                        let saddr = r.read_ipv4()?;
-                        let dport = r.read_u16_be()?;
-                        let sport = r.read_u16_be()?;
-                        Some((saddr, sport, daddr, dport))
-                    });
-                    let (src_addr, src_port, dst_addr, dst_port) =
-                        parsed.unwrap_or_default();
-                    let direction = if event_id == 10 {
-                        NetworkDirection::Outbound
-                    } else {
-                        NetworkDirection::Inbound
-                    };
-                    (
-                        EventCategory::Network,
-                        Severity::Info,
-                        EventData::NetworkConnect {
-                            pid,
-                            image_path: String::new(),
-                            protocol: "TCP".into(),
-                            src_addr,
-                            src_port,
-                            dst_addr,
-                            dst_port,
-                            direction,
-                        },
-                    )
-                }
-                // TcpSendIPv6 (11) / TcpRecvIPv6 (13)
-                11 | 13 => {
-                    let parsed = data.and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        let _pid = r.read_u32()?;
-                        let _size = r.read_u32()?;
-                        let daddr = r.read_ipv6()?;
-                        let saddr = r.read_ipv6()?;
-                        let dport = r.read_u16_be()?;
-                        let sport = r.read_u16_be()?;
-                        Some((saddr, sport, daddr, dport))
-                    });
-                    let (src_addr, src_port, dst_addr, dst_port) =
-                        parsed.unwrap_or_default();
-                    let direction = if event_id == 11 {
-                        NetworkDirection::Outbound
-                    } else {
-                        NetworkDirection::Inbound
-                    };
-                    (
-                        EventCategory::Network,
-                        Severity::Info,
-                        EventData::NetworkConnect {
-                            pid,
-                            image_path: String::new(),
-                            protocol: "TCPv6".into(),
-                            src_addr,
-                            src_port,
-                            dst_addr,
-                            dst_port,
-                            direction,
-                        },
-                    )
-                }
-                // UdpSendIPv4 (15) / UdpRecvIPv4 (17)
-                15 | 17 => {
-                    let parsed = data.and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        let _pid = r.read_u32()?;
-                        let _size = r.read_u32()?;
-                        let daddr = r.read_ipv4()?;
-                        let saddr = r.read_ipv4()?;
-                        let dport = r.read_u16_be()?;
-                        let sport = r.read_u16_be()?;
-                        Some((saddr, sport, daddr, dport))
-                    });
-                    let (src_addr, src_port, dst_addr, dst_port) =
-                        parsed.unwrap_or_default();
-                    let direction = if event_id == 15 {
-                        NetworkDirection::Outbound
-                    } else {
-                        NetworkDirection::Inbound
-                    };
-                    (
-                        EventCategory::Network,
-                        Severity::Info,
-                        EventData::NetworkConnect {
-                            pid,
-                            image_path: String::new(),
-                            protocol: "UDP".into(),
-                            src_addr,
-                            src_port,
-                            dst_addr,
-                            dst_port,
-                            direction,
-                        },
-                    )
-                }
-                // UdpSendIPv6 (16) / UdpRecvIPv6 (18)
-                16 | 18 => {
-                    let parsed = data.and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        let _pid = r.read_u32()?;
-                        let _size = r.read_u32()?;
-                        let daddr = r.read_ipv6()?;
-                        let saddr = r.read_ipv6()?;
-                        let dport = r.read_u16_be()?;
-                        let sport = r.read_u16_be()?;
-                        Some((saddr, sport, daddr, dport))
-                    });
-                    let (src_addr, src_port, dst_addr, dst_port) =
-                        parsed.unwrap_or_default();
-                    let direction = if event_id == 16 {
-                        NetworkDirection::Outbound
-                    } else {
-                        NetworkDirection::Inbound
-                    };
-                    (
-                        EventCategory::Network,
-                        Severity::Info,
-                        EventData::NetworkConnect {
-                            pid,
-                            image_path: String::new(),
-                            protocol: "UDPv6".into(),
-                            src_addr,
-                            src_port,
-                            dst_addr,
-                            dst_port,
-                            direction,
-                        },
-                    )
-                }
-                _ => return None,
-            },
-
-            // -----------------------------------------------------------
-            // Kernel-Registry
-            // -----------------------------------------------------------
-            "Microsoft-Windows-Kernel-Registry" => {
-                let operation = match event_id {
-                    1 => RegistryOperation::CreateKey,
-                    2 => RegistryOperation::CreateKey, // OpenKey
-                    3 => RegistryOperation::DeleteKey,
-                    4 => RegistryOperation::RenameKey,
-                    5 => RegistryOperation::SetValue,
-                    6 => RegistryOperation::DeleteValue,
-                    _ => return None,
-                };
-
-                let (key, value_name, value_data) = data
-                    .and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        match event_id {
-                            1 | 2 => {
-                                // CreateKey/OpenKey: BaseObject(ptr),
-                                //   KeyObject(ptr), Status(u32),
-                                //   [Disposition(u32) for event 1],
-                                //   BaseName(wstr), RelativeName(wstr)
-                                r.read_pointer()?;
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                if event_id == 1 {
-                                    r.read_u32()?;
-                                }
-                                let base = r.read_utf16_nul();
-                                let rel = r.read_utf16_nul();
-                                let key = if base.is_empty() {
-                                    rel
-                                } else if rel.is_empty() {
-                                    base
-                                } else {
-                                    format!("{base}\\{rel}")
-                                };
-                                Some((key, None, None))
-                            }
-                            3 => {
-                                // DeleteKey: KeyObject(ptr), Status(u32),
-                                //   KeyName(wstr)
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                Some((r.read_utf16_nul(), None, None))
-                            }
-                            4 => {
-                                // RenameKey: KeyObject(ptr), Status(u32),
-                                //   OldKeyName(wstr), NewKeyName(wstr)
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                let old_name = r.read_utf16_nul();
-                                let new_name = r.read_utf16_nul();
-                                Some((old_name, Some(new_name), None))
-                            }
-                            5 => {
-                                // SetValueKey: KeyObject(ptr), Status(u32),
-                                //   Type(u32), DataSize(u32),
-                                //   KeyName(wstr), ValueName(wstr),
-                                //   CapturedDataSize(u16), CapturedData(bytes)
-                                r.read_pointer()?;
-                                r.read_u32()?; // Status
-                                let reg_type = r.read_u32()?;
-                                let _data_size = r.read_u32()?;
-                                let key = r.read_utf16_nul();
-                                let vn = r.read_utf16_nul();
-                                // Try to capture REG_SZ (1) / REG_EXPAND_SZ (2)
-                                // value data from CapturedData if present
-                                let vd = if matches!(reg_type, 1 | 2) {
-                                    if let Some(cap_size) = r.read_u16() {
-                                        let cap = cap_size as usize;
-                                        if cap > 0 && r.remaining() >= cap {
-                                            Some(r.read_utf16_bytes(cap))
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-                                Some((key, Some(vn), vd))
-                            }
-                            6 => {
-                                // DeleteValueKey: KeyObject(ptr),
-                                //   Status(u32), KeyName(wstr),
-                                //   ValueName(wstr)
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                let key = r.read_utf16_nul();
-                                let vn = r.read_utf16_nul();
-                                Some((key, Some(vn), None))
-                            }
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or_default();
-
-                (
-                    EventCategory::Registry,
-                    Severity::Info,
-                    EventData::RegistryEvent {
-                        pid,
-                        operation,
-                        key,
-                        value_name,
-                        value_data,
-                    },
-                )
-            }
-
-            // -----------------------------------------------------------
-            // DNS-Client
-            // -----------------------------------------------------------
-            "Microsoft-Windows-DNS-Client" => match event_id {
-                3006 => {
-                    // QueryInitiated: QueryName(wstr), QueryType(u16)
-                    let (query_name, query_type) = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            let name = r.read_utf16_nul();
-                            let qtype = r.read_u16()?;
-                            Some((name, qtype))
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::Dns,
-                        Severity::Info,
-                        EventData::DnsQuery {
-                            pid,
-                            query_name,
-                            query_type: dns_query_type_name(query_type),
-                            response: None,
-                        },
-                    )
-                }
-                3008 => {
-                    // QueryCompleted: QueryName(wstr), QueryType(u16),
-                    //   QueryOptions(u32), QueryStatus(u32),
-                    //   QueryResults(wstr)
-                    let (query_name, query_type, response) = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            let name = r.read_utf16_nul();
-                            let qtype = r.read_u16()?;
-                            let _options = r.read_u32()?;
-                            let status = r.read_u32()?;
-                            let resp = if status == 0 && r.remaining() > 0 {
-                                let s = r.read_utf16_nul();
-                                if s.is_empty() { None } else { Some(s) }
-                            } else {
-                                None
-                            };
-                            Some((name, qtype, resp))
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::Dns,
-                        Severity::Info,
-                        EventData::DnsQuery {
-                            pid,
-                            query_name,
-                            query_type: dns_query_type_name(query_type),
-                            response,
-                        },
-                    )
-                }
-                _ => return None,
-            },
-
-            // -----------------------------------------------------------
-            // PowerShell ScriptBlockLogging
-            // -----------------------------------------------------------
-            "Microsoft-Windows-PowerShell" => match event_id {
-                4104 => {
-                    // MessageNumber(i32), MessageTotal(i32),
-                    // ScriptBlockText(wstr), ScriptBlockId(wstr),
-                    // Path(wstr)
-                    let parsed = data.and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        r.read_u32()?; // MessageNumber
-                        r.read_u32()?; // MessageTotal
-                        let content = r.read_utf16_nul();
-                        let script_block_id = {
-                            let s = r.read_utf16_nul();
-                            if s.is_empty() { None } else { Some(s) }
-                        };
-                        let script_path = {
-                            let s = r.read_utf16_nul();
-                            if s.is_empty() { None } else { Some(s) }
-                        };
-                        Some((content, script_block_id, script_path))
-                    });
-                    let (content, script_block_id, script_path) =
-                        parsed.unwrap_or_default();
-                    (
-                        EventCategory::Script,
-                        Severity::Medium,
-                        EventData::ScriptBlock {
-                            pid,
-                            script_engine: "PowerShell".into(),
-                            content,
-                            script_path,
-                            script_block_id,
-                        },
-                    )
-                }
-                _ => return None,
-            },
-
-            // -----------------------------------------------------------
-            // AMSI
-            // -----------------------------------------------------------
-            "Microsoft-Antimalware-Scan-Interface" => match event_id {
-                1101 => {
-                    // session(ptr), scanStatus(u32), appname(wstr),
-                    // contentname(wstr), contentsize(u32), ...
-                    let parsed = data.and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        r.read_pointer()?; // session
-                        let scan_result = r.read_u32()?;
-                        let app_name = r.read_utf16_nul();
-                        let content_name = r.read_utf16_nul();
-                        let content_size = r.read_u32().unwrap_or(0);
-                        Some((app_name, content_name, content_size, scan_result))
-                    });
-                    let (app_name, content_name, content_size, scan_result) =
-                        parsed.unwrap_or_default();
-                    let severity = if scan_result >= 32768 {
-                        Severity::High
-                    } else {
-                        Severity::Info
-                    };
-                    let scan_result_name =
-                        crate::events::amsi_result_name(scan_result).to_string();
-                    (
-                        EventCategory::Script,
-                        severity,
-                        EventData::AmsiScan {
-                            pid,
-                            app_name,
-                            content_name,
-                            content_size,
-                            scan_result,
-                            scan_result_name,
-                        },
-                    )
-                }
-                _ => return None,
-            },
-
-            // -----------------------------------------------------------
-            // Threat Intelligence
-            //
-            // UserData layout (community-documented, best-effort):
-            //   Common header (all TI events):
-            //     CallingProcessId(u32), CallingProcessCreateTime(u64),
-            //     CallingProcessStartKey(u64),
-            //     CallingProcessSignatureLevel(u8),
-            //     CallingProcessSectionSignatureLevel(u8),
-            //     CallingProcessProtection(u8),
-            //     CallingThreadId(u32),
-            //     CallingThreadCreateTime(u64)
-            //   Remote events (IDs 1-5) add target process header:
-            //     TargetProcessId(u32), TargetProcessCreateTime(u64),
-            //     TargetProcessStartKey(u64),
-            //     TargetProcessSignatureLevel(u8),
-            //     TargetProcessSectionSignatureLevel(u8),
-            //     TargetProcessProtection(u8)
-            //   Then event-specific fields (BaseAddress, RegionSize, etc.)
-            // -----------------------------------------------------------
-            "Microsoft-Windows-Threat-Intelligence" => {
-                return Some(map_ti_event(data, event_id, pid, agent, ps));
-            }
-
-            _ => return None,
-        };
-
-        Some(ThreatEvent::new(
-            agent,
-            EventSource::Etw {
-                provider: provider.to_string(),
-            },
-            cat,
-            sev,
-            event_data,
-        ))
-    }
-
-    /// Parse a Threat Intelligence ETW event with per-event-ID handling.
-    ///
-    /// The TI provider requires PPL or elevated privileges to receive events.
-    /// Field layouts are based on community research and may vary across
-    /// Windows versions; parsing is best-effort with graceful fallback.
-    fn map_ti_event(
-        data: Option<&[u8]>,
-        event_id: u16,
-        pid: u32,
-        agent: &crate::events::AgentInfo,
-        ps: usize,
-    ) -> ThreatEvent {
-        // Try to parse the common TI header present in all events.
-        // CallingProcessId is win:Pointer (ptr-sized), not u32.
-        let header = data.and_then(|d| {
-            let mut r = UserDataReader::new(d, ps);
-            let calling_pid = r.read_pointer()? as u32;
-            let _calling_create_time = r.read_u64()?;
-            let _calling_start_key = r.read_u64()?;
-            let _calling_sig_level = r.read_u8()?;
-            let _calling_sec_sig_level = r.read_u8()?;
-            let _calling_protection = r.read_u8()?;
-            let calling_tid = r.read_u32()?;
-            let _calling_thread_create_time = r.read_u64()?;
-            Some((calling_pid, calling_tid, r.position()))
-        });
-        let (calling_pid, _calling_tid, header_end) =
-            header.unwrap_or((pid, 0, 0));
-
-        // For remote operations (IDs 1-5, 9-10), parse the target process
-        // fields. TargetProcessId is also win:Pointer.
-        let target = if matches!(event_id, 1..=5 | 9..=10) {
-            data.and_then(|d| {
-                if header_end >= d.len() {
-                    return None;
-                }
-                let mut r = UserDataReader::new(&d[header_end..], ps);
-                let target_pid = r.read_pointer()? as u32;
-                let _target_create_time = r.read_u64()?;
-                let _target_start_key = r.read_u64()?;
-                let _target_sig_level = r.read_u8()?;
-                let _target_sec_sig_level = r.read_u8()?;
-                let _target_protection = r.read_u8()?;
-                Some((target_pid, header_end + r.position()))
-            })
         } else {
-            None
-        };
-        let (target_pid, post_target) = target.unwrap_or((0, header_end));
-
-        // Parse event-specific fields (address, size, protection).
-        let specifics = data.and_then(|d| {
-            if post_target >= d.len() {
-                return None;
-            }
-            let mut r = UserDataReader::new(&d[post_target..], ps);
-            match event_id {
-                // ALLOCVM_REMOTE / ALLOCVM_LOCAL
-                1 | 6 => {
-                    let base = r.read_pointer()?;
-                    let size = r.read_pointer()?;
-                    let _alloc_type = r.read_u32()?;
-                    let protection = r.read_u32()?;
-                    Some((base, size, protection))
-                }
-                // PROTECTVM_REMOTE / PROTECTVM_LOCAL
-                2 | 7 => {
-                    let base = r.read_pointer()?;
-                    let size = r.read_pointer()?;
-                    let protection = r.read_u32()?;
-                    let _old_protection = r.read_u32()?;
-                    Some((base, size, protection))
-                }
-                // MAPVIEW_REMOTE / MAPVIEW_LOCAL
-                3 | 8 => {
-                    let base = r.read_pointer()?;
-                    let size = r.read_pointer()?;
-                    let _alloc_type = r.read_u32()?;
-                    let protection = r.read_u32()?;
-                    Some((base, size, protection))
-                }
-                // QUEUEAPC_REMOTE
-                4 => {
-                    let _target_tid = r.read_u32()?;
-                    let apc_routine = r.read_pointer()?;
-                    Some((apc_routine, 0, 0))
-                }
-                // SETTHREADCONTEXT_REMOTE
-                5 => {
-                    let _target_tid = r.read_u32()?;
-                    let context_flags = r.read_u32()?;
-                    Some((0, 0, context_flags))
-                }
-                // SUSPEND_THREAD_REMOTE / RESUME_THREAD_REMOTE
-                // Target thread ID only
-                9 | 10 => {
-                    let target_tid = r.read_u32()?;
-                    Some((target_tid as u64, 0, 0))
-                }
-                _ => None,
-            }
-        });
-
-        let (rule_id, name, description, technique_id, technique_name) = match event_id {
-            1 => (
-                "TF-TI-001",
-                "Remote Virtual Memory Allocation",
-                "A process allocated virtual memory in another process \
-                 (NtAllocateVirtualMemory). This is a common step in \
-                 process injection techniques.",
-                "T1055",
-                "Process Injection",
-            ),
-            2 => (
-                "TF-TI-002",
-                "Remote Memory Protection Change",
-                "A process changed memory protection in another process \
-                 (NtProtectVirtualMemory). Often used to make injected \
-                 code executable.",
-                "T1055",
-                "Process Injection",
-            ),
-            3 => (
-                "TF-TI-003",
-                "Remote Section Mapping",
-                "A process mapped a section into another process \
-                 (NtMapViewOfSection). Used in section-based injection \
-                 and process hollowing.",
-                "T1055",
-                "Process Injection",
-            ),
-            4 => (
-                "TF-TI-004",
-                "Remote APC Queue",
-                "A process queued an APC to a thread in another process \
-                 (NtQueueApcThread). This is the APC injection technique.",
-                "T1055.004",
-                "Process Injection: Asynchronous Procedure Call",
-            ),
-            5 => (
-                "TF-TI-005",
-                "Remote Thread Context Modification",
-                "A process modified the thread context of another process \
-                 (NtSetContextThread). Used in thread execution hijacking.",
-                "T1055.003",
-                "Process Injection: Thread Execution Hijacking",
-            ),
-            6 => (
-                "TF-TI-006",
-                "Local Virtual Memory Allocation (TI)",
-                "TI provider flagged a local executable memory allocation. \
-                 Common in legitimate JIT compilers and loaders; suspicious \
-                 when combined with other injection indicators.",
-                "T1055",
-                "Process Injection",
-            ),
-            7 => (
-                "TF-TI-007",
-                "Local Memory Protection Change (TI)",
-                "TI provider flagged a local memory protection change to \
-                 executable. Common in code unpacking, JIT, and .NET; \
-                 suspicious when the process is not a known runtime.",
-                "T1027.002",
-                "Obfuscated Files or Information: Software Packing",
-            ),
-            8 => (
-                "TF-TI-008",
-                "Local Section Mapping (TI)",
-                "TI provider flagged a local executable section mapping. \
-                 Common in normal DLL loading; suspicious when the mapped \
-                 section is not backed by a known image.",
-                "T1055",
-                "Process Injection",
-            ),
-            9 => (
-                "TF-TI-009",
-                "Remote Thread Suspension",
-                "A process suspended a thread in another process \
-                 (NtSuspendThread). Used in process injection to \
-                 freeze a target before modifying its state.",
-                "T1055",
-                "Process Injection",
-            ),
-            10 => (
-                "TF-TI-010",
-                "Remote Thread Resume",
-                "A process resumed a thread in another process \
-                 (NtResumeThread). Often follows injection setup \
-                 to trigger execution of injected code.",
-                "T1055",
-                "Process Injection",
-            ),
-            _ => (
-                "TF-TI-000",
-                "Threat Intelligence ETW Event",
-                "Windows Threat Intelligence ETW provider emitted an \
-                 unrecognized event type.",
-                "N/A",
-                "Unknown",
-            ),
-        };
-
-        let mut evidence = vec![
-            format!("TI event ID: {event_id}"),
-            format!("Calling PID: {calling_pid}"),
-        ];
-        if matches!(event_id, 1..=5 | 9..=10) && target_pid > 0 {
-            evidence.push(format!("Target PID: {target_pid}"));
-        }
-        if let Some((base, size, protection)) = specifics {
-            match event_id {
-                4 => {
-                    // QUEUEAPC: base=ApcRoutine, size/protection unused
-                    evidence.push(format!("ApcRoutine: 0x{base:X}"));
-                }
-                5 => {
-                    // SETCONTEXT: protection=ContextFlags, base/size unused
-                    evidence.push(format!("ContextFlags: 0x{protection:08X}"));
-                }
-                9 | 10 => {
-                    // SUSPEND/RESUME: base=TargetThreadId
-                    evidence.push(format!("Target TID: {base}"));
-                }
-                _ => {
-                    evidence.push(format!("BaseAddress: 0x{base:X}"));
-                    evidence.push(format!("RegionSize: 0x{size:X}"));
-                    evidence.push(format!("Protection: 0x{protection:08X}"));
-                }
-            }
-        }
-
-        let details = if matches!(event_id, 1..=5 | 9..=10) && target_pid > 0 {
-            format!("{name}: PID {calling_pid} → PID {target_pid}")
-        } else {
-            format!("{name}: PID {calling_pid}")
-        };
-
-        let source = EventSource::Etw {
-            provider: "Microsoft-Windows-Threat-Intelligence".into(),
-        };
-        let event_data = EventData::EvasionDetected {
-            technique: EvasionTechnique::Unknown,
-            pid: Some(calling_pid),
-            process_name: None,
-            details,
-        };
-
-        // Local operations (IDs 6-8) are telemetry: the TI provider flagged
-        // them, but they are common in JIT, .NET, and DLL loaders, so we
-        // emit them without rule metadata for contextual analysis.
-        // Remote operations (IDs 1-5, 9-10) are detections: cross-process
-        // memory manipulation is inherently suspicious.
-        if matches!(event_id, 6..=8) {
-            ThreatEvent::new(
-                agent,
-                source,
-                EventCategory::Evasion,
-                Severity::Medium,
-                event_data,
-            )
-        } else {
-            ThreatEvent::with_rule(
-                agent,
-                source,
-                EventCategory::Evasion,
-                Severity::High,
-                event_data,
-                RuleMetadata {
-                    id: rule_id.into(),
-                    name: name.into(),
-                    description: description.into(),
-                    mitre: MitreRef {
-                        tactic: "Defense Evasion".into(),
-                        technique_id: technique_id.into(),
-                        technique_name: technique_name.into(),
-                    },
-                    confidence: Confidence::Medium,
-                    evidence,
-                },
-            )
+            ctx.health.fail("etw_decoder_panic", None);
+            ctx.health.lost_before_queue();
         }
     }
 }
@@ -1550,17 +634,34 @@ impl Collector for EtwCollector {
         self.config.enabled
     }
 
+    fn supported(&self) -> bool {
+        cfg!(target_os = "windows")
+    }
+
+    fn status(&self) -> Option<CollectorStatus> {
+        #[cfg(target_os = "windows")]
+        if let Some(session) = &self.session {
+            session.refresh_statistics();
+        }
+        Some(self.health.snapshot(self.dropped_events()))
+    }
+
     async fn start(&mut self, _tx: mpsc::Sender<ThreatEvent>) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            let (flag, lock) = platform::start_session(
+            if self.session.is_some() {
+                anyhow::bail!("ETW collector already started");
+            }
+            self.dropped.store(0, Ordering::Relaxed);
+            self.health.starting();
+            let session = platform::start_session(
                 &self.config.providers,
                 self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
+                self.health.clone(),
             )?;
-            self.stop_flag = Some(flag);
-            self.instance_lock = Some(lock);
+            self.session = Some(session);
             info!(
                 "ETW collector started with {} providers",
                 self.config.providers.len()
@@ -1575,14 +676,8 @@ impl Collector for EtwCollector {
 
     async fn stop(&mut self) -> Result<()> {
         #[cfg(target_os = "windows")]
-        {
-            // Signal background thread to stop processing events
-            if let Some(flag) = self.stop_flag.take() {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            // Stop the ETW session and release the instance lock
-            let lock = self.instance_lock.take().unwrap_or(0);
-            platform::stop_session(lock);
+        if let Some(mut session) = self.session.take() {
+            session.stop().await?;
         }
 
         info!("ETW collector stopped");
@@ -1600,10 +695,7 @@ mod tests {
 
     // --- Helper: encode a UTF-16LE null-terminated string into bytes ----------
     fn utf16_nul(s: &str) -> Vec<u8> {
-        let mut buf: Vec<u8> = s
-            .encode_utf16()
-            .flat_map(|c| c.to_le_bytes())
-            .collect();
+        let mut buf: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
         buf.extend_from_slice(&[0, 0]); // null terminator
         buf
     }
@@ -1720,10 +812,10 @@ mod tests {
         //   Flags(u32), ImageName(wstr), CommandLine(wstr)
         let mut data = Vec::new();
         data.extend_from_slice(&1234u32.to_le_bytes()); // PID
-        data.extend_from_slice(&0u64.to_le_bytes());    // CreateTime
+        data.extend_from_slice(&0u64.to_le_bytes()); // CreateTime
         data.extend_from_slice(&4321u32.to_le_bytes()); // PPID
-        data.extend_from_slice(&1u32.to_le_bytes());    // SessionID
-        data.extend_from_slice(&0u32.to_le_bytes());    // Flags
+        data.extend_from_slice(&1u32.to_le_bytes()); // SessionID
+        data.extend_from_slice(&0u32.to_le_bytes()); // Flags
         data.extend_from_slice(&utf16_nul(r"C:\Windows\System32\cmd.exe"));
         data.extend_from_slice(&utf16_nul("cmd.exe /c whoami"));
 
@@ -1750,11 +842,11 @@ mod tests {
         //   PID(u32), Size(u32), DstAddr(4), SrcAddr(4),
         //   DstPort(u16 BE), SrcPort(u16 BE)
         let mut data = Vec::new();
-        data.extend_from_slice(&100u32.to_le_bytes());  // PID
-        data.extend_from_slice(&512u32.to_le_bytes());  // Size
-        data.extend_from_slice(&[93, 184, 216, 34]);    // DstAddr: 93.184.216.34
-        data.extend_from_slice(&[192, 168, 1, 10]);     // SrcAddr: 192.168.1.10
-        data.extend_from_slice(&443u16.to_be_bytes());  // DstPort (BE)
+        data.extend_from_slice(&100u32.to_le_bytes()); // PID
+        data.extend_from_slice(&512u32.to_le_bytes()); // Size
+        data.extend_from_slice(&[93, 184, 216, 34]); // DstAddr: 93.184.216.34
+        data.extend_from_slice(&[192, 168, 1, 10]); // SrcAddr: 192.168.1.10
+        data.extend_from_slice(&443u16.to_be_bytes()); // DstPort (BE)
         data.extend_from_slice(&50000u16.to_be_bytes()); // SrcPort (BE)
 
         let mut r = UserDataReader::new(&data, 8);
@@ -1797,9 +889,9 @@ mod tests {
         //   KeyName(wstr), ValueName(wstr)
         let mut data = Vec::new();
         data.extend_from_slice(&0x1234_5678_9ABCu64.to_le_bytes()); // KeyObject (64-bit ptr)
-        data.extend_from_slice(&0u32.to_le_bytes());                // Status
-        data.extend_from_slice(&1u32.to_le_bytes());                // Type (REG_SZ)
-        data.extend_from_slice(&64u32.to_le_bytes());               // DataSize
+        data.extend_from_slice(&0u32.to_le_bytes()); // Status
+        data.extend_from_slice(&1u32.to_le_bytes()); // Type (REG_SZ)
+        data.extend_from_slice(&64u32.to_le_bytes()); // DataSize
         data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\Test"));
         data.extend_from_slice(&utf16_nul("MyValue"));
 
@@ -1852,7 +944,9 @@ mod tests {
         data.push(6); // SignatureLevel
         data.push(2); // SignatureType
         data.extend_from_slice(&[0, 0]); // padding
-        data.extend_from_slice(&utf16_nul(r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"));
+        data.extend_from_slice(&utf16_nul(
+            r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll",
+        ));
 
         let mut r = UserDataReader::new(&data, 8);
         let process_id = r.read_u32().unwrap();
@@ -1954,10 +1048,10 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&300u32.to_le_bytes()); // PID
         data.extend_from_slice(&128u32.to_le_bytes()); // Size
-        // DstAddr: 2001:4860:4860::8888
+                                                       // DstAddr: 2001:4860:4860::8888
         let dst_v6: [u8; 16] = [
-            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x88, 0x88,
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x88, 0x88,
         ];
         data.extend_from_slice(&dst_v6);
         // SrcAddr: ::1
@@ -1989,7 +1083,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&400u32.to_le_bytes()); // PID
         data.extend_from_slice(&1024u32.to_le_bytes()); // Size
-        // DstAddr: fe80::1
+                                                        // DstAddr: fe80::1
         let mut dst_v6 = [0u8; 16];
         dst_v6[0] = 0xfe;
         dst_v6[1] = 0x80;
@@ -2589,7 +1683,11 @@ mod tests {
         let status = r.read_u32().unwrap();
         let response = if status == 0 && r.remaining() > 0 {
             let s = r.read_utf16_nul();
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         } else {
             None
         };
@@ -2615,7 +1713,11 @@ mod tests {
         let status = r.read_u32().unwrap();
         let response = if status == 0 && r.remaining() > 0 {
             let s = r.read_utf16_nul();
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         } else {
             None
         };
@@ -2936,7 +2038,7 @@ mod tests {
         data.extend_from_slice(&0xF000u64.to_le_bytes()); // BaseObject
         data.extend_from_slice(&0xF001u64.to_le_bytes()); // KeyObject
         data.extend_from_slice(&0u32.to_le_bytes()); // Status
-        // No Disposition for OpenKey (ID 2) — unlike CreateKey (ID 1)
+                                                     // No Disposition for OpenKey (ID 2) — unlike CreateKey (ID 1)
         data.extend_from_slice(&utf16_nul(r"\REGISTRY\MACHINE\SYSTEM"));
         data.extend_from_slice(&utf16_nul(r"CurrentControlSet\Services\LanmanServer"));
 
@@ -2996,7 +2098,10 @@ mod tests {
         assert_eq!(reg_type, 4);
         assert_eq!(key, r"HKLM\SOFTWARE\App");
         assert_eq!(value_name, "EnableFeature");
-        assert!(vd.is_none(), "REG_DWORD should not produce string value_data");
+        assert!(
+            vd.is_none(),
+            "REG_DWORD should not produce string value_data"
+        );
     }
 
     // --- Registry SetValue with empty CapturedData ---------------------------
@@ -3085,7 +2190,11 @@ mod tests {
         let status = r.read_u32().unwrap();
         let resp = if status == 0 && r.remaining() > 0 {
             let s = r.read_utf16_nul();
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         } else {
             None
         };
@@ -3104,9 +2213,7 @@ mod tests {
         data.extend_from_slice(&1u16.to_le_bytes()); // A
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&utf16_nul(
-            "10.0.0.1;10.0.0.2;10.0.0.3;10.0.0.4",
-        ));
+        data.extend_from_slice(&utf16_nul("10.0.0.1;10.0.0.2;10.0.0.3;10.0.0.4"));
 
         let mut r = UserDataReader::new(&data, 8);
         let _name = r.read_utf16_nul();
@@ -3115,7 +2222,11 @@ mod tests {
         let status = r.read_u32().unwrap();
         let resp = if status == 0 && r.remaining() > 0 {
             let s = r.read_utf16_nul();
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         } else {
             None
         };
@@ -3145,7 +2256,11 @@ mod tests {
         let status = r.read_u32().unwrap();
         let resp = if status == 0 && r.remaining() > 0 {
             let s = r.read_utf16_nul();
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         } else {
             None
         };
@@ -3444,5 +2559,80 @@ mod tests {
         assert_eq!(src, "127.0.0.1");
         assert_eq!(dp, 65535);
         assert_eq!(sp, 65535);
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+    use crate::events::{CollectorState, EventData};
+
+    /// Run alone in an elevated, disposable Windows VM. Only a benign process
+    /// is started; this is a real ETW integration check, not a detection test.
+    #[tokio::test]
+    #[ignore = "requires an elevated isolated Windows VM; see docs/SENSOR_HEALTH.md"]
+    async fn windows_etw_process_smoke() {
+        let mut config = EtwConfig::default();
+        config
+            .providers
+            .retain(|p| p.name == "Microsoft-Windows-Kernel-Process");
+        assert_eq!(config.providers.len(), 1);
+        let agent = AgentInfo {
+            hostname: "ETW-TEST".into(),
+            agent_id: uuid::Uuid::new_v4(),
+        };
+        let mut collector = EtwCollector::new(config.clone(), agent.clone());
+        let (tx, mut rx) = mpsc::channel(10_000);
+        collector.start(tx.clone()).await.unwrap();
+        let mut second = EtwCollector::new(config, agent);
+        assert!(second.start(tx).await.is_err());
+        // Stopping a failed second instance must not stop the active session.
+        second.stop().await.unwrap();
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        child.wait().unwrap();
+        let observation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(event.data, EventData::ProcessCreate { pid, .. } if pid == child_pid) {
+                    return Some(event);
+                }
+            }
+            None
+        })
+        .await;
+        let live = collector.status().unwrap();
+        collector.stop().await.unwrap();
+        let final_status = collector.status().unwrap();
+        let event = observation
+            .ok()
+            .flatten()
+            .expect("expected the benign child process in real ETW telemetry");
+        let origin = event
+            .provenance
+            .as_ref()
+            .expect("missing native provenance");
+        assert!(origin.original_time);
+        assert!(origin.issues.is_empty(), "{:?}", origin.issues);
+        assert_eq!(origin.provider_guid, super::super::etw_normalize::PROCESS);
+        assert_eq!(origin.event_id, 1);
+        assert!(!origin.fields.is_empty());
+        assert!(
+            (event.observed_at.unwrap() - event.timestamp)
+                .num_seconds()
+                .abs()
+                < 30
+        );
+        assert!(
+            matches!(event.data,EventData::ProcessCreate {image_path,create_time:Some(_),..}
+            if image_path.to_ascii_lowercase().ends_with("cmd.exe"))
+        );
+        assert!(live.etw.is_some());
+        assert!(live.statistics_error.is_none());
+        assert!(live.providers.iter().all(|p| p.enabled));
+        assert_eq!(final_status.state, CollectorState::Stopped);
+        assert!(final_status.etw.is_some());
     }
 }

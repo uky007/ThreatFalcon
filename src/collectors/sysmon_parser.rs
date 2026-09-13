@@ -57,95 +57,166 @@ impl SysmonParsedEvent {
             .map(|s| s.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
+
+    pub fn optional_bool(&self, key: &str) -> Option<bool> {
+        match self.get(key)?.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // XML parsing
 // ---------------------------------------------------------------------------
 
-/// Parse Sysmon XML (rendered by EvtRender) into a structured event.
+/// Parse one rendered Event using XML syntax, not substring matching. No DTD,
+/// external entities, duplicate fields, or unbounded nesting are accepted.
 pub fn parse_sysmon_xml(xml: &str) -> Option<SysmonParsedEvent> {
-    let event_id = extract_event_id(xml)?;
-    let fields = extract_event_data_fields(xml);
-    Some(SysmonParsedEvent { event_id, fields })
-}
-
-fn extract_event_id(xml: &str) -> Option<u16> {
-    let tag = "<EventID>";
-    let close = "</EventID>";
-    let start = xml.find(tag)? + tag.len();
-    let end = xml[start..].find(close)?;
-    xml[start..start + end].trim().parse().ok()
-}
-
-/// Extract all `<Data Name="key">value</Data>` elements within `<EventData>`.
-fn extract_event_data_fields(xml: &str) -> HashMap<String, String> {
+    use quick_xml::events::Event;
+    if xml.len() > 1024 * 1024 {
+        return None;
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().expand_empty_elements = true;
+    let mut stack: Vec<String> = Vec::new();
+    let mut active: Option<String> = None;
+    let mut value = String::new();
     let mut fields = HashMap::new();
-
-    let section_start = match xml.find("<EventData>") {
-        Some(pos) => pos,
-        None => return fields,
-    };
-    let section = match xml[section_start..].find("</EventData>") {
-        Some(end) => &xml[section_start..section_start + end],
-        None => return fields,
-    };
-
-    let name_marker = "Name=\"";
-    let mut pos = 0;
-
-    while let Some(rel) = section[pos..].find(name_marker) {
-        let name_start = pos + rel + name_marker.len();
-
-        // Extract field name up to closing quote
-        let name_end = match section[name_start..].find('"') {
-            Some(e) => name_start + e,
-            None => break,
-        };
-        let name = &section[name_start..name_end];
-
-        // Find the '>' that closes this <Data> opening tag
-        let after_attr = name_end + 1;
-        let gt_pos = match section[after_attr..].find('>') {
-            Some(e) => after_attr + e,
-            None => break,
-        };
-
-        // Self-closing tag: <Data Name="X"/> — skip
-        let between = &section[after_attr..gt_pos];
-        if between.trim_end().ends_with('/') {
-            pos = gt_pos + 1;
-            continue;
+    let mut seen_fields = std::collections::HashSet::new();
+    let mut event_id = None;
+    let mut roots = 0;
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(tag) => {
+                let name = std::str::from_utf8(tag.local_name().as_ref())
+                    .ok()?
+                    .to_string();
+                if stack.is_empty() {
+                    if name != "Event" {
+                        return None;
+                    }
+                    roots += 1;
+                    if roots > 1 {
+                        return None;
+                    }
+                }
+                if active.is_some() || stack.len() >= 16 {
+                    return None;
+                }
+                let attrs: HashMap<String, String> = tag
+                    .attributes()
+                    .map(|a| {
+                        let a = a.ok()?;
+                        Some((
+                            std::str::from_utf8(a.key.as_ref()).ok()?.to_string(),
+                            a.unescape_value().ok()?.into_owned(),
+                        ))
+                    })
+                    .collect::<Option<_>>()?;
+                let parent = stack.last().map(String::as_str);
+                if parent == Some("System") {
+                    match name.as_str() {
+                        "TimeCreated" => {
+                            if let Some(time) = attrs.get("SystemTime") {
+                                fields.insert("System.TimeCreated".into(), time.clone());
+                            }
+                        }
+                        "Provider" => {
+                            for (k, v) in &attrs {
+                                fields.insert(format!("System.Provider.{k}"), v.clone());
+                            }
+                        }
+                        "EventID" | "EventRecordID" | "Version" | "Computer" => {
+                            active = Some(format!("System.{name}"));
+                            value.clear();
+                        }
+                        _ => {}
+                    }
+                } else if parent == Some("EventData") && name == "Data" {
+                    let key = attrs.get("Name")?.clone();
+                    if key.starts_with("System.") {
+                        return None;
+                    }
+                    active = Some(key);
+                    value.clear();
+                }
+                stack.push(name);
+            }
+            Event::Text(text) => {
+                if active.is_some() {
+                    value.push_str(&text.xml_content().ok()?);
+                } else if !text.iter().all(|b| b.is_ascii_whitespace()) && stack.is_empty() {
+                    return None;
+                }
+            }
+            Event::CData(text) => {
+                if active.is_some() {
+                    value.push_str(&text.decode().ok()?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                let ch = if let Some(ch) = reference.resolve_char_ref().ok()? {
+                    ch
+                } else {
+                    match reference.decode().ok()?.as_ref() {
+                        "amp" => '&',
+                        "lt" => '<',
+                        "gt" => '>',
+                        "quot" => '"',
+                        "apos" => '\'',
+                        _ => return None,
+                    }
+                };
+                if active.is_some() {
+                    value.push(ch);
+                }
+            }
+            Event::End(_) => {
+                if let Some(key) = active.take() {
+                    if !seen_fields.insert(key.clone()) {
+                        return None;
+                    }
+                    if key == "System.EventID" {
+                        if event_id.replace(value.trim().parse().ok()?).is_some() {
+                            return None;
+                        }
+                    } else if !value.is_empty() && fields.insert(key, value.clone()).is_some() {
+                        return None;
+                    }
+                }
+                stack.pop()?;
+                if fields.len() > 256 {
+                    return None;
+                }
+            }
+            Event::DocType(_) => return None,
+            Event::Eof => break,
+            _ => {}
         }
-
-        let val_start = gt_pos + 1;
-
-        // Find </Data>
-        let val_end = match section[val_start..].find("</Data>") {
-            Some(e) => val_start + e,
-            None => break,
-        };
-
-        let raw_value = &section[val_start..val_end];
-        if !raw_value.is_empty() {
-            fields.insert(name.to_string(), decode_xml_entities(raw_value));
-        }
-
-        pos = val_end + "</Data>".len();
     }
-
-    fields
-}
-
-fn decode_xml_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
+    if !stack.is_empty() || roots != 1 {
+        return None;
     }
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    // The live subscription is already scoped to Sysmon; reject explicitly
+    // conflicting provider identities in imported fixtures/exported XML too.
+    if fields
+        .get("System.Provider.Name")
+        .is_some_and(|s| s != "Microsoft-Windows-Sysmon")
+    {
+        return None;
+    }
+    if fields.get("System.Provider.Guid").is_some_and(|s| {
+        uuid::Uuid::parse_str(s).ok()
+            != uuid::Uuid::parse_str("5770385f-c22a-43e0-bf4c-06f5698ffbd9").ok()
+    }) {
+        return None;
+    }
+    Some(SysmonParsedEvent {
+        event_id: event_id?,
+        fields,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -153,10 +224,125 @@ fn decode_xml_entities(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Convert a parsed Sysmon event into a unified `ThreatEvent`.
-pub fn map_to_threat_event(
-    parsed: &SysmonParsedEvent,
-    agent: &AgentInfo,
-) -> Option<ThreatEvent> {
+pub fn map_to_threat_event(parsed: &SysmonParsedEvent, agent: &AgentInfo) -> Option<ThreatEvent> {
+    let mut event = map_payload(parsed, agent)?;
+    let mut origin = EventProvenance {
+        provider_guid: "5770385f-c22a-43e0-bf4c-06f5698ffbd9".into(),
+        event_id: parsed.event_id,
+        version: parsed
+            .get("System.Version")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        record_id: parsed
+            .get("System.EventRecordID")
+            .and_then(|v| v.parse().ok()),
+        fields: parsed
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    // UtcTime is the operation time. SystemTime is only a fallback.
+    let original = parsed
+        .get("UtcTime")
+        .and_then(parse_utc)
+        .or_else(|| parsed.get("System.TimeCreated").and_then(parse_utc));
+    if let Some(time) = original {
+        event.timestamp = time;
+        origin.original_time = true;
+    } else {
+        origin.issues.push("missing_or_invalid_source_time".into());
+    }
+    if parsed
+        .get("UtcTime")
+        .is_some_and(|s| parse_utc(s).is_none())
+    {
+        origin.issues.push("invalid_utc_time".into());
+    }
+    let guid = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| parsed.get(name))
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .filter(|g| !g.is_nil())
+    };
+    origin.process_guid = guid(&[
+        "ProcessGuid",
+        "ProcessGUID",
+        "SourceProcessGUID",
+        "SourceProcessGuid",
+    ]);
+    origin.parent_process_guid = guid(&["ParentProcessGuid", "ParentProcessGUID"]);
+    origin.target_process_guid = guid(&["TargetProcessGUID", "TargetProcessGuid"]);
+    if matches!(
+        parsed.event_id,
+        1 | 3 | 5 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 17 | 18 | 22 | 23 | 25 | 26
+    ) && origin.process_guid.is_none()
+    {
+        origin.issues.push("missing_or_invalid_process_guid".into());
+    }
+    if matches!(parsed.event_id, 8 | 10) && origin.target_process_guid.is_none() {
+        origin.issues.push("missing_or_invalid_target_guid".into());
+    }
+    let pid_fields: &[&str] = match parsed.event_id {
+        8 | 10 => &["SourceProcessId", "TargetProcessId"],
+        1 | 3 | 5 | 7 | 11 | 12 | 13 | 14 | 15 | 17 | 18 | 22 | 23 | 25 | 26 => &["ProcessId"],
+        _ => &[],
+    };
+    for field in pid_fields {
+        if parsed
+            .get(field)
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+            .is_none()
+        {
+            origin.issues.push(format!("invalid_field:{field}"));
+        }
+    }
+    if parsed.event_id == 3 {
+        for field in ["SourceIp", "DestinationIp"] {
+            if parsed
+                .get(field)
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .is_none()
+            {
+                origin.issues.push(format!("invalid_field:{field}"));
+            }
+        }
+        for field in ["SourcePort", "DestinationPort"] {
+            if parsed
+                .get(field)
+                .and_then(|s| s.parse::<u16>().ok())
+                .is_none()
+            {
+                origin.issues.push(format!("invalid_field:{field}"));
+            }
+        }
+        if parsed.optional_bool("Initiated").is_none() {
+            origin.issues.push("invalid_field:Initiated".into());
+        }
+    }
+    if parsed.event_id == 255 {
+        origin.issues.push("upstream_sysmon_error".into());
+        event.severity = Severity::Medium;
+    }
+    event.provenance = Some(origin);
+    Some(event)
+}
+
+fn parse_utc(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.to_utc())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(|t| t.and_utc())
+        })
+}
+
+fn map_payload(parsed: &SysmonParsedEvent, agent: &AgentInfo) -> Option<ThreatEvent> {
     let eid = parsed.event_id;
     let source = EventSource::Sysmon { event_id: eid };
 
@@ -179,10 +365,10 @@ pub fn map_to_threat_event(
 
         // Event 3: Network Connection
         3 => {
-            let direction = if parsed.get_bool("Initiated") {
-                NetworkDirection::Outbound
-            } else {
-                NetworkDirection::Inbound
+            let direction = match parsed.optional_bool("Initiated") {
+                Some(true) => NetworkDirection::Outbound,
+                Some(false) => NetworkDirection::Inbound,
+                None => NetworkDirection::Unknown,
             };
             (
                 EventCategory::Network,
@@ -214,11 +400,7 @@ pub fn map_to_threat_event(
         // Event 6: Driver Loaded
         6 => {
             let image = parsed.get_string("ImageLoaded");
-            let name = image
-                .rsplit('\\')
-                .next()
-                .unwrap_or(&image)
-                .to_string();
+            let name = image.rsplit('\\').next().unwrap_or(&image).to_string();
             (
                 EventCategory::ImageLoad,
                 Severity::Info,
@@ -226,7 +408,7 @@ pub fn map_to_threat_event(
                     pid: 0,
                     image_path: image,
                     image_name: name,
-                    signed: parsed.get_bool("Signed"),
+                    signed: parsed.optional_bool("Signed"),
                     signature: parsed.get("Signature").map(String::from),
                     hashes: parsed.get("Hashes").map(String::from),
                 },
@@ -236,11 +418,7 @@ pub fn map_to_threat_event(
         // Event 7: Image Loaded (DLL)
         7 => {
             let image = parsed.get_string("ImageLoaded");
-            let name = image
-                .rsplit('\\')
-                .next()
-                .unwrap_or(&image)
-                .to_string();
+            let name = image.rsplit('\\').next().unwrap_or(&image).to_string();
             (
                 EventCategory::ImageLoad,
                 Severity::Info,
@@ -248,7 +426,7 @@ pub fn map_to_threat_event(
                     pid: parsed.get_u32("ProcessId"),
                     image_path: image,
                     image_name: name,
-                    signed: parsed.get_bool("Signed"),
+                    signed: parsed.optional_bool("Signed"),
                     signature: parsed.get("Signature").map(String::from),
                     hashes: parsed.get("Hashes").map(String::from),
                 },
@@ -295,7 +473,12 @@ pub fn map_to_threat_event(
         // Events 12/13/14: Registry
         12 | 13 | 14 => {
             let op = match eid {
-                12 => RegistryOperation::CreateKey,
+                12 => match parsed.get("EventType") {
+                    Some("DeleteKey") => RegistryOperation::DeleteKey,
+                    Some("DeleteValue") => RegistryOperation::DeleteValue,
+                    Some("CreateKey") => RegistryOperation::CreateKey,
+                    _ => return Some(native_event(parsed, agent, "unknown_registry_operation")),
+                },
                 13 => RegistryOperation::SetValue,
                 14 => RegistryOperation::RenameKey,
                 _ => unreachable!(),
@@ -440,10 +623,26 @@ pub fn map_to_threat_event(
             ));
         }
 
-        _ => return None,
+        _ => return Some(native_event(parsed, agent, "unmapped_sysmon_event")),
     };
 
     Some(ThreatEvent::new(agent, source, cat, sev, data))
+}
+
+fn native_event(parsed: &SysmonParsedEvent, agent: &AgentInfo, reason: &str) -> ThreatEvent {
+    ThreatEvent::new(
+        agent,
+        EventSource::Sysmon {
+            event_id: parsed.event_id,
+        },
+        EventCategory::Telemetry,
+        Severity::Info,
+        EventData::NativeTelemetry {
+            pid: parsed.get("ProcessId").and_then(|s| s.parse().ok()),
+            reason: reason.into(),
+            payload_hex: None,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +659,75 @@ mod tests {
             hostname: "test-host".into(),
             agent_id: Uuid::nil(),
         }
+    }
+
+    #[test]
+    fn preserves_native_time_record_id_and_guids() {
+        let xml = r#"<Event><System><EventID>8</EventID><EventRecordID>4321</EventRecordID><Version>2</Version>
+            <TimeCreated SystemTime='2026-09-12T12:30:00Z'/></System><EventData>
+            <Data Name='UtcTime'>2026-09-12 12:29:59.1234567</Data>
+            <Data Name='SourceProcessGUID'>{11111111-1111-1111-1111-111111111111}</Data>
+            <Data Name='TargetProcessGUID'>{22222222-2222-2222-2222-222222222222}</Data>
+            <Data Name='SourceProcessId'>12</Data><Data Name='TargetProcessId'>34</Data>
+            </EventData></Event>"#;
+        let e = map_to_threat_event(&parse_sysmon_xml(xml).unwrap(), &test_agent()).unwrap();
+        assert_eq!(
+            e.timestamp.to_rfc3339(),
+            "2026-09-12T12:29:59.123456700+00:00"
+        );
+        let p = e.provenance.unwrap();
+        assert_eq!(p.record_id, Some(4321));
+        assert_eq!(p.version, 2);
+        assert!(p.original_time);
+        assert!(p.issues.is_empty());
+        assert!(p.target_process_guid.is_some());
+    }
+    #[test]
+    fn xml_is_decoded_exactly_once_including_numeric_entities() {
+        let xml = r#"<Event><System><EventID>1</EventID></System><EventData>
+            <Data Name='CommandLine'>&amp;lt;&#x41;&#65;<![CDATA[&literal;]]></Data></EventData></Event>"#;
+        assert_eq!(
+            parse_sysmon_xml(xml).unwrap().get("CommandLine"),
+            Some("&lt;AA&literal;")
+        );
+    }
+    #[test]
+    fn rejects_ambiguous_or_malformed_xml_without_entity_expansion() {
+        for xml in ["<Event><System><EventID>1</EventID></System>",
+            "<!DOCTYPE Event [<!ENTITY e SYSTEM 'file:///fixture'>]><Event><System><EventID>1</EventID></System></Event>",
+            "<Event><System><EventID>1</EventID><EventID>3</EventID></System></Event>",
+            "<Event><System><EventID>1</EventID></System><EventData><Data Name='ProcessId'>1</Data><Data Name='ProcessId'>2</Data></EventData></Event>",
+            "<Event><System><Provider Name='not-Sysmon'/><EventID>1</EventID></System></Event>"] {
+            assert!(parse_sysmon_xml(xml).is_none(),"{xml}");
+        }
+    }
+    #[test]
+    fn missing_signature_remains_unknown_and_delete_is_not_create() {
+        let xml="<Event><System><EventID>7</EventID></System><EventData><Data Name='ProcessId'>10</Data></EventData></Event>";
+        let e = map_to_threat_event(&parse_sysmon_xml(xml).unwrap(), &test_agent()).unwrap();
+        assert!(matches!(e.data, EventData::ImageLoad { signed: None, .. }));
+        let xml="<Event><System><EventID>12</EventID></System><EventData><Data Name='EventType'>DeleteKey</Data></EventData></Event>";
+        let e = map_to_threat_event(&parse_sysmon_xml(xml).unwrap(), &test_agent()).unwrap();
+        assert!(matches!(
+            e.data,
+            EventData::RegistryEvent {
+                operation: RegistryOperation::DeleteKey,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn upstream_errors_are_quality_failures_and_duplicate_empty_fields_are_rejected() {
+        let xml="<Event><System><EventID>255</EventID></System><EventData><Data Name='Description'>fixture error</Data></EventData></Event>";
+        let event = map_to_threat_event(&parse_sysmon_xml(xml).unwrap(), &test_agent()).unwrap();
+        assert!(event
+            .provenance
+            .unwrap()
+            .issues
+            .contains(&"upstream_sysmon_error".to_string()));
+        let xml="<Event><System><EventID>1</EventID></System><EventData><Data Name='ProcessId'/><Data Name='ProcessId'>10</Data></EventData></Event>";
+        assert!(parse_sysmon_xml(xml).is_none());
     }
 
     fn sample_process_create() -> &'static str {
@@ -492,10 +760,7 @@ mod tests {
         let parsed = parse_sysmon_xml(sample_process_create()).unwrap();
         assert_eq!(parsed.get_u32("ProcessId"), 4728);
         assert_eq!(parsed.get_u32("ParentProcessId"), 1024);
-        assert_eq!(
-            parsed.get_string("Image"),
-            r"C:\Windows\System32\cmd.exe"
-        );
+        assert_eq!(parsed.get_string("Image"), r"C:\Windows\System32\cmd.exe");
         assert_eq!(parsed.get_string("User"), r"DESKTOP-ABC\Admin");
     }
 
@@ -519,10 +784,7 @@ mod tests {
   </EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        assert_eq!(
-            parsed.get_string("CommandLine"),
-            "a <b> & \"c\" 'd'"
-        );
+        assert_eq!(parsed.get_string("CommandLine"), "a <b> & \"c\" 'd'");
     }
 
     #[test]
@@ -547,10 +809,7 @@ mod tests {
         let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
 
         assert_eq!(event.hostname, "test-host");
-        assert!(matches!(
-            event.source,
-            EventSource::Sysmon { event_id: 1 }
-        ));
+        assert!(matches!(event.source, EventSource::Sysmon { event_id: 1 }));
         match &event.data {
             EventData::ProcessCreate {
                 pid,
@@ -682,9 +941,7 @@ mod tests {
         let parsed = parse_sysmon_xml(xml).unwrap();
         let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
         match &event.data {
-            EventData::ProcessAccess {
-                granted_access, ..
-            } => {
+            EventData::ProcessAccess { granted_access, .. } => {
                 assert_eq!(*granted_access, 0x1F0FFF);
             }
             _ => panic!("expected ProcessAccess"),
@@ -708,7 +965,7 @@ mod tests {
                 image_name, signed, ..
             } => {
                 assert_eq!(image_name, "evil.sys");
-                assert!(!signed);
+                assert_eq!(*signed, Some(false));
             }
             _ => panic!("expected ImageLoad"),
         }
@@ -732,7 +989,10 @@ mod tests {
             }
             _ => panic!("expected EvasionDetected"),
         }
-        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        let rule = event
+            .rule
+            .as_ref()
+            .expect("rule metadata should be present");
         assert_eq!(rule.id, "TF-SYS-001a");
         assert_eq!(rule.mitre.technique_id, "T1055.012");
         assert!(rule.name.contains("Hollowing"));
@@ -756,7 +1016,10 @@ mod tests {
             }
             _ => panic!("expected EvasionDetected"),
         }
-        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        let rule = event
+            .rule
+            .as_ref()
+            .expect("rule metadata should be present");
         assert_eq!(rule.id, "TF-SYS-001b");
         assert_eq!(rule.mitre.technique_id, "T1055");
         assert!(rule.name.contains("Herpaderping"));
@@ -780,7 +1043,10 @@ mod tests {
             }
             _ => panic!("expected EvasionDetected"),
         }
-        let rule = event.rule.as_ref().expect("rule metadata should be present");
+        let rule = event
+            .rule
+            .as_ref()
+            .expect("rule metadata should be present");
         assert_eq!(rule.id, "TF-SYS-001");
         assert_eq!(rule.mitre.technique_id, "T1055");
         assert!(rule.evidence.iter().any(|e| e.contains("Something new")));
@@ -801,17 +1067,23 @@ mod tests {
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
         let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
-        assert!(event.rule.is_none(), "telemetry events should not have rule metadata");
+        assert!(
+            event.rule.is_none(),
+            "telemetry events should not have rule metadata"
+        );
     }
 
     #[test]
-    fn unknown_event_returns_none() {
+    fn unknown_event_preserves_native_evidence() {
         let xml = r#"<Event>
   <System><EventID>999</EventID></System>
   <EventData></EventData>
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
-        assert!(map_to_threat_event(&parsed, &test_agent()).is_none());
+        assert!(matches!(
+            map_to_threat_event(&parsed, &test_agent()).unwrap().data,
+            EventData::NativeTelemetry { .. }
+        ));
     }
 
     // --- Rule metadata consistency tests -------------------------------------
@@ -852,7 +1124,11 @@ mod tests {
 
     #[test]
     fn sysmon_all_rules_have_defense_evasion_tactic() {
-        for tampering_type in &["Image is replaced", "Image is locked for access", "Unknown type"] {
+        for tampering_type in &[
+            "Image is replaced",
+            "Image is locked for access",
+            "Unknown type",
+        ] {
             let xml = format!(
                 r#"<Event>
   <System><EventID>25</EventID></System>
@@ -912,7 +1188,14 @@ mod tests {
 </Event>"#;
         let parsed = parse_sysmon_xml(xml).unwrap();
         let event = map_to_threat_event(&parsed, &test_agent()).unwrap();
-        assert!(event.rule.is_none(), "CreateRemoteThread is telemetry, not detection");
-        assert_eq!(event.severity, Severity::High, "suspicious telemetry has elevated severity");
+        assert!(
+            event.rule.is_none(),
+            "CreateRemoteThread is telemetry, not detection"
+        );
+        assert_eq!(
+            event.severity,
+            Severity::High,
+            "suspicious telemetry has elevated severity"
+        );
     }
 }

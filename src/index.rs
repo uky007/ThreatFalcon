@@ -539,6 +539,8 @@ fn category_short(cat: &EventCategory) -> &'static str {
         EventCategory::Evasion => "Evasion",
         EventCategory::Script => "Script",
         EventCategory::Health => "Health",
+        EventCategory::Telemetry => "Telemetry",
+        EventCategory::Detection => "Detection",
     }
 }
 
@@ -551,6 +553,7 @@ fn event_pid(data: &EventData) -> Option<u32> {
         | EventData::FileCreate { pid, .. }
         | EventData::FileDelete { pid, .. }
         | EventData::NetworkConnect { pid, .. }
+        | EventData::NetworkTraffic { pid, .. }
         | EventData::RegistryEvent { pid, .. }
         | EventData::ImageLoad { pid, .. }
         | EventData::DnsQuery { pid, .. }
@@ -560,7 +563,8 @@ fn event_pid(data: &EventData) -> Option<u32> {
         EventData::EvasionDetected { pid, .. } => *pid,
         EventData::CreateRemoteThread { source_pid, .. } => Some(*source_pid),
         EventData::ProcessAccess { source_pid, .. } => Some(*source_pid),
-        EventData::SensorHealth { .. } => None,
+        EventData::NativeTelemetry { pid, .. } => *pid,
+        EventData::SensorHealth { .. } | EventData::CorrelationDetection { .. } => None,
     }
 }
 

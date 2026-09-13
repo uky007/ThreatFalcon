@@ -6,9 +6,10 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::config::EvasionConfig;
-use crate::events::{AgentInfo, Confidence, ThreatEvent};
+use crate::events::{AgentInfo, CollectorStatus, Confidence, ThreatEvent};
 
 use super::Collector;
+use super::health::RuntimeHealth;
 
 /// Periodically scans running processes to detect EDR evasion techniques:
 ///
@@ -24,8 +25,9 @@ pub struct EvasionCollector {
     #[allow(dead_code)] // used on Windows only
     agent: AgentInfo,
     dropped: Arc<AtomicU64>,
+    health: RuntimeHealth,
     #[cfg(target_os = "windows")]
-    stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    worker: Option<super::health::Worker>,
 }
 
 impl EvasionCollector {
@@ -34,8 +36,9 @@ impl EvasionCollector {
             config,
             agent,
             dropped: Arc::new(AtomicU64::new(0)),
+            health: RuntimeHealth::new("EvasionDetector"),
             #[cfg(target_os = "windows")]
-            stop_flag: None,
+            worker: None,
         }
     }
 }
@@ -414,15 +417,12 @@ mod platform {
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
-    ) -> Result<Arc<AtomicBool>> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop.clone();
-
-        tokio::task::spawn_blocking(move || {
-            scan_loop(&config, &agent, &tx, &stop_clone, &dropped);
-        });
-
-        Ok(stop)
+        health: RuntimeHealth,
+    ) -> super::super::health::Worker {
+        super::super::health::Worker::spawn(health, move |stop, health| {
+            health.running();
+            scan_loop(&config, &agent, &tx, &stop, &dropped);
+        })
     }
 
     fn scan_loop(
@@ -515,7 +515,12 @@ mod platform {
                 }
             }
 
-            std::thread::sleep(interval);
+            // Bound shutdown latency even when the configured scan interval is long.
+            let started = std::time::Instant::now();
+            while started.elapsed() < interval && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep((interval - started.elapsed().min(interval))
+                    .min(std::time::Duration::from_millis(100)));
+            }
         }
     }
 
@@ -1371,19 +1376,30 @@ impl Collector for EvasionCollector {
         self.config.enabled
     }
 
+    fn supported(&self) -> bool { cfg!(target_os = "windows") }
+
+    fn status(&self) -> Option<CollectorStatus> {
+        #[cfg(target_os = "windows")]
+        if let Some(worker) = &self.worker { worker.check(); }
+        Some(self.health.snapshot(self.dropped_events()))
+    }
+
     async fn start(
         &mut self,
         _tx: mpsc::Sender<ThreatEvent>,
     ) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
-            let flag = platform::start_scanner(
+            if self.worker.is_some() { anyhow::bail!("Evasion collector already started"); }
+            self.dropped.store(0, Ordering::Relaxed);
+            self.health.starting();
+            self.worker = Some(platform::start_scanner(
                 self.config.clone(),
                 self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
-            )?;
-            self.stop_flag = Some(flag);
+                self.health.clone(),
+            ));
             info!("Evasion detector started");
         }
 
@@ -1395,8 +1411,8 @@ impl Collector for EvasionCollector {
 
     async fn stop(&mut self) -> Result<()> {
         #[cfg(target_os = "windows")]
-        if let Some(flag) = self.stop_flag.take() {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(mut worker) = self.worker.take() {
+            worker.stop().await?;
         }
 
         info!("Evasion detector stopped");

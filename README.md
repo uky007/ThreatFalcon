@@ -11,15 +11,26 @@ The project is aimed at a transparent, explainable, open source sensor that coll
 
 ThreatFalcon is early-stage software.
 
+New: evidence-preserving schema v2, TDH-based ETW decoding, GUID-safe Sysmon correlation,
+and `analyze --lang ja|en`. See [detection implementation and validation](docs/DETECTION_VALIDATION.md)
+for the implemented rules, controlled Windows profile, XML import, and remaining acceptance gates.
+The new correlations currently require Sysmon; ETW-only mode does not supply their evidence.
+実用的な高度脅威検知を目指す実装ですが、実Windowsでの収集品質・実攻撃の検知精度はまだ実証していません。
+
+Opt-in [Windows/Sysmon restart recovery](docs/WINDOWS_RECOVERY.md) synchronizes source events/findings to local output before committing source progress **and incremental correlation state together**. Native Windows validation is pending; replay duplicates, source retention and bounded evidence windows remain explicit limitations.
+Windows/Sysmon向けに、ファイル保存確認後に再開位置と相関状態を一緒に確定する実験的な復旧機構を追加しました。実機検証は未実施で、重複再読込・元ログの保持・相関時間窓の制約があります。
+
 - Windows is the primary target platform
 - ETW collection is implemented
 - Sysmon subscription and parsing are implemented, but disabled by default
 - Evasion-oriented signal collection is implemented for selected techniques
 - Sensor health events are available for local runtime visibility
+- Collector health includes runtime failures, ETW provider enable results, and session loss statistics
+- `health --lang ja|en` explains recorded sensor status in Japanese or English (`--json` for integrations)
 - Configuration is loaded from `threatfalcon.toml` (TOML format), overridable via `--config`
 - Output supports file, stdout, and HTTP POST sinks
 - Windows service mode is supported (SCM start/stop via `--service` flag)
-- Process context enrichment provides stable process identity across PID reuse
+- Sysmon process context uses native ProcessGuid across PID reuse; PID-only cross-feed joins are not used for the new correlations
 - Local investigation CLI (`query`, `explain`, `bundle`, `stats`, `tail`, `tree`, `inspect`, `ioc`, `hunt`, `score`, `alert`, `replay`) reads JSONL output directly
 - Real-time detection monitoring (`alert`) with hunt rule evaluation, per-process scoring, deduplication, and webhook output
 - JSONL event replay (`replay`) with speed control for offline testing and rule tuning
@@ -45,9 +56,15 @@ ThreatFalcon currently emits normalized telemetry for:
 - registry events
 - image load events
 - DNS events
-- script-related events (PowerShell ScriptBlock with path/ID correlation, AMSI scan with result classification)
+- script-related events (PowerShell fragments with path/ID metadata; multipart assembly is not yet implemented)
 - evasion-oriented signal events for selected techniques
 - sensor health events (periodic heartbeat with uptime, throughput, and collector status)
+
+Normalization depends on the source. ETW schemas/operations not yet safely normalized
+(including file, registry, AMSI and TI) are retained as `NativeTelemetry` with native
+fields/bytes and diagnostic codes. They are not silently classified using guessed offsets.
+File/registry/cross-process normalization is currently supplied by Sysmon. Signing
+state may be unknown; telemetry absence and zero detections do not establish safety.
 
 It currently collects from:
 
@@ -56,6 +73,12 @@ It currently collects from:
 - an in-process evasion-oriented signal collector
 
 ThreatFalcon normalizes these inputs into a unified `ThreatEvent` model for downstream inspection and comparison.
+
+## Multi-platform and control-plane direction
+
+Windows is the first production target. The platform strategy, data-minimisation rules, and staged plan for macOS/Linux are documented in [docs/RESEARCH.md](docs/RESEARCH.md) (日本語/English). The shared sensor and optional on-premises/hosted control-server boundary is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Windows is developed first because ETW and Sysmon already provide the strongest implementation base in this repository. macOS and Linux collectors will emit the same normalized `ThreatEvent` contract; the control server is optional so local collection remains useful during network outages or in isolated environments.
 
 ## Default Behavior
 
@@ -229,14 +252,18 @@ C:\ProgramData\ThreatFalcon\
 # Copy the binary
 Copy-Item threatfalcon.exe C:\ProgramData\ThreatFalcon\threatfalcon.exe
 
-# Install (config is auto-discovered from ProgramData)
-.\threatfalcon.exe --install-service
+# Install the copied binary (requires an existing, valid configuration)
+& C:\ProgramData\ThreatFalcon\threatfalcon.exe --install-service
 
 # Or with a custom config path baked into the service registration
-.\threatfalcon.exe --install-service --config C:\ProgramData\ThreatFalcon\threatfalcon.toml
+& C:\ProgramData\ThreatFalcon\threatfalcon.exe --install-service --config C:\ProgramData\ThreatFalcon\threatfalcon.toml
 ```
 
 `--install-service` registers ThreatFalcon with the Service Control Manager as an auto-start service running as LocalSystem. Equivalent to `sc.exe create` but with correct binary path and arguments.
+
+Before registration, the installer validates an existing configuration and pins its absolute path. A missing/invalid configuration or stdout sink is rejected before SCM mutation. Without `--config`, the existing normal search order is used once at installation, not repeated from the service's working directory. Protect the binary and configuration directory from untrusted writes before running as LocalSystem; service permissions do not replace filesystem ACLs. See [Microsoft service security guidance](https://learn.microsoft.com/en-us/windows/win32/services/service-security-and-access-rights).
+
+サービス登録前に既存設定を検証し、絶対パスで固定します。設定なし・不正な設定・標準出力は登録前に拒否します。LocalSystemで動かすバイナリと設定ディレクトリのアクセス権は、別途保護してください。
 
 **Start / stop:**
 
@@ -438,6 +465,16 @@ Example enriched NetworkConnect event:
 ## Local Investigation CLI
 
 ThreatFalcon includes built-in investigation commands that read JSONL telemetry output directly — no external SIEM or database required.
+
+### Health / センサ稼働状況
+
+```bash
+threatfalcon health --input events.jsonl --lang ja
+threatfalcon health --input events.jsonl --lang en
+threatfalcon health --input events.jsonl --json
+```
+
+Inspect the latest recorded collector state, provider failures, event/buffer losses, and record freshness. See [Sensor health / センサの収集品質](docs/SENSOR_HEALTH.md) for field definitions, limitations, and Windows validation instructions. A collection-focused sample is available at [configs/windows-telemetry.toml](configs/windows-telemetry.toml).
 
 ### Query
 

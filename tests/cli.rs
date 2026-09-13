@@ -1974,13 +1974,13 @@ fn ioc_deduplicates_by_count() {
 
 fn sample_image_load(id: &str, pid: u32, image_path: &str, image_name: &str, signed: bool, timestamp: &str) -> String {
     format!(
-        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"ImageLoad","severity":"Info","data":{{"type":"ImageLoad","pid":{pid},"image_path":"{image_path}","image_name":"{image_name}","signed":{signed},"signature":null,"hashes":null}}}}"#
+        r#"{{"schema_version":2,"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"ImageLoad","severity":"Info","data":{{"type":"ImageLoad","pid":{pid},"image_path":"{image_path}","image_name":"{image_name}","signed":{signed},"signature":null,"hashes":null}}}}"#
     )
 }
 
 fn sample_image_load_with_context(id: &str, pid: u32, image_path: &str, image_name: &str, signed: bool, timestamp: &str, process_key: &str, proc_image: &str) -> String {
     format!(
-        r#"{{"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"ImageLoad","severity":"Info","data":{{"type":"ImageLoad","pid":{pid},"image_path":"{image_path}","image_name":"{image_name}","signed":{signed},"signature":null,"hashes":null}},"process_context":{{"process_key":"{process_key}","image_path":"{proc_image}"}}}}"#
+        r#"{{"schema_version":2,"id":"{id}","timestamp":"{timestamp}","hostname":"TEST","agent_id":"00000000-0000-0000-0000-000000000000","sensor_version":"0.2.0","source":{{"Etw":{{"provider":"Microsoft-Windows-Kernel-Process"}}}},"category":"ImageLoad","severity":"Info","data":{{"type":"ImageLoad","pid":{pid},"image_path":"{image_path}","image_name":"{image_name}","signed":{signed},"signature":null,"hashes":null}},"process_context":{{"process_key":"{process_key}","image_path":"{proc_image}"}}}}"#
     )
 }
 
@@ -2089,13 +2089,18 @@ fn hunt_beaconing() {
     // 12 connections to the same IP from the same process (above threshold of 10)
     let mut lines: Vec<String> = Vec::new();
     for i in 0..12 {
-        lines.push(sample_network_event(
+        let mut value:serde_json::Value=serde_json::from_str(&sample_network_event(
             &format!("40000000-0000-0000-0000-{:012}", i),
             "185.100.87.174",
             443,
             "C:/malware/beacon.exe",
-            &format!("2026-03-13T10:{:02}:00Z", i),
-        ));
+            &format!("2026-03-13T10:{:02}:{:02}Z", i/2,(i%2)*30),
+        )).unwrap();
+        value["schema_version"]=serde_json::json!(2);
+        value["source"]=serde_json::json!({"Sysmon":{"event_id":3}});
+        value["provenance"]=serde_json::json!({"provider_guid":"5770385f-c22a-43e0-bf4c-06f5698ffbd9","event_id":3,
+            "original_time":true,"process_guid":"11111111-1111-1111-1111-111111111111"});
+        lines.push(value.to_string());
     }
     // 3 connections to a different IP (below threshold)
     for i in 0..3 {

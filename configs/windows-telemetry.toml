@@ -1,0 +1,21 @@
+# Windows telemetry baseline / Windowsテレメトリ収集用の基本設定
+# Copy to %ProgramData%\ThreatFalcon\threatfalcon.toml before running.
+# 実行前に %ProgramData%\ThreatFalcon\threatfalcon.toml に配置してください。
+health_interval_secs = 30
+state_path = "threatfalcon.state"
+
+[output]
+type = "file"
+path = "threatfalcon_events.jsonl"
+rotation_size_mb = 100
+
+[collectors.etw]
+enabled = true
+
+[collectors.sysmon]
+# Enable after installing/configuring Sysmon / Sysmonの導入・設定後に有効化
+enabled = false
+
+[collectors.evasion]
+# This profile focuses on event collection / この設定はイベント収集を対象とします
+enabled = false

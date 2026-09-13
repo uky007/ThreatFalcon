@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use crate::config::{OutputConfig, SinkType};
@@ -21,6 +21,11 @@ pub trait Sink: Send {
     fn name(&self) -> &str;
     async fn send(&mut self, event: &ThreatEvent) -> Result<()>;
     async fn flush(&mut self) -> Result<()>;
+    /// A normal flush is not necessarily durable (HTTP batching/stdout/spool).
+    /// Source checkpoints require an explicit durability contract.
+    async fn durable_checkpoint(&mut self) -> Result<()> {
+        anyhow::bail!("sink does not support acknowledged source checkpoints")
+    }
     /// Total number of events this sink failed to deliver.
     fn dropped_events(&self) -> u64;
     /// Number of spool files currently on disk (HTTP sink only).
@@ -38,7 +43,7 @@ pub fn create_sink(config: &OutputConfig) -> Result<Box<dyn Sink>> {
     match config.sink_type {
         SinkType::File => Ok(Box::new(FileSink::new(config)?)),
         SinkType::Stdout => Ok(Box::new(StdoutSink::new(config.pretty))),
-        SinkType::Http => Ok(Box::new(HttpSink::new(config)?))
+        SinkType::Http => Ok(Box::new(HttpSink::new(config)?)),
     }
 }
 
@@ -58,8 +63,21 @@ pub struct FileSink {
 impl FileSink {
     pub fn new(config: &OutputConfig) -> Result<Self> {
         let path = config.path.to_string_lossy().to_string();
-        let existing_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let file = open_append(&path)?;
+        let mut file = open_append(&path)?;
+        let mut existing_size = file.metadata()?.len();
+        // A crash can leave a partial last JSON line. Preserve every byte of
+        // that evidence, but do not concatenate new records onto its tail.
+        if existing_size > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                existing_size += 1;
+                tracing::warn!(path = %path, "Separated unterminated log tail; existing bytes preserved, last record may be incomplete");
+            }
+        }
         let generation = find_max_generation(&path);
 
         Ok(Self {
@@ -74,8 +92,12 @@ impl FileSink {
 
     fn rotate(&mut self) -> Result<()> {
         self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
 
-        self.generation += 1;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("log rotation generation exhausted"))?;
         let rotated_path = format!("{}.{}", self.base_path, self.generation);
         tracing::info!(
             from = %self.base_path,
@@ -94,6 +116,11 @@ impl FileSink {
 
 #[async_trait]
 impl Sink for FileSink {
+    async fn durable_checkpoint(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        Ok(())
+    }
     fn name(&self) -> &str {
         "file"
     }
@@ -110,7 +137,11 @@ impl Sink for FileSink {
             }
         }
 
-        if let Err(e) = self.writer.write_all(line.as_bytes()).and_then(|_| self.writer.flush()) {
+        if let Err(e) = self
+            .writer
+            .write_all(line.as_bytes())
+            .and_then(|_| self.writer.flush())
+        {
             self.events_dropped += 1;
             return Err(e.into());
         }
@@ -162,7 +193,11 @@ impl Sink for StdoutSink {
             serde_json::to_string(event)?
         };
         let line = format!("{json}\n");
-        if let Err(e) = self.writer.write_all(line.as_bytes()).and_then(|_| self.writer.flush()) {
+        if let Err(e) = self
+            .writer
+            .write_all(line.as_bytes())
+            .and_then(|_| self.writer.flush())
+        {
             self.events_dropped += 1;
             return Err(e.into());
         }
@@ -298,7 +333,7 @@ impl HttpSink {
             Ok(()) => {
                 self.buffer.clear();
                 // Opportunistically drain spooled batches
-                self.drain_spool().await;
+                self.drain_spool().await?;
                 Ok(())
             }
             Err(e) => {
@@ -339,46 +374,29 @@ impl HttpSink {
 
     /// Try to re-send spooled batches (oldest first). Stops on first
     /// failure so we don't overwhelm a recovering endpoint.
-    async fn drain_spool(&mut self) {
+    async fn drain_spool(&mut self) -> Result<()> {
         let files = match self.spool.as_ref() {
-            Some(s) => match s.pending() {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to list spool files");
-                    return;
-                }
-            },
-            None => return,
+            Some(s) => s
+                .pending()
+                .context("Cannot list spool files; source files retained")?,
+            None => return Ok(()),
         };
 
         for path in files {
-            let payload = match DiskSpool::read(&path) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Removing unreadable spool file");
-                    if let Some(ref mut spool) = self.spool {
-                        let _ = spool.remove(&path);
-                    }
-                    continue;
-                }
-            };
-
-            let payload_str = match std::str::from_utf8(&payload) {
-                Ok(s) => s,
-                Err(_) => {
-                    tracing::warn!(path = %path.display(), "Removing non-UTF8 spool file");
-                    if let Some(ref mut spool) = self.spool {
-                        let _ = spool.remove(&path);
-                    }
-                    continue;
-                }
-            };
+            // Never delete unreadable/corrupt evidence and count it as drained.
+            // Stop explicitly for operator inspection; counters retain the file.
+            let payload = DiskSpool::read(&path)
+                .with_context(|| format!("Unreadable spool retained: {}", path.display()))?;
+            let payload_str = std::str::from_utf8(&payload)
+                .with_context(|| format!("Non-UTF8 spool retained: {}", path.display()))?;
+            serde_json::from_str::<Vec<ThreatEvent>>(payload_str)
+                .with_context(|| format!("Invalid event batch retained: {}", path.display()))?;
 
             match self.try_post(payload_str).await {
                 Ok(()) => {
                     if let Some(ref mut spool) = self.spool {
                         if let Err(e) = spool.remove(&path) {
-                            tracing::warn!(path = %path.display(), error = %e, "Failed to remove drained spool file");
+                            return Err(e).with_context(|| format!("Delivered spool could not be removed; replay may duplicate: {}",path.display()));
                         } else {
                             tracing::info!(path = %path.display(), "Drained spooled batch");
                         }
@@ -390,6 +408,7 @@ impl HttpSink {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -413,7 +432,7 @@ impl Sink for HttpSink {
         // Attempt spool drain even when the buffer was empty, so that
         // periodic health flushes act as a drain trigger when the
         // endpoint recovers but no new events are flowing.
-        self.drain_spool().await;
+        self.drain_spool().await?;
         Ok(())
     }
 
@@ -437,9 +456,7 @@ impl Sink for HttpSink {
 /// Scan for existing rotated files (`base_path.1`, `.2`, ...) and return the
 /// highest generation number found, so the next rotation won't overwrite them.
 fn find_max_generation(base_path: &str) -> u32 {
-    let parent = Path::new(base_path)
-        .parent()
-        .unwrap_or(Path::new("."));
+    let parent = Path::new(base_path).parent().unwrap_or(Path::new("."));
     let filename = match Path::new(base_path).file_name().and_then(|n| n.to_str()) {
         Some(f) => f,
         None => return 0,
@@ -466,6 +483,7 @@ fn find_max_generation(base_path: &str) -> u32 {
 fn open_append(path: &str) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(Path::new(path))?;
     Ok(file)
@@ -510,6 +528,27 @@ mod tests {
     }
 
     // --- FileSink tests (adapted from EventWriter) ---------------------------
+
+    #[tokio::test]
+    async fn file_restart_preserves_partial_tail_without_corrupting_next_event() {
+        let dir = TempDir::new().unwrap();
+        let config = file_config(&dir, 0);
+        let tail = b"{\"id\":\"interrupted";
+        fs::write(&config.path, tail).unwrap();
+        let event = dummy_event();
+        let mut sink = FileSink::new(&config).unwrap();
+        sink.send(&event).await.unwrap();
+        sink.durable_checkpoint().await.unwrap();
+        drop(sink);
+        let bytes = fs::read(&config.path).unwrap();
+        assert_eq!(&bytes[..tail.len()], tail);
+        assert_eq!(bytes[tail.len()], b'\n');
+        let recovered: ThreatEvent = serde_json::from_slice(&bytes[tail.len() + 1..]).unwrap();
+        assert_eq!(recovered.id, event.id);
+        let before = bytes.clone();
+        drop(FileSink::new(&config).unwrap());
+        assert_eq!(fs::read(&config.path).unwrap(), before);
+    }
 
     #[tokio::test]
     async fn file_write_single_event() {
@@ -930,7 +969,9 @@ mod tests {
             .await;
 
         let mut config = http_config(&format!("{}/events", server.url()), 1);
-        config.headers.insert("X-Sensor-Id".into(), "sensor-001".into());
+        config
+            .headers
+            .insert("X-Sensor-Id".into(), "sensor-001".into());
         config.headers.insert("X-Api-Key".into(), "key-abc".into());
         let mut sink = HttpSink::new(&config).unwrap();
 
@@ -1021,7 +1062,10 @@ mod tests {
         let result = create_sink(&config);
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
-        assert!(err.contains("url"), "error should mention missing url: {err}");
+        assert!(
+            err.contains("url"),
+            "error should mention missing url: {err}"
+        );
     }
 
     // --- HttpSink + spool integration tests ----------------------------------
@@ -1041,6 +1085,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_spool_is_preserved_and_flush_reports_failure() {
+        for bytes in [
+            vec![0xff, 0xfe],
+            b"[truncated".to_vec(),
+            b"[{\"not_an_event\":true}]".to_vec(),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("0001.spool");
+            fs::write(&path, &bytes).unwrap();
+            // Invalid batches must be rejected before any HTTP connection.
+            let config = http_config_with_spool("http://127.0.0.1:1/events", 1, dir.path());
+            let mut sink = HttpSink::new(&config).unwrap();
+            assert!(sink.flush().await.is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(sink.spool_files(), 1);
+            assert_eq!(sink.spool_bytes(), bytes.len() as u64);
+            assert_eq!(sink.dropped_events(), 0); // retained, not silently deleted
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_spool_is_not_removed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("0001.spool");
+        fs::create_dir(&path).unwrap();
+        let config = http_config_with_spool("http://127.0.0.1:1/events", 1, dir.path());
+        let mut sink = HttpSink::new(&config).unwrap();
+        assert!(sink.flush().await.is_err());
+        assert!(path.is_dir());
+        assert_eq!(sink.spool_files(), 1);
+    }
+
+    #[tokio::test]
     async fn http_sink_spools_on_failure() {
         let dir = TempDir::new().unwrap();
         let spool_dir = dir.path().join("spool");
@@ -1052,11 +1129,7 @@ mod tests {
             .create_async()
             .await;
 
-        let config = http_config_with_spool(
-            &format!("{}/events", server.url()),
-            1,
-            &spool_dir,
-        );
+        let config = http_config_with_spool(&format!("{}/events", server.url()), 1, &spool_dir);
         let mut sink = HttpSink::new(&config).unwrap();
 
         // send triggers flush → HTTP fails → events spooled, not dropped
@@ -1089,11 +1162,7 @@ mod tests {
             .create_async()
             .await;
 
-        let config = http_config_with_spool(
-            &format!("{}/events", server.url()),
-            1,
-            &spool_dir,
-        );
+        let config = http_config_with_spool(&format!("{}/events", server.url()), 1, &spool_dir);
         let mut sink = HttpSink::new(&config).unwrap();
 
         sink.send(&dummy_event()).await.unwrap();
@@ -1135,11 +1204,7 @@ mod tests {
             .await;
 
         // Very small spool cap: 0 MB → any write exceeds it
-        let mut config = http_config_with_spool(
-            &format!("{}/events", server.url()),
-            1,
-            &spool_dir,
-        );
+        let mut config = http_config_with_spool(&format!("{}/events", server.url()), 1, &spool_dir);
         config.spool_max_mb = 0;
         let mut sink = HttpSink::new(&config).unwrap();
 
@@ -1182,11 +1247,7 @@ mod tests {
             .create_async()
             .await;
 
-        let config = http_config_with_spool(
-            &format!("{}/events", server.url()),
-            1,
-            &spool_dir,
-        );
+        let config = http_config_with_spool(&format!("{}/events", server.url()), 1, &spool_dir);
         let mut sink = HttpSink::new(&config).unwrap();
 
         for _ in 0..3 {
@@ -1240,11 +1301,7 @@ mod tests {
             .create_async()
             .await;
 
-        let config = http_config_with_spool(
-            &format!("{}/events", server.url()),
-            1,
-            &spool_dir,
-        );
+        let config = http_config_with_spool(&format!("{}/events", server.url()), 1, &spool_dir);
         let mut sink = HttpSink::new(&config).unwrap();
 
         sink.send(&dummy_event()).await.unwrap();

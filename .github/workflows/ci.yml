@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,8 +12,12 @@ env:
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,8 +28,9 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-  check-windows:
-    name: Check (Windows)
+  windows-etw-smoke:
+    name: ETW integration (manual Windows VM run)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,5 +41,5 @@ jobs:
         with:
           key: windows
 
-      - name: Check Windows target
-        run: cargo check --locked
+      - name: Observe a benign process with ETW and verify session ownership
+        run: cargo test --locked windows_etw_process_smoke -- --ignored --test-threads=1

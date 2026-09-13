@@ -46,24 +46,27 @@ static CONFIG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Register ThreatFalcon as a Windows service.
 ///
 /// The service is configured to start automatically (`AutoStart`) and
-/// run as `LocalSystem`. If `config_path` is `Some`, `--config <path>`
-/// is appended to the service launch arguments so SCM passes it on
-/// every start.
+/// run as `LocalSystem`. An existing validated configuration is required and
+/// its absolute path is pinned in the launch arguments for every SCM start.
 pub fn install(config_path: Option<&std::path::Path>) -> Result<()> {
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CREATE_SERVICE,
-    )
-    .map_err(|e| anyhow::anyhow!("failed to open Service Control Manager: {e}"))?;
+    // Resolve configuration before any SCM mutation. An implicit working-
+    // directory lookup at service startup can otherwise select another policy.
+    let candidate=config_path.map(|p|p.to_path_buf())
+        .or_else(||crate::config::find_config_file(None))
+        .ok_or_else(||anyhow::anyhow!("service installation requires a configuration file; create and validate one, then pass --config <path>"))?;
+    let config_path = crate::config::validated_service_config(&candidate)?;
+    let manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
+            .map_err(|e| anyhow::anyhow!("failed to open Service Control Manager: {e}"))?;
 
     let exe_path = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("failed to determine executable path: {e}"))?;
 
-    let mut launch_args = vec![OsString::from("--service")];
-    if let Some(path) = config_path {
-        launch_args.push(OsString::from("--config"));
-        launch_args.push(path.as_os_str().to_os_string());
-    }
+    let launch_args = vec![
+        OsString::from("--service"),
+        OsString::from("--config"),
+        config_path.into_os_string(),
+    ];
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -89,11 +92,8 @@ pub fn install(config_path: Option<&std::path::Path>) -> Result<()> {
 ///
 /// If the service is currently running, it is stopped first.
 pub fn uninstall() -> Result<()> {
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT,
-    )
-    .map_err(|e| anyhow::anyhow!("failed to open Service Control Manager: {e}"))?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| anyhow::anyhow!("failed to open Service Control Manager: {e}"))?;
 
     let service = manager
         .open_service(
@@ -204,7 +204,11 @@ fn run_service() -> Result<()> {
     }
 
     // Report StartPending while we initialise.
-    report_state(&status_handle, ServiceState::StartPending, svc_exit::SUCCESS)?;
+    report_state(
+        &status_handle,
+        ServiceState::StartPending,
+        svc_exit::SUCCESS,
+    )?;
 
     // Initialise logging (same style as foreground mode).
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -281,22 +285,10 @@ fn report_state(
     exit: u32,
 ) -> Result<(), windows_service::Error> {
     let (controls, wait_hint) = match state {
-        ServiceState::Running => (
-            ServiceControlAccept::STOP,
-            Duration::default(),
-        ),
-        ServiceState::StartPending => (
-            ServiceControlAccept::empty(),
-            Duration::from_secs(10),
-        ),
-        ServiceState::StopPending => (
-            ServiceControlAccept::empty(),
-            Duration::from_secs(15),
-        ),
-        _ => (
-            ServiceControlAccept::empty(),
-            Duration::default(),
-        ),
+        ServiceState::Running => (ServiceControlAccept::STOP, Duration::default()),
+        ServiceState::StartPending => (ServiceControlAccept::empty(), Duration::from_secs(10)),
+        ServiceState::StopPending => (ServiceControlAccept::empty(), Duration::from_secs(15)),
+        _ => (ServiceControlAccept::empty(), Duration::default()),
     };
     handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
