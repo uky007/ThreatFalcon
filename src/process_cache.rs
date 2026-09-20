@@ -53,6 +53,18 @@ impl ProcessCache {
     ///   then evict the entry.
     /// - **Activity events**: look up by PID and attach full context.
     pub fn enrich(&mut self, event: &mut ThreatEvent) {
+        if crate::collectors::etw_metadata::has_extended_metadata(event) {
+            // Extended keys identify the publisher, not necessarily the actor.
+            // A lifecycle observation still invalidates any legacy PID entry;
+            // otherwise a mixed opt-in profile could reuse stale actor metadata.
+            if let EventData::ProcessCreate { pid, .. } | EventData::ProcessTerminate { pid, .. } =
+                &event.data
+            {
+                self.entries.remove(pid);
+            }
+            event.process_context = None;
+            return;
+        }
         // PowerShell supplies a script ID, not a process lifetime ID. A cached
         // ETW process with the same numeric PID is not sufficient evidence.
         if crate::collectors::etw_normalize::is_powershell_script(event) {

@@ -296,6 +296,8 @@ mod platform {
     }
 
     struct CallbackContext {
+        capture_id: uuid::Uuid,
+        extended: Vec<(GUID, super::super::etw_metadata::CaptureOptions)>,
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
@@ -505,8 +507,10 @@ mod platform {
         }
 
         // ---- enable providers -----------------------------------------------
+        let capture_id = uuid::Uuid::new_v4();
         let mut provider_statuses = Vec::new();
         for (p, guid) in providers.iter().zip(&guids) {
+            let parameters = super::super::etw_metadata::native::parameters(p.extended);
             let status = unsafe {
                 EnableTraceEx2(
                     session.handle,
@@ -516,7 +520,7 @@ mod platform {
                     p.keywords,
                     0,
                     0,
-                    None,
+                    p.extended.enabled().then_some(&parameters as *const _),
                 )
             };
             if status != WIN32_ERROR(0) {
@@ -529,6 +533,11 @@ mod platform {
                 tracing::info!(provider = %p.name, "ETW provider enabled");
             }
             provider_statuses.push(crate::events::ProviderStatus {
+                telemetry: Some(super::super::etw_metadata::ProviderTelemetry {
+                    capture_id: Some(capture_id),
+                    requested: p.extended,
+                    ..Default::default()
+                }),
                 name: p.name.clone(),
                 guid: p.guid.clone(),
                 enabled: status.0 == 0,
@@ -544,6 +553,12 @@ mod platform {
 
         // ---- consume events in a blocking thread ----------------------------
         let ctx_ptr = Box::into_raw(Box::new(CallbackContext {
+            capture_id,
+            extended: guids
+                .iter()
+                .copied()
+                .zip(providers.iter().map(|p| p.extended))
+                .collect(),
             agent,
             tx,
             dropped,
@@ -592,21 +607,43 @@ mod platform {
         let ctx = unsafe { &*(rec.UserContext as *const CallbackContext) };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            ctx.decoder
+            let mut event = ctx
+                .decoder
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .decode(rec, &ctx.agent)
+                .decode(rec, &ctx.agent);
+            if let Some((_, options)) = ctx
+                .extended
+                .iter()
+                .find(|(guid, _)| *guid == rec.EventHeader.ProviderId)
+            {
+                if options.enabled() {
+                    let metadata =
+                        super::super::etw_metadata::native::capture(rec, ctx.capture_id, *options);
+                    if let Some(provenance) = event.provenance.as_mut() {
+                        provenance.etw_extended = Some(metadata);
+                    }
+                }
+            }
+            event
         }));
         if let Ok(event) = result {
-            ctx.health.decoded(
-                matches!(event.data, EventData::NativeTelemetry { .. }),
-                event
-                    .provenance
-                    .as_ref()
-                    .is_some_and(|p| p.issues.iter().any(|i| i.starts_with("tdh_"))),
-            );
-            if let Err(_) = ctx.tx.try_send(event) {
-                let n = ctx.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            ctx.health.etw_observed(&event);
+            let guid = event
+                .provenance
+                .as_ref()
+                .map(|p| p.provider_guid.clone())
+                .unwrap_or_default();
+            let admitted = ctx.tx.try_send(event).is_ok();
+            ctx.health.etw_queue_result(&guid, admitted);
+            if !admitted {
+                let old = ctx
+                    .dropped
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_add(1))
+                    })
+                    .unwrap_or(u64::MAX);
+                let n = old.saturating_add(1);
                 if n.is_power_of_two() || n % 1000 == 0 {
                     tracing::warn!(
                         total_dropped = n,
@@ -647,6 +684,7 @@ impl Collector for EtwCollector {
     }
 
     async fn start(&mut self, _tx: mpsc::Sender<ThreatEvent>) -> Result<()> {
+        self.config.validate()?;
         #[cfg(target_os = "windows")]
         {
             if self.session.is_some() {

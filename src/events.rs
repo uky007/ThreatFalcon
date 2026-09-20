@@ -51,6 +51,8 @@ fn legacy_schema_version() -> u16 {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etw_extended: Option<crate::collectors::etw_metadata::ExtendedMetadata>,
     pub provider_guid: String,
     pub event_id: u16,
     #[serde(default)]
@@ -449,6 +451,8 @@ pub struct CollectorError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<crate::collectors::etw_metadata::ProviderTelemetry>,
     pub name: String,
     pub guid: String,
     pub enabled: bool,

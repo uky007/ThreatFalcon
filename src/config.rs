@@ -264,8 +264,27 @@ pub struct EtwConfig {
     pub providers: Vec<EtwProviderConfig>,
 }
 
+impl EtwConfig {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.providers.len() <= 64, "ETW provider count exceeds 64");
+        if self.providers.iter().any(|p| p.extended.enabled()) {
+            let mut guids = std::collections::HashSet::new();
+            for p in &self.providers {
+                let guid = uuid::Uuid::parse_str(&p.guid)?;
+                anyhow::ensure!(
+                    !guid.is_nil() && guids.insert(guid),
+                    "extended ETW capture requires unique non-nil provider GUIDs"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EtwProviderConfig {
+    #[serde(default)]
+    pub extended: crate::collectors::etw_metadata::CaptureOptions,
     pub name: String,
     pub guid: String,
     #[serde(default = "default_level")]
@@ -478,6 +497,11 @@ impl SensorConfig {
 
 impl SensorConfig {
     pub fn validate(&self) -> Result<()> {
+        // A GUID must have a single capture policy; otherwise the last enable
+        // call and the first callback lookup could describe different requests.
+        if self.collectors.etw.enabled {
+            self.collectors.etw.validate()?;
+        }
         if self.collectors.sysmon.enabled {
             if let Some(checkpoint) = &self.collectors.sysmon.checkpoint_path {
                 anyhow::ensure!(
@@ -734,48 +758,56 @@ fn default_etw_providers() -> Vec<EtwProviderConfig> {
     vec![
         EtwProviderConfig {
             name: "Microsoft-Windows-Kernel-Process".into(),
+            extended: Default::default(),
             guid: "22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Windows-Kernel-File".into(),
+            extended: Default::default(),
             guid: "EDD08927-9CC4-4E65-B970-C2560FB5C289".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Windows-Kernel-Network".into(),
+            extended: Default::default(),
             guid: "7DD42A49-5329-4832-8DFD-43D979153A88".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Windows-Kernel-Registry".into(),
+            extended: Default::default(),
             guid: "70EB4F03-C1DE-4F73-A051-33D13D5413BD".into(),
             level: 4,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Windows-DNS-Client".into(),
+            extended: Default::default(),
             guid: "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Windows-PowerShell".into(),
+            extended: Default::default(),
             guid: "A0C1853B-5C40-4B15-8766-3CF1C58F985A".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Antimalware-Scan-Interface".into(),
+            extended: Default::default(),
             guid: "2A576B87-09A7-520E-C21A-4942F0271D67".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,
         },
         EtwProviderConfig {
             name: "Microsoft-Windows-Threat-Intelligence".into(),
+            extended: Default::default(),
             guid: "F4E1897C-BB5D-5668-F1D8-040F4D8DD344".into(),
             level: 5,
             keywords: 0xFFFFFFFFFFFFFFFF,

@@ -5,6 +5,12 @@
 
 ThreatFalcon is an experimental Windows/macOS/Linux endpoint telemetry sensor written in Rust.
 
+New: opt-in [Windows ETW context](docs/WINDOWS_ETW_CONTEXT.md): publisher start keys,
+bounded 32/64-bit stack evidence, capture-scoped publisher inspection, and per-provider health.
+Native Windows validation, symbol/module enrichment and actor correlation remain pending.
+ETW拡張情報・発行元識別・スタック証拠と日英の収集品質表示を追加しました。
+実Windows検証・シンボル解決・操作対象との相関は未完了です。
+
 New: [Windows PowerShell / PowerShell Core script telemetry](docs/WINDOWS_POWERSHELL.md)
 preserves fragment positions and avoids native script PID-only process/AMSI joins in `explain`.
 PowerShell 7向けの明示的な収集設定と、分割ログの保存・品質表示を追加しました。

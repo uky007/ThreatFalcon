@@ -93,7 +93,12 @@ impl RuntimeHealth {
                         || v.sequence_discontinuities > 0
                         || v.sequence_unavailable > 0
                 })
-                || s.providers.iter().any(|p| !p.enabled))
+                || s.providers.iter().any(|p| {
+                    !p.enabled
+                        || p.telemetry
+                            .as_ref()
+                            .is_some_and(|t| t.metadata_issue_events > 0)
+                }))
         {
             s.state = CollectorState::Degraded;
         }
@@ -107,6 +112,66 @@ impl RuntimeHealth {
                 .events_not_normalized
                 .saturating_add(u64::from(not_normalized));
             s.decode_failures = s.decode_failures.saturating_add(u64::from(failed));
+        });
+    }
+
+    pub fn etw_observed(&self, event: &crate::events::ThreatEvent) {
+        use crate::collectors::etw_metadata::publisher_identity;
+        let not_normalized = matches!(event.data, crate::events::EventData::NativeTelemetry { .. });
+        let Some(p) = &event.provenance else {
+            return;
+        };
+        let failed = p.issues.iter().any(|issue| issue.starts_with("tdh_"));
+        self.update(|s| {
+            s.events_observed = s.events_observed.saturating_add(1);
+            s.events_not_normalized = s
+                .events_not_normalized
+                .saturating_add(u64::from(not_normalized));
+            s.decode_failures = s.decode_failures.saturating_add(u64::from(failed));
+            if let Some(t) = s
+                .providers
+                .iter_mut()
+                .find(|provider| {
+                    provider
+                        .guid
+                        .trim_matches(['{', '}'])
+                        .eq_ignore_ascii_case(&p.provider_guid)
+                })
+                .and_then(|provider| provider.telemetry.as_mut())
+            {
+                t.observed = t.observed.saturating_add(1);
+                t.normalized = t.normalized.saturating_add(u64::from(!not_normalized));
+                t.last_observed_at = Some(chrono::Utc::now());
+                if let Some(metadata) = &p.etw_extended {
+                    t.extended_events = t.extended_events.saturating_add(1);
+                    t.publisher_identity_events = t
+                        .publisher_identity_events
+                        .saturating_add(u64::from(publisher_identity(event).is_some()));
+                    t.stack_events = t
+                        .stack_events
+                        .saturating_add(u64::from(!metadata.stacks.is_empty()));
+                    t.metadata_issue_events = t
+                        .metadata_issue_events
+                        .saturating_add(u64::from(!metadata.issues.is_empty()));
+                }
+            }
+        });
+    }
+
+    pub fn etw_queue_result(&self, guid: &str, admitted: bool) {
+        self.update(|s| {
+            if let Some(t) = s
+                .providers
+                .iter_mut()
+                .find(|p| p.guid.trim_matches(['{', '}']).eq_ignore_ascii_case(guid))
+                .and_then(|p| p.telemetry.as_mut())
+            {
+                if admitted {
+                    t.queue_admitted = t.queue_admitted.saturating_add(1);
+                } else {
+                    t.queue_dropped = t.queue_dropped.saturating_add(1);
+                }
+            }
         });
     }
 
@@ -233,6 +298,7 @@ mod tests {
         let health = RuntimeHealth::new("ETW");
         health.starting();
         health.providers(vec![ProviderStatus {
+            telemetry: None,
             name: "restricted".into(),
             guid: "test".into(),
             enabled: false,

@@ -378,6 +378,34 @@ pub fn run(
                         .map(|v| format!(" (OS: {v})"))
                         .unwrap_or_default()
                 )?;
+                if let Some(t) = &p.telemetry {
+                    writeln!(
+                        out,
+                        "    capture_id={}",
+                        t.capture_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| lang.text("unknown", "不明").into())
+                    )?;
+                    writeln!(
+                        out,
+                        "    {}: {} / {} / {}",
+                        lang.text(
+                            "Requested process-start key / event key / stack",
+                            "要求したプロセス開始キー / イベントキー / スタック"
+                        ),
+                        t.requested.process_start_key,
+                        t.requested.event_key,
+                        t.requested.stack_trace
+                    )?;
+                    writeln!(out, "    {}: {} / {} / {} / {}", lang.text(
+                        "Observed / normalized / queue admitted / queue dropped (not durable-save counts)",
+                        "観測 / 正規化 / キュー受付 / キュー欠落（永続保存数ではありません）"),
+                        t.observed, t.normalized, t.queue_admitted, t.queue_dropped)?;
+                    writeln!(out, "    {}: {} / {} / {}", lang.text(
+                        "Publisher identities / stack events / metadata issue events; complete coverage unverified",
+                        "発行元識別 / スタック付き / 拡張情報の品質問題あり：網羅性は未検証"),
+                        t.publisher_identity_events, t.stack_events, t.metadata_issue_events)?;
+                }
             }
             if let Some(stats) = &c.wfp_audit {
                 writeln!(

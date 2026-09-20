@@ -1,0 +1,31 @@
+# Experimental, opt-in DNS ETW context validation. Read docs/WINDOWS_ETW_CONTEXT.md.
+# Publisher identity is NOT necessarily the process responsible for a DNS query.
+# Native addresses and DNS names are sensitive; secure the output directory.
+hostname = "WINDOWS-HOST"
+state_path = "etw-context.state"
+health_interval_secs = 30
+
+[output]
+type = "file"
+path = "etw-context-events.jsonl"
+rotation_size_mb = 100
+
+[collectors.etw]
+enabled = true
+[[collectors.etw.providers]]
+name = "Microsoft-Windows-DNS-Client"
+guid = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D"
+level = 5
+keywords = "0xFFFFFFFFFFFFFFFF"
+extended = { process_start_key = true, event_key = true, stack_trace = true }
+
+[collectors.sysmon]
+enabled = false
+[collectors.wfp_audit]
+enabled = false
+[collectors.evasion]
+enabled = false
+[collectors.macos]
+enabled = false
+[collectors.linux_audit]
+enabled = false

@@ -695,6 +695,8 @@ fn run_query(input: &Path, filter: &QueryFilter, limit: usize, no_index: bool) -
 /// Structured explain output for `--json` mode.
 #[derive(Serialize)]
 struct ExplainOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publisher_activity: Option<PublisherActivity>,
     target_event: ThreatEvent,
     window_minutes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -704,6 +706,50 @@ struct ExplainOutput {
     script_amsi_activity: Vec<ThreatEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule: Option<crate::events::RuleMetadata>,
+}
+
+#[derive(Serialize)]
+struct PublisherActivity {
+    identity: crate::collectors::etw_metadata::PublisherIdentity,
+    relation: &'static str,
+    matched_events: usize,
+    truncated: bool,
+    events: Vec<ThreatEvent>,
+}
+
+fn build_publisher_activity(target: &ThreatEvent, events: &[ThreatEvent], window_mins: u64) -> Option<PublisherActivity> {
+    use crate::collectors::etw_metadata::publisher_identity;
+    let identity = publisher_identity(target)?;
+    let window = chrono::Duration::try_minutes(window_mins.try_into().ok()?)?;
+    let from = target.timestamp.checked_sub_signed(window)?;
+    let to = target.timestamp.checked_add_signed(window)?;
+    let mut selected = Vec::new();
+    let mut matched_events = 0;
+    for event in events.iter().filter(|e| e.timestamp >= from && e.timestamp <= to && publisher_identity(e).as_ref() == Some(&identity)) {
+        matched_events += 1;
+        if selected.len() < 256 { selected.push(event.clone()); }
+    }
+    selected.sort_by_key(|e| e.timestamp);
+    Some(PublisherActivity {
+        identity,
+        relation: "same ETW publisher within one capture; not payload actor identity or causality",
+        matched_events,
+        truncated: matched_events > selected.len(),
+        events: selected,
+    })
+}
+
+fn print_publisher_activity(out: &mut impl Write, activity: Option<&PublisherActivity>) -> Result<()> {
+    if let Some(activity) = activity {
+        writeln!(out, "\n=== ETW publisher activity / ETW発行元の関連イベント（対象プロセス・因果関係の証明ではありません） ===")?;
+        writeln!(out, "capture={} publisher_pid={} start_key={} matched={} shown={} truncated={}",
+            activity.identity.capture_id, activity.identity.pid, activity.identity.process_start_key,
+            activity.matched_events, activity.events.len(), activity.truncated)?;
+        for event in &activity.events {
+            writeln!(out, "{} {} {}", event.id, event.timestamp, event_summary(&event.data))?;
+        }
+    }
+    Ok(())
 }
 
 fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_index: bool) -> Result<()> {
@@ -719,7 +765,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
     let target = find_event(&events, event_id)?;
 
     // --- Build timeline ---
-    let native_script = crate::collectors::etw_normalize::is_powershell_script(target);
+    let native_script = crate::collectors::etw_metadata::requires_explicit_identity(target);
     let process_key = target.process_context.as_ref().filter(|_| !native_script).map(|c| c.process_key.as_str());
     let target_pid = target.data.acting_pid().filter(|_| !native_script);
     let window = chrono::Duration::minutes(window_mins as i64);
@@ -754,10 +800,12 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
     timeline.sort_by_key(|e| e.timestamp);
 
     // --- JSON output ---
-    timeline.retain(|event| !crate::collectors::etw_normalize::is_powershell_script(event));
+    timeline.retain(|event| !crate::collectors::etw_metadata::requires_explicit_identity(event));
+    let publisher_activity = build_publisher_activity(target, &events, window_mins);
     if json {
         let script_activity = build_script_activity(target, &events, window_mins);
         let output = ExplainOutput {
+            publisher_activity,
             target_event: target.clone(),
             window_minutes: window_mins,
             process_key: process_key.map(|s| s.to_string()),
@@ -775,6 +823,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
 
     writeln!(stdout, "=== Target Event ===")?;
     print_event_detail(&mut stdout, target)?;
+    print_publisher_activity(&mut stdout, publisher_activity.as_ref())?;
 
     if process_key.is_some() || target_pid.is_some() {
         let key_display = process_key
@@ -796,7 +845,7 @@ fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_in
             )?;
         }
     } else {
-        writeln!(stdout, "{}", if native_script { "\nNo verified PowerShell process lifetime identity — no process timeline." } else { "\nNo process_context — cannot build timeline." })?;
+        writeln!(stdout, "{}", if native_script { "\nNo verified native actor lifetime identity — no actor process timeline." } else { "\nNo process_context — cannot build timeline." })?;
     }
 
     // --- Script / AMSI correlation ---
@@ -862,7 +911,7 @@ fn print_event_detail(w: &mut impl Write, event: &ThreatEvent) -> Result<()> {
     writeln!(w, "  Source:   {}", source_display(&event.source))?;
     writeln!(w, "  Host:     {}", event.hostname)?;
 
-    if let Some(ref ctx) = event.process_context {
+    if let Some(ctx) = event.process_context.as_ref().filter(|_| !crate::collectors::etw_metadata::has_extended_metadata(event)) {
         writeln!(w, "  Process:")?;
         writeln!(w, "    key:        {}", ctx.process_key)?;
         if let Some(ref p) = ctx.image_path {
@@ -924,7 +973,7 @@ fn run_bundle(
     let process_key = target
         .process_context
         .as_ref()
-        .filter(|_| !crate::collectors::etw_normalize::is_powershell_script(&target))
+        .filter(|_| !crate::collectors::etw_metadata::requires_explicit_identity(&target))
         .map(|c| c.process_key.clone());
 
     let mut related: Vec<ThreatEvent> = if let Some(ref key) = process_key {
@@ -947,6 +996,7 @@ fn run_bundle(
     } else {
         vec![]
     };
+    related.retain(|event| !crate::collectors::etw_metadata::requires_explicit_identity(event));
     related.sort_by_key(|e| e.timestamp);
 
     let bundle = EvidenceBundle {
@@ -3774,7 +3824,12 @@ fn run_explain_indexed(
     };
 
     // Find related events by process_key (or PID fallback) within window
-    let native_script = crate::collectors::etw_normalize::is_powershell_script(&target);
+    // The existing index stores payload PIDs, not publisher PIDs. A full scan
+    // is required to avoid losing publisher events about a different actor.
+    if crate::collectors::etw_metadata::has_extended_metadata(&target) {
+        return run_explain(input, event_id, window_mins, json, true);
+    }
+    let native_script = crate::collectors::etw_metadata::requires_explicit_identity(&target);
     let process_key = target
         .process_context
         .as_ref()
@@ -3799,7 +3854,7 @@ fn run_explain_indexed(
     };
     timeline.sort_by_key(|e| e.timestamp);
 
-    timeline.retain(|event| !crate::collectors::etw_normalize::is_powershell_script(event));
+    timeline.retain(|event| !crate::collectors::etw_metadata::requires_explicit_identity(event));
     // PID is only a preliminary index filter for native script candidates;
     // build_script_activity also checks agent/provider/ScriptBlockId/time.
     let script_activity = if native_script {
@@ -3811,6 +3866,7 @@ fn run_explain_indexed(
 
     if json {
         let output = ExplainOutput {
+            publisher_activity: None,
             target_event: target.clone(),
             window_minutes: window_mins,
             process_key: process_key.map(|s| s.to_string()),
@@ -3932,7 +3988,7 @@ fn run_bundle_indexed(
     let process_key = target
         .process_context
         .as_ref()
-        .filter(|_| !crate::collectors::etw_normalize::is_powershell_script(&target))
+        .filter(|_| !crate::collectors::etw_metadata::requires_explicit_identity(&target))
         .map(|c| c.process_key.clone());
 
     let mut related = if let Some(ref key) = process_key {
@@ -3950,6 +4006,7 @@ fn run_bundle_indexed(
     } else {
         vec![]
     };
+    related.retain(|event| !crate::collectors::etw_metadata::requires_explicit_identity(event));
     related.sort_by_key(|e| e.timestamp);
 
     let bundle = EvidenceBundle {
@@ -4357,13 +4414,15 @@ fn build_script_activity(
         return fragments;
     }
 
+    if crate::collectors::etw_metadata::has_extended_metadata(target) { return vec![]; }
+
     let mut result: Vec<ThreatEvent> = events
         .iter()
         .filter(|e| {
             if !is_script_or_amsi(&e.data) {
                 return false;
             }
-            if crate::collectors::etw_normalize::is_powershell_script(e) {
+            if crate::collectors::etw_metadata::requires_explicit_identity(e) {
                 return false;
             }
             if e.timestamp < t_start || e.timestamp > t_end {
@@ -6080,6 +6139,7 @@ mod tests {
         let target = find_event(&all, &events[1].id.to_string()).unwrap();
 
         let output = ExplainOutput {
+            publisher_activity: None,
             target_event: target.clone(),
             window_minutes: 5,
             process_key: target

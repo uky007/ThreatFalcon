@@ -13,3 +13,6 @@
 /configs/powershell.state
 /configs/powershell-events.jsonl
 /configs/powershell-events.jsonl.*
+/configs/etw-context.state
+/configs/etw-context-events.jsonl
+/configs/etw-context-events.jsonl.*

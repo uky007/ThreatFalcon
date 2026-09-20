@@ -10,6 +10,13 @@ use std::path::Path;
 
 #[derive(Default, Serialize)]
 pub struct Coverage {
+    pub etw_saved_provider_events: BTreeMap<String, u64>,
+    pub etw_coverage_unverified: bool,
+    pub etw_extended_events: u64,
+    pub etw_publisher_identity_events: u64,
+    pub etw_stack_events: u64,
+    pub etw_saved_stack_frames: u64,
+    pub etw_metadata_issue_events: u64,
     pub events: u64,
     pub source_time_events: u64,
     pub stable_process_guid_events: u64,
@@ -80,6 +87,42 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         );
         let coverage = agents.entry(event.agent_id).or_default();
         coverage.events += 1;
+        if matches!(event.source, EventSource::Etw { .. }) {
+            coverage.etw_coverage_unverified = true;
+            if let Some(p) = &event.provenance {
+                // Only UUID-shaped keys enter this bounded per-provider map.
+                if let Ok(guid) = uuid::Uuid::parse_str(&p.provider_guid) {
+                    let key = guid.to_string();
+                    if coverage.etw_saved_provider_events.len() < 64
+                        || coverage.etw_saved_provider_events.contains_key(&key)
+                    {
+                        *coverage.etw_saved_provider_events.entry(key).or_default() += 1;
+                    }
+                }
+                if let Some(metadata) = &p.etw_extended {
+                    coverage.etw_extended_events += 1;
+                    coverage.etw_publisher_identity_events += u64::from(
+                        crate::collectors::etw_metadata::publisher_identity(&event).is_some(),
+                    );
+                    coverage.etw_stack_events += u64::from(!metadata.stacks.is_empty());
+                    coverage.etw_saved_stack_frames += metadata
+                        .stacks
+                        .iter()
+                        .map(|s| s.addresses.len() as u64)
+                        .sum::<u64>();
+                    coverage.etw_metadata_issue_events += u64::from(!metadata.issues.is_empty());
+                    coverage.recorded_loss_or_degradation |= !metadata.issues.is_empty();
+                    for issue in &metadata.issues {
+                        let code: String = issue.chars().take(80).collect();
+                        if coverage.quality_issues.len() < 128
+                            || coverage.quality_issues.contains_key(&code)
+                        {
+                            *coverage.quality_issues.entry(code).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(p) = &event.provenance {
             coverage.source_time_events += u64::from(p.original_time);
             coverage.stable_process_guid_events += u64::from(p.process_guid.is_some());
@@ -187,12 +230,19 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         } = &event.data
         {
             coverage.health_records += 1;
+            coverage.etw_coverage_unverified |= collectors.iter().any(|c| c.name == "ETW");
             coverage.wfp_audit_coverage_unknown |= collectors.iter().any(|c| c.wfp_audit.is_some());
             coverage.recorded_loss_or_degradation |= *events_dropped > 0
                 || collectors.iter().any(|c| {
                     c.decode_failures > 0
                         || c.events_lost_before_queue > 0
                         || c.queue_events_dropped > 0
+                        || c.providers.iter().any(|p| {
+                            !p.enabled
+                                || p.telemetry.as_ref().is_some_and(|t| {
+                                    t.metadata_issue_events > 0 || t.queue_dropped > 0
+                                })
+                        })
                         || c.linux_audit
                             .as_ref()
                             .is_some_and(|s| s.quality_uncertain())
@@ -253,6 +303,21 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
             "wfp_audit_pid_is_not_process_lifetime_identity",
             "wfp_audit_live_only_no_outage_replay_or_exact_source_loss_count",
             "wfp_audit_detection_rules_not_implemented",
+        ]);
+    }
+    if agents.values().any(|c| c.etw_extended_events > 0) {
+        limitations.extend([
+            "etw_publisher_identity_is_not_payload_actor_identity",
+            "etw_capture_id_is_not_boot_id_no_cross_capture_identity_join",
+            "etw_stacks_are_addresses_not_symbols_or_complete_execution_proof",
+            "etw_stack_parts_not_reassembled_or_memory_classified",
+            "etw_saved_counts_describe_input_not_all_generated_events",
+        ]);
+    }
+    if agents.values().any(|c| c.etw_coverage_unverified) {
+        limitations.extend([
+            "etw_provider_enabled_or_zero_events_does_not_verify_coverage",
+            "etw_queue_admission_is_not_durable_save_acknowledgement",
         ]);
     }
     if agents.values().any(|c| {
@@ -326,6 +391,22 @@ pub fn run(path: &Path, lang: Language, json: bool) -> Result<()> {
     for (agent, c) in &report.agents {
         writeln!(out,"agent={agent} events={} source_time={} process_guid={} native_only={} recorded_loss={}",
             c.events,c.source_time_events,c.stable_process_guid_events,c.native_only_events,c.recorded_loss_or_degradation)?;
+        if c.etw_extended_events > 0 {
+            writeln!(
+                out,
+                "{}: {} / {} / {} / {} / {}",
+                if ja {
+                    "ETW拡張情報 / 発行元識別 / スタック付き / 保存フレーム / 品質問題あり（対象プロセス・完全な実行経路の証明ではありません）"
+                } else {
+                    "ETW extended / publisher identities / stack events / saved frames / metadata issues (not actor identity or complete execution proof)"
+                },
+                c.etw_extended_events,
+                c.etw_publisher_identity_events,
+                c.etw_stack_events,
+                c.etw_saved_stack_frames,
+                c.etw_metadata_issue_events
+            )?;
+        }
         if c.powershell_4104_events > 0
             || c.script_single_part_events > 0
             || c.script_multipart_events > 0

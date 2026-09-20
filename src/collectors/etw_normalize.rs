@@ -221,7 +221,15 @@ pub fn is_powershell_script(event: &ThreatEvent) -> bool {
 }
 
 /// A script ID groups a logged script's fragments, not an entire process lifetime.
-pub fn script_identity(event: &ThreatEvent) -> Option<(uuid::Uuid, String, u32, uuid::Uuid)> {
+pub fn script_identity(
+    event: &ThreatEvent,
+) -> Option<(
+    uuid::Uuid,
+    String,
+    u32,
+    uuid::Uuid,
+    Option<super::etw_metadata::PublisherIdentity>,
+)> {
     if !is_powershell_script(event) || event.agent_id.is_nil() {
         return None;
     }
@@ -241,7 +249,16 @@ pub fn script_identity(event: &ThreatEvent) -> Option<(uuid::Uuid, String, u32, 
     if *pid == 0 || *pid == u32::MAX || event.data.script_fragment_position().is_none() {
         return None;
     }
-    Some((event.agent_id, p.provider_guid.clone(), *pid, id))
+    let publisher = if p.etw_extended.is_some() {
+        let identity = super::etw_metadata::publisher_identity(event)?;
+        if identity.pid != *pid {
+            return None;
+        }
+        Some(identity)
+    } else {
+        None
+    };
+    Some((event.agent_id, p.provider_guid.clone(), *pid, id, publisher))
 }
 
 fn script_fragment(p: &EventProvenance, pid: u32) -> Result<EventData, &'static str> {
