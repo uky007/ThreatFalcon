@@ -30,7 +30,9 @@ ThreatFalcon is early-stage software.
 New: opt-in [Linux Audit multicast collector](docs/LINUX_SENSOR.md), with bounded
 multi-record assembly, argument/proctitle exclusion and Japanese/English loss diagnostics.
 Linux向けの読み取り専用収集基盤を追加しました。監査ルールは自動変更せず、既存auditdと
-共存する設計です。実Linuxでの収集検証とLinux専用の脅威検知ルールは未完了です。
+共存する設計です。[Linux実機検証](docs/LINUX_VALIDATION_2026-09-21.md)で通常テスト642件と、
+69件の既知操作の実収集・JSONL保存・検索照合、正常停止・再起動時の識別子、基本的なauditd共存を確認しました。
+包括的な収集品質・負荷検証とLinux専用の脅威検知ルールは未完了です。
 
 New: opt-in [native macOS Endpoint Security collector](docs/MACOS_SENSOR.md), with
 process/file events, audit-token identity, signing metadata and loss diagnostics.

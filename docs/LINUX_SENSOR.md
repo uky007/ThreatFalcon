@@ -6,8 +6,9 @@ Experimental, opt-in collector on `feat/linux-audit-sensor`, based on
 `feat/macos-endpoint-security`. Windows/macOS work is preserved. These branches
 are not merged with the independently advanced `origin/main`.
 
-Linux向けの初期収集基盤であり、完成したEDRではありません。Linux専用の脅威検知ルール、
-eBPFによる補完、実機での収集品質・負荷・検知精度の検証は未完了です。保存・検索・解析
+Linux向けの初期収集基盤であり、完成したEDRではありません。実機で無害な単発execの
+受信・組み立て・停止と基本的なauditd共存を確認済みです。Linux専用の脅威検知ルール、
+eBPFによる補完、実機での包括的な収集品質・負荷・検知精度の検証は未完了です。保存・検索・解析
 できることと、高度な脅威を検知できることは別です。
 
 ## Native source / 収集方式
@@ -143,8 +144,9 @@ checkout as a persistent root service. Keep telemetry, state, rotation and HTTP
 spool paths outside audited file watches: automatic self-process audit exclusion
 is not implemented and self-IO can amplify collection load.
 
-After collection, these commands inspect the output without creating an index
-(`query` otherwise attempts automatic indexing):
+After collection, these commands inspect the output without using an index.
+`query` reuses and updates an existing index, but does not create one automatically;
+run `threatfalcon index --input linux-events.jsonl` first when an index is desired:
 
 ```sh
 threatfalcon health --input linux-events.jsonl --lang ja
@@ -156,6 +158,29 @@ threatfalcon query --input linux-events.jsonl --source linuxaudit --no-index
 イベントの送信待ちであり、未収集のカーネルイベントの復旧ではありません。
 
 ## Validation and remaining gates / 検証と残る受入条件
+
+Update (2026-09-21): [physical Linux validation record](LINUX_VALIDATION_2026-09-21.md).
+Commit `d3f4af9` built natively on Kali x86_64 with Rust 1.93.0 and warnings denied:
+642 ordinary tests passed. An explicit unprivileged probe observed `EPERM`, and
+an actual denied sensor start returned exit code 2 with persisted bilingual-readable
+error health. After administrator preparation, the permitted subscription probe
+and `/bin/true` live exec smoke test passed, including EOE assembly, boot/session
+identity presence and clean stop. The auditd owner PID remained unchanged,
+kernel lost counters were zero at both snapshots, and temporary rule/capability
+cleanup succeeded. This initial smoke test was followed by bounded live capture
+of 69 known operations across two sensor runs: all matched the saved native
+evidence, with 79 Linux events and eight health records saved. Full-scan and
+indexed queries agreed; PID queries, `explain`, and bilingual health/analysis passed.
+The initial E2E run stopped at a harness error (the index had not been created).
+After correcting the harness to create it explicitly, offline readback completed
+against the unchanged original capture and binary, without sudo or another live run.
+Agent identity stayed stable, capture sessions differed, and both stops were clean.
+These are bounded functional checks, not losslessness, sustained-load or
+detection-quality validation.
+An additional 4,096-event synthetic output/checkpoint workload passed. Loopback
+HTTPS tests passed for process-local CA trust, rejection of an untrusted CA and
+an incorrect certificate address, and replay of two queued health records.
+See the validation record for exact scope and [reproduction scripts](../scripts/linux-validation/README.md).
 
 Validation record (2026-09-13): 596 ordinary tests passed on the development Mac
 (440 unit, 4 analysis CLI, 142 general CLI, 10 health CLI; 4 opt-in tests excluded).
@@ -170,12 +195,15 @@ compiled but **not run**. HTTPS/native CA integration on Linux remains untested.
 CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc RUSTFLAGS=-Dwarnings cargo test --locked --target x86_64-unknown-linux-musl --no-run
 ```
 
-The development Mac has no running Linux VM/Docker daemon. Portable synthetic
-tests and Linux cross-builds are **not native Linux execution**. No malware or
-attack code was executed. Native gates remain:
+At the 2026-09-13 baseline, native validation was unavailable. Subsequent Docker
+regression checks and the 2026-09-21 physical-host checks above are separate
+results. The physical-host session additionally verified bounded benign
+exec/file/same-UID credential/socket operations alongside auditd as described above.
+No malware or attack code was executed.
+Native gates remain:
 
-- Permitted/denied startup, auditd coexistence, controlled exec/file/credential/
-  socket events, clean shutdown and boot identity.
+- Broader controlled exec/file/credential/socket coverage, failure/restart
+  scenarios beyond two clean stops and sustained auditd coexistence.
 - Buffer pressure, kernel backlog loss, slow output, sustained multi-core load
   and administrator-selected policy coverage.
 - Distro/kernel/architecture matrix and namespace boundaries; no container claims.

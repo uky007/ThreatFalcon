@@ -1,4 +1,6 @@
 /target
+/scripts/linux-validation/workload
+/scripts/linux-validation/logs/
 
 # Local output from the opt-in macOS example profile is not source evidence.
 /configs/macos.state
