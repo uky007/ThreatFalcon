@@ -3055,13 +3055,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
     let is_stdin = input.as_os_str() == "-";
 
     // File identity for rotation detection (file mode only).
-    let mut file_id = FileIdentity {
-        #[cfg(unix)]
-        dev: 0,
-        #[cfg(unix)]
-        ino: 0,
-        size: 0,
-    };
+    let mut file_id = FileIdentity::default();
 
     // Build reader: stdin (stream mode) or file (follow mode).
     let mut reader: Box<dyn BufRead> = if is_stdin {
@@ -3710,46 +3704,44 @@ fn tail_file_rotated(
     path: &Path,
     reader: &std::io::BufReader<std::fs::File>,
 ) -> bool {
-    let path_meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false, // path gone temporarily during rotation
-    };
-    let handle_meta = match reader.get_ref().metadata() {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    // On Unix, compare device + inode to detect file replacement.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if handle_meta.dev() != path_meta.dev() || handle_meta.ino() != path_meta.ino() {
-            return true;
-        }
-    }
-
-    // Fallback (non-Unix): if the path's file is smaller than our handle's
-    // current size, assume rotation. Not perfect but covers truncation.
-    #[cfg(not(unix))]
-    {
-        if path_meta.len() < handle_meta.len() {
-            return true;
-        }
-    }
-
-    false
+    file_path_rotated(path, &file_identity(reader.get_ref()))
 }
 
 /// Snapshot of file identity for rotation detection.
-#[allow(dead_code)] // `size` used only on non-unix
+#[derive(Default)]
 struct FileIdentity {
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
     ino: u64,
+    #[cfg(windows)]
+    windows_id: Option<(u64, [u8; 16])>,
     /// File size at open — used as non-Unix fallback (if the path's file
     /// is smaller than this, we assume truncation/rotation).
+    #[cfg(not(unix))]
     size: u64,
+}
+
+/// Compare the volume and full 128-bit file ID, not size or timestamps. The
+/// latter cannot distinguish a same-size (or larger) replacement file.
+#[cfg(windows)]
+fn windows_file_id(file: &std::fs::File) -> Option<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO},
+    };
+    let mut info = FILE_ID_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .ok()?;
+    Some((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
 /// Capture identity of an open file.
@@ -3766,35 +3758,47 @@ fn file_identity(file: &std::fs::File) -> FileIdentity {
             use std::os::unix::fs::MetadataExt;
             m.ino()
         }).unwrap_or(0),
+        #[cfg(windows)]
+        windows_id: windows_file_id(file),
+        #[cfg(not(unix))]
         size: meta.map(|m| m.len()).unwrap_or(0),
     }
 }
 
 /// Check if the file at `path` has been rotated relative to `original`.
 fn file_path_rotated(path: &Path, original: &FileIdentity) -> bool {
-    let path_meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if path_meta.dev() != original.dev || path_meta.ino() != original.ino {
-            return true;
+        let current = match std::fs::File::open(path) {
+            Ok(file) => file_identity(&file),
+            Err(_) => return false, // path may be absent briefly during rotation
+        };
+        if let (Some(before), Some(after)) = (original.windows_id, current.windows_id) {
+            if before != after {
+                return true;
+            }
         }
+        // Retain the size fallback if the filesystem cannot provide file IDs.
+        current.size < original.size
     }
 
-    // Non-Unix fallback: if the path's file is smaller than our original,
-    // assume rotation (covers truncation).
-    #[cfg(not(unix))]
+    #[cfg(not(windows))]
     {
-        if path_meta.len() < original.size {
-            return true;
+        let path_meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            path_meta.dev() != original.dev || path_meta.ino() != original.ino
+        }
+        #[cfg(not(unix))]
+        {
+            path_meta.len() < original.size
         }
     }
-
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -4490,6 +4494,72 @@ mod tests {
     use crate::events::*;
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    #[cfg(any(unix, windows))]
+    fn assert_replacement_detected(replacement: &[u8]) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rotation.log");
+        std::fs::write(&path, b"old\n").unwrap();
+        let reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let original = file_identity(reader.get_ref());
+        #[cfg(windows)]
+        assert!(original.windows_id.is_some(), "test filesystem must provide file IDs");
+        assert!(!tail_file_rotated(&path, &reader));
+        assert!(!file_path_rotated(&path, &original));
+
+        std::fs::rename(&path, dir.path().join("rotation.log.1")).unwrap();
+        // A temporarily absent path is retried, not treated as a new file.
+        assert!(!tail_file_rotated(&path, &reader));
+        assert!(!file_path_rotated(&path, &original));
+        std::fs::write(&path, replacement).unwrap();
+        assert!(tail_file_rotated(&path, &reader));
+        assert!(file_path_rotated(&path, &original));
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn rotation_detects_same_size_replacement() {
+        assert_replacement_detected(b"new\n");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn rotation_detects_larger_replacement() {
+        assert_replacement_detected(b"new\nmore\n");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn rotation_detects_empty_replacement() {
+        assert_replacement_detected(b"");
+    }
+
+    #[test]
+    fn rotation_ignores_append_to_same_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rotation.log");
+        std::fs::write(&path, b"old\n").unwrap();
+        let reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let original = file_identity(reader.get_ref());
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(b"appended\n").unwrap();
+        writer.flush().unwrap();
+        assert!(!tail_file_rotated(&path, &reader));
+        assert!(!file_path_rotated(&path, &original));
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn rotation_ignores_same_file_via_hard_link() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rotation.log");
+        let link = dir.path().join("same.log");
+        std::fs::write(&path, b"old\n").unwrap();
+        std::fs::hard_link(&path, &link).unwrap();
+        let reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        assert!(!tail_file_rotated(&link, &reader));
+        assert!(!file_path_rotated(&link, &file_identity(reader.get_ref())));
+    }
 
     fn test_agent() -> AgentInfo {
         AgentInfo {

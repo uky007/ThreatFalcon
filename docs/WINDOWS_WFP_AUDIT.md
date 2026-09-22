@@ -1,9 +1,11 @@
 # Windows WFP audit sensor / Windows WFP監査センサ
 
-Status: experimental, opt-in, read-only. Native Windows collection is **not yet validated**.
+Status: experimental, opt-in, read-only. Bounded native Windows 11 validation passed;
+see [2026-09-22 results and limits](WINDOWS_VALIDATION_2026-09-22.md). Broad coverage and production readiness remain unverified.
 This adds telemetry, not a detection rule, firewall, WFP callout driver, or commercial EDR equivalent.
 
-状態：実験的・明示的有効化・読み取り専用。実Windowsでの収集は**未検証**です。
+状態：実験的・明示的有効化・読み取り専用。Windows 11 VMで許可・遮断の短時間実収集を確認済みです。
+収集範囲の網羅性と本番運用品質は未検証です。
 検知ルール、ファイアウォール、独自WFPドライバ、市販EDRと同等の機能を追加するものではありません。
 
 ## Research boundary / 調査の扱い
@@ -36,15 +38,19 @@ Windowsの接続許可・遮断の監査記録を収集します。Securityロ�
 
 - `WindowsSecurity { event_id }` / `WfpConnectionAudit` is distinct from `NetworkConnect` and Sysmon.
   Native event time, provider identity, schema version and record ID accompany the observation time.
-- The actor PID comes from `EventData.ProcessID`. `System.Execution.ProcessID` is retained separately
+- The actor PID comes from `EventData.ProcessID` or the 5156 v1 spelling `EventData.ProcessId`.
+  Both names occurring together are ambiguous and leave the actor PID absent with a quality issue.
+  `System.Execution.ProcessID` is retained separately
   as publisher metadata; it is never used as the actor. Decimal and explicitly prefixed hexadecimal
   PIDs are accepted. Missing/invalid values stay absent, with quality issues; no default PID/port 0.
 - PID alone cannot identify a process lifetime. No PID-only ETW/Sysmon process-cache join is made.
   Filtered record-ID gaps are not missing-event counts, and record IDs are not global stable IDs.
 - Application device paths and source/destination labels remain native, without current-filesystem
   lookups or local/remote swaps. Direction and layer names remain unlocalized tokens, not guessed enums.
-- Documented core fields in versions 0/1 are normalized. Later versions preserve allowlisted evidence
-  and report an unsupported-version issue without guessing typed fields.
+- Core fields in 5156 versions 0–2 and 5157 versions 0–4 are normalized. Their names and types were
+  checked against the installed Microsoft provider templates on Windows 11 build 26200.9457;
+  live samples used 5156 v1 and 5157 v3. Other versions preserve allowlisted evidence and report
+  an unsupported-version issue without guessing typed fields.
 - Only the fields enumerated in `src/collectors/wfp_audit/parser.rs` are retained. Remote user/machine
   identifier values and unknown EventData values are omitted; their field names remain auditable.
   Paths, hostnames, PIDs and addresses are still sensitive: restrict file access, retention and exports.
@@ -93,8 +99,10 @@ threatfalcon health --input configs/wfp-audit-events.jsonl --lang ja
 
 ## Collection quality / 収集品質と限界
 
-- Future-only strict subscription, one owned blocking worker, native batches of 16 handles, polling
-  waits bounded to 100ms. All event/subscription/signal handles have scoped cleanup; no FFI callback.
+- Future-only strict subscription, one owned blocking worker, native batches of 16 handles.
+  After draining a batch, notification waits check shutdown every 100ms; a wait timeout does not
+  trigger another read of the exhausted subscription. All event/subscription/signal handles have
+  scoped cleanup; no FFI callback.
 - Render allocation is capped at 131074 bytes of UTF-16 storage. Parsed XML is capped at 64 KiB,
   individual values at 4 KiB, EventData fields at 64. Invalid namespaces, duplicate fields/sections,
   DTDs, processing instructions, unsupported entities and nested scalar markup are rejected.
@@ -158,6 +166,11 @@ The example profile passed config validation. These results do not include nativ
 Windows-specific native code is cross-buildable, but cross-compilation is not a runtime test.
 The ignored `native_subscription_probe` opens and closes the local subscription without policy changes;
 it tests permissions/lifecycle only and cannot prove coverage.
+
+The [2026-09-22 native validation](WINDOWS_VALIDATION_2026-09-22.md) additionally checked
+idle waits, actual permitted/blocked IPv4 records, original Security-log evidence,
+normal stop and policy restoration in two bounded runs. It does not complete the
+broader validation gates below.
 
 Before claiming live support, validate on an authorized Windows x64 VM and retain redacted evidence:
 

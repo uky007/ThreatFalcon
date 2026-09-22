@@ -2,6 +2,8 @@ pub mod etw;
 pub mod etw_metadata;
 pub mod etw_normalize;
 #[cfg(target_os = "windows")]
+mod eventlog;
+#[cfg(target_os = "windows")]
 mod tdh;
 pub mod evasion;
 pub mod health;

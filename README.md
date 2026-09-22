@@ -7,9 +7,10 @@ ThreatFalcon is an experimental Windows/macOS/Linux endpoint telemetry sensor wr
 
 New: opt-in [Windows ETW context](docs/WINDOWS_ETW_CONTEXT.md): publisher start keys,
 bounded 32/64-bit stack evidence, capture-scoped publisher inspection, and per-provider health.
-Native Windows validation, symbol/module enrichment and actor correlation remain pending.
+[Bounded Windows VM validation](docs/WINDOWS_VALIDATION_2026-09-22.md) passed for an owned publisher;
+symbol/module enrichment and actor correlation remain pending.
 ETW拡張情報・発行元識別・スタック証拠と日英の収集品質表示を追加しました。
-実Windows検証・シンボル解決・操作対象との相関は未完了です。
+所有する発行元での限定実機検証は通過しました。シンボル解決・操作対象との相関は未完了です。
 
 New: [Windows PowerShell / PowerShell Core script telemetry](docs/WINDOWS_POWERSHELL.md)
 preserves fragment positions and avoids native script PID-only process/AMSI joins in `explain`.
@@ -17,7 +18,8 @@ PowerShell 7向けの明示的な収集設定と、分割ログの保存・品�
 実Windows収集・断片の再構成・新規の検知ルールは今回の完了範囲に含みません。
 
 New: opt-in [Windows WFP authorization audit reader](docs/WINDOWS_WFP_AUDIT.md) for Security events
-5156/5157, with bounded parsing and JA/EN diagnostics. Native Windows collection remains unvalidated.
+5156/5157, with bounded parsing and JA/EN diagnostics. Bounded permitted/blocked native collection
+passed on Windows 11; comprehensive coverage and production readiness remain unverified.
 Windowsの接続許可・遮断の監査収集を追加しました。通信成立や脅威判定を示すものではなく、
 独自WFPドライバではありません。監査設定は自動変更しません。
 
@@ -43,10 +45,10 @@ New: evidence-preserving schema v2, TDH-based ETW decoding, GUID-safe Sysmon cor
 and `analyze --lang ja|en`. See [detection implementation and validation](docs/DETECTION_VALIDATION.md)
 for the implemented rules, controlled Windows profile, XML import, and remaining acceptance gates.
 The new correlations currently require Sysmon; ETW-only mode does not supply their evidence.
-実用的な高度脅威検知を目指す実装ですが、実Windowsでの収集品質・実攻撃の検知精度はまだ実証していません。
+実用的な高度脅威検知を目指す実装です。Windows VMでの限定的な収集検証は通過しましたが、実脅威の検知精度・本番運用での収集品質は未実証です。
 
-Opt-in [Windows/Sysmon restart recovery](docs/WINDOWS_RECOVERY.md) synchronizes source events/findings to local output before committing source progress **and incremental correlation state together**. Native Windows validation is pending; replay duplicates, source retention and bounded evidence windows remain explicit limitations.
-Windows/Sysmon向けに、ファイル保存確認後に再開位置と相関状態を一緒に確定する実験的な復旧機構を追加しました。実機検証は未実施で、重複再読込・元ログの保持・相関時間窓の制約があります。
+Opt-in [Windows/Sysmon restart recovery](docs/WINDOWS_RECOVERY.md) synchronizes source events/findings to local output before committing source progress **and incremental correlation state together**. A bounded native unacknowledged-record replay check passed; replay duplicates, source retention and bounded evidence windows remain explicit limitations.
+Windows/Sysmon向けに、ファイル保存確認後に再開位置と相関状態を一緒に確定する実験的な復旧機構を追加しました。未確定イベントの再取得を実機で確認しましたが、重複再読込・元ログの保持・相関時間窓の制約があります。
 
 - Windows is the primary target platform
 - ETW collection is implemented
@@ -98,7 +100,7 @@ It currently collects from:
 
 - ETW
 - Sysmon
-- Windows Security WFP authorization audit (5156/5157, explicitly opt-in; native validation pending)
+- Windows Security WFP authorization audit (5156/5157, explicitly opt-in; bounded native validation passed)
 - an in-process evasion-oriented signal collector
 - macOS Endpoint Security (native NOTIFY-only, explicitly opt-in; see scope above)
 - Linux Audit (read-only multicast, explicitly opt-in; requires administrator-managed audit rules)

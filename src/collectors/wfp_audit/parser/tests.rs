@@ -81,6 +81,90 @@ fn blocked_v0_ipv6_and_explicit_hex_pid_are_supported_without_threat_verdict() {
 }
 
 #[test]
+fn provider_template_versions_and_pid_spellings_preserve_actor_identity() {
+    for (id, last_version) in [(5156, 2), (5157, 4)] {
+        for version in 0..=last_version {
+            let mut xml = sample()
+                .replace("<EventID>5156", &format!("<EventID>{id}"))
+                .replace("<Version>1", &format!("<Version>{version}"));
+            let pid_name = if (id, version) == (5156, 1) {
+                xml = xml.replace("Name=\"ProcessID\"", "Name=\"ProcessId\"");
+                "ProcessId"
+            } else {
+                "ProcessID"
+            };
+            // Modern templates add profile/filter fields. Retain their names,
+            // not their potentially private values, under the existing policy.
+            xml = xml.replace(
+                "</EventData>",
+                concat!(
+                    "<Data Name=\"InterfaceIndex\">6</Data>",
+                    "<Data Name=\"FilterOrigin\">SECRET-FILTER</Data>",
+                    "<Data Name=\"OriginalProfile\">%%14644</Data>",
+                    "<Data Name=\"CurrentProfile\">%%14644</Data>",
+                    "<Data Name=\"IsLoopback\">%%1826</Data>",
+                    "<Data Name=\"HasRemoteDynamicKeywordAddress\">%%1826</Data>",
+                    "</EventData>"
+                ),
+            );
+            let event = parse(&xml, &agent()).unwrap();
+            assert_eq!(payload(&event).pid, Some(4242), "{id} v{version}");
+            assert_eq!(payload(&event).destination_port, Some(443));
+            assert_eq!(
+                payload(&event).decision,
+                if id == 5156 {
+                    WfpDecision::Permitted
+                } else {
+                    WfpDecision::Blocked
+                }
+            );
+            let p = event.provenance.as_ref().unwrap();
+            assert!(p.issues.is_empty(), "{id} v{version}: {:?}", p.issues);
+            assert_eq!(p.fields[pid_name], "4242");
+            assert_eq!(p.fields["System.Execution.ProcessID"], "4");
+            assert!(!payload(&event)
+                .omitted_fields
+                .iter()
+                .any(|name| name == pid_name));
+            assert!(!serde_json::to_string(&event).unwrap().contains("SECRET"));
+        }
+    }
+}
+
+#[test]
+fn ambiguous_pid_aliases_are_not_resolved_by_precedence() {
+    for alternate in ["4242", "99", "invalid"] {
+        let xml = sample().replace(
+            "</EventData>",
+            &format!("<Data Name=\"ProcessId\">{alternate}</Data></EventData>"),
+        );
+        let event = parse(&xml, &agent()).unwrap();
+        assert!(payload(&event).pid.is_none());
+        assert!(event
+            .provenance
+            .unwrap()
+            .issues
+            .contains(&"wfp_ambiguous_process_id".into()));
+    }
+}
+
+#[test]
+fn alternate_pid_spelling_keeps_numeric_validation_and_no_publisher_fallback() {
+    for pid in ["-1", "4294967296", "invalid"] {
+        let xml = sample()
+            .replace("Name=\"ProcessID\"", "Name=\"ProcessId\"")
+            .replace(">4242<", &format!(">{pid}<"));
+        let event = parse(&xml, &agent()).unwrap();
+        assert!(payload(&event).pid.is_none());
+        assert!(!event.provenance.unwrap().issues.is_empty());
+    }
+    let xml = sample()
+        .replace("Name=\"ProcessID\"", "Name=\"ProcessId\"")
+        .replace(">4242<", ">0x1092<");
+    assert_eq!(payload(&parse(&xml, &agent()).unwrap()).pid, Some(4242));
+}
+
+#[test]
 fn invalid_numbers_never_become_zero_or_publisher_pid() {
     for invalid in [
         "",
@@ -134,7 +218,7 @@ fn missing_or_invalid_fields_are_explicit_and_unknown_direction_is_not_guessed()
 fn future_version_preserves_allowlisted_evidence_without_guessing_typed_fields() {
     let event = parse(
         &sample()
-            .replace("<Version>1", "<Version>2")
+            .replace("<Version>1", "<Version>9")
             .replace("<Opcode>0", "<Opcode>7"),
         &agent(),
     )
@@ -151,6 +235,21 @@ fn future_version_preserves_allowlisted_evidence_without_guessing_typed_fields()
         event.provenance.unwrap().issues,
         ["wfp_unsupported_event_version"]
     );
+}
+
+#[test]
+fn version_support_is_specific_to_the_event_id() {
+    for (id, version) in [(5156, 3), (5157, 5)] {
+        let xml = sample()
+            .replace("<EventID>5156", &format!("<EventID>{id}"))
+            .replace("<Version>1", &format!("<Version>{version}"));
+        let event = parse(&xml, &agent()).unwrap();
+        assert!(payload(&event).pid.is_none());
+        assert_eq!(
+            event.provenance.unwrap().issues,
+            ["wfp_unsupported_event_version"]
+        );
+    }
 }
 
 #[test]

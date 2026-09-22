@@ -284,8 +284,8 @@ mod platform {
         path: &std::path::Path,
     ) -> Result<()> {
         use anyhow::Context;
-        use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_TIMEOUT, WAIT_FAILED};
-        use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+        use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_TIMEOUT};
+        use windows::Win32::System::Threading::CreateEventW;
         let mut store = crate::checkpoint::Checkpoint::open(path, agent.agent_id)?;
         let saved = store.load()?;
         let analysis = store.load_analysis()?;
@@ -329,15 +329,14 @@ mod platform {
                 .map(|h| EventHandle(EVT_HANDLE(h)))
                 .collect();
             if let Err(e) = next {
-                if e.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0)
-                    || e.code() == windows::core::HRESULT::from_win32(ERROR_TIMEOUT.0)
+                if events.is_empty()
+                    && (e.code() == windows::core::HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0)
+                        || e.code() == windows::core::HRESULT::from_win32(ERROR_TIMEOUT.0))
                 {
-                    unsafe {
-                        ResetEvent(signal.0)?;
-                        if WaitForSingleObject(signal.0, 100) == WAIT_FAILED {
-                            return Err(windows::core::Error::from_win32())
-                                .context("waiting for Sysmon signal failed");
-                        }
+                    if !crate::collectors::eventlog::wait_for_events(signal.0, stop)
+                        .context("waiting for Sysmon signal failed")?
+                    {
+                        return Ok(());
                     }
                     continue;
                 }
@@ -619,6 +618,11 @@ mod platform {
             let mut cache = crate::process_cache::ProcessCache::new(100);
             let mut detector = crate::detection::Detector::default();
             let interrupted = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                anyhow::ensure!(
+                    first.status().unwrap().state == CollectorState::Running,
+                    "Sysmon pull subscription failed while idle"
+                );
                 let pid = benign_child()?;
                 while let Some(event) = rx.recv().await {
                     if is_child(&event, pid) {
@@ -671,9 +675,15 @@ mod platform {
                 anyhow::bail!("unacknowledged source record was not replayed");
             })
             .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let live = second.status().unwrap();
             second.stop().await?;
             drop(rx);
             replay.context("resume/replay timed out")??;
+            anyhow::ensure!(
+                live.state == CollectorState::Running,
+                "Sysmon pull subscription failed after draining replay: {live:?}"
+            );
             anyhow::ensure!(
                 detector.stats.state_restored,
                 "persisted analysis was not restored"

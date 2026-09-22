@@ -14,6 +14,7 @@ fn retained(key: &str) -> bool {
     matches!(
         key,
         "ProcessID"
+            | "ProcessId"
             | "Application"
             | "Direction"
             | "SourceAddress"
@@ -256,16 +257,24 @@ pub fn parse(xml: &str, agent: &AgentInfo) -> Result<ThreatEvent> {
         layer_runtime_id: None,
         omitted_fields: omitted,
     };
-    // Microsoft examples show v1 while their text lists v0. Both use the
-    // documented core fields. Future versions retain evidence but aren't guessed.
-    if version <= 1 {
-        record.pid = number(get("ProcessID"), "ProcessID", &mut issues).and_then(|v| {
-            match u32::try_from(v) {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    issues.push("wfp_invalid_ProcessID".into());
-                    None
-                }
+    // Core field names/types checked against the Security-Auditing provider
+    // templates on Windows 11 build 26200.9457: 5156 v0..2 and 5157 v0..4.
+    // In particular, live 5156 v1 uses ProcessId, while 5157 v3 uses ProcessID.
+    // Additional profile/filter fields remain omitted. Unrecognized versions
+    // retain allowlisted evidence but are not assigned guessed typed fields.
+    if matches!((event_id, version), (5156, 0..=2) | (5157, 0..=4)) {
+        let pid = match (get("ProcessID"), get("ProcessId")) {
+            (Some(_), Some(_)) => {
+                issues.push("wfp_ambiguous_process_id".into());
+                None
+            }
+            (legacy, alternate) => number(legacy.or(alternate), "ProcessID", &mut issues),
+        };
+        record.pid = pid.and_then(|v| match u32::try_from(v) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                issues.push("wfp_invalid_ProcessID".into());
+                None
             }
         });
         record.application = get("Application")

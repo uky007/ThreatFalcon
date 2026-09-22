@@ -4,6 +4,10 @@ Experimental implementation. Portable failure-injection tests and Windows-target
 
 実装・検証途上です。可搬テストとWindows向け型チェックだけでは実機動作を実証できません。完全無損失、重複なし、耐改ざん性、停電耐性、高度脅威の網羅を保証するものではありません。
 
+The [2026-09-22 Windows VM validation](WINDOWS_VALIDATION_2026-09-22.md) passed the
+bounded native Sysmon push and unacknowledged-record replay checks after correcting
+idle pull waits. This does not replace the fault/load/retention testing described below.
+
 ## Source and output contract / 元ログと出力の契約
 
 With `collectors.sysmon.checkpoint_path` set and Sysmon enabled:
@@ -11,6 +15,9 @@ With `collectors.sysmon.checkpoint_path` set and Sysmon enabled:
 1. A single worker opens an agent-bound SQLite checkpoint under an exclusive lock. A different agent, unsupported checkpoint format, missing row or corrupt payload is an error, not a reason to reset progress.
 2. An absent initial bookmark starts at the oldest **retained** Sysmon record. On restart, the worker verifies the bookmarked record's native record ID, SystemTime, Computer and event type, then subscribes strictly after it. Expired/replaced/mismatched records stop recovery instead of silently skipping forward.
 3. Pull delivery holds at most 32 source records per uncommitted batch. The bounded sensor queue applies backpressure; the next batch is not fetched until the current batch is acknowledged. It is not a byte-budget or Windows EventLog internal-memory guarantee.
+   Once the current results are exhausted, the worker waits for a fresh Event Log notification,
+   checking shutdown every 100ms. A wait timeout does not cause another `EvtNext` call against
+   an exhausted subscription.
 4. The sensor writes each source event and the correlations generated from it. Only after the entire batch has succeeded does it flush and `sync_all` the local file. Rotated segments are also synchronized before rotation.
 5. Only that success acknowledgement permits a **single SQLite transaction** to update the bookmark/native identity, changed correlation timelines, finding-suppression keys and input-dedup order together. SQLite uses `synchronous=FULL` and a persistent rollback journal. Failed writes, synchronization, parsing, analysis validation or interrupted batches do not advance the bookmark. A DB failure rolls back both the source position and analysis mutations.
 

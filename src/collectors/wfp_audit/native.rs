@@ -121,15 +121,10 @@ fn collect(
                 && (e.code() == HRESULT::from_win32(ERROR_NO_MORE_ITEMS.0)
                     || e.code() == HRESULT::from_win32(ERROR_TIMEOUT.0))
             {
-                unsafe {
-                    ResetEvent(signal.0).map_err(|e| failure("wfp_signal_failed", e))?;
-                    // A reset racing a notification delays at most 100ms: always poll again.
-                    if WaitForSingleObject(signal.0, 100) == WAIT_FAILED {
-                        return Err(failure(
-                            "wfp_signal_failed",
-                            windows::core::Error::from_win32(),
-                        ));
-                    }
+                if !crate::collectors::eventlog::wait_for_events(signal.0, stop)
+                    .map_err(|e| failure("wfp_signal_failed", e))?
+                {
+                    return Ok(());
                 }
                 continue;
             }
@@ -234,7 +229,15 @@ mod tests {
             .start(tx)
             .await
             .expect("Security log subscription must succeed");
-        collector.stop().await.unwrap();
+        // The former loop failed after its first 100 ms idle timeout. A
+        // start/immediate-stop probe never exercised that path.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let live = collector.status().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), collector.stop())
+            .await
+            .expect("idle collector must stop promptly")
+            .unwrap();
+        assert_eq!(live.state, crate::events::CollectorState::Running);
         let status = collector.status().unwrap();
         assert_eq!(status.state, crate::events::CollectorState::Stopped);
         assert!(!status.wfp_audit.unwrap().audit_policy_verified);

@@ -2645,6 +2645,43 @@ fn alert_help() {
 }
 
 #[test]
+fn alert_survives_same_size_file_rotation() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    // Synthetic telemetry only: no executable named in these records is run.
+    let initial = sample_process_create(
+        "11111111-1111-1111-1111-111111111111",
+        100, 1, "C:/Windows/System32/certutil.exe", "certutil.exe -?",
+        "2026-03-13T09:00:00Z",
+    );
+    let replacement = sample_process_create(
+        "22222222-2222-2222-2222-222222222222",
+        200, 1, "C:/Windows/System32/certutil.exe", "certutil.exe -?",
+        "2026-03-13T10:00:00Z",
+    );
+    assert_eq!(initial.len(), replacement.len());
+    fs::write(&path, format!("{initial}\n")).unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("threatfalcon"))
+        .args(["alert", "--input", path.to_str().unwrap(), "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    fs::rename(&path, dir.path().join("events.jsonl.1")).unwrap();
+    fs::write(&path, format!("{replacement}\n")).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let alerts: Vec<serde_json::Value> = stdout.lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert!(alerts.iter().any(|a| a["pid"] == 200 && a["rule"] == "lolbin"),
+        "alert should follow a same-size replacement, got: {stdout}");
+    assert!(!alerts.iter().any(|a| a["pid"] == 100), "old content was replayed");
+}
+
+#[test]
 fn alert_detects_lolbin() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("events.jsonl");

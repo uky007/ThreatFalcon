@@ -66,7 +66,9 @@ Expected: TF-COR-001 with three original evidence IDs. **This fixture is generat
 4. Measure CPU, working set, disk bytes/day, callback latency and loss under normal and peak loads, long runs, restarts, sleep/resume and clock adjustments. Set deployment-specific budgets before acceptance. Resource bounds in code are not performance measurements.
 5. Complete source/sensor integrity, signing/update supply-chain, least privilege, tamper resistance, privacy/retention and delivery/recovery review. Missing kernel callbacks, restricted TI access and memory visibility cannot be fixed by adding more string rules.
 
-この開発環境はmacOSのため、Windowsネイティブ収集の実行検証と実攻撃・正常業務データによる精度評価は未実施です。Windows/GNU向けの型チェックと可搬テストは別の検証として扱います。オンプレミス／クラウド管理サーバー、macOS／Linuxセンサ、独自カーネル収集基盤の完成を意味しません。
+[2026-09-22のWindows VM検証](WINDOWS_VALIDATION_2026-09-22.md)では、無害な操作による限定的なネイティブ収集・Sysmon再取得・WFP許可／遮断記録の照合が通過しました。Sysmonは`cmd.exe`のプロセス生成に限定した設定であり、上記3ルールに必要な通信・クロスプロセスの証拠は揃えていません。これらの相関検知の実機E2E、実脅威・正常業務データによる検知率・誤検知率の評価は未実施です。検証後はVMを停止し、継続的なThreatFalcon監視は有効化していません。
+
+Windows/GNU向けの型チェックと可搬テストは別の検証として扱います。オンプレミス／クラウド管理サーバー、macOS／Linuxセンサ、独自カーネル収集基盤の完成を意味しません。
 
 Native fields, command lines, paths, scripts and raw payloads may contain confidential information. Keep pilot data local with restrictive ACLs, encryption and a deliberate retention policy. Do not submit collected telemetry to a public issue tracker. TDH decoding is currently synchronous in the callback and complex arrays/structs are retained as native data; benchmark and expand schema support before broad deployment.
 
