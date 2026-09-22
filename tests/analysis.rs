@@ -103,6 +103,55 @@ fn empty_analysis_is_not_a_clean_bill_of_health() {
 }
 
 #[test]
+fn rule_input_reports_do_not_merge_agents_or_claim_detection_readiness() {
+    let imported = import();
+    assert!(imported.status.success());
+    let mut events: Vec<serde_json::Value> = String::from_utf8(imported.stdout).unwrap()
+        .lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+    let agent_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let agent_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    events[2]["agent_id"] = agent_b.into();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("agents.jsonl");
+    std::fs::write(&path, events.iter().map(|e| format!("{e}\n")).collect::<String>()).unwrap();
+    let output = cmd().args(["analyze", "--input", path.to_str().unwrap(), "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let a = &report["agents"][agent_a]["rule_inputs"];
+    let b = &report["agents"][agent_b]["rule_inputs"];
+    assert_eq!(a[0]["unobserved_required_event_ids"], serde_json::json!([3]));
+    assert_eq!(b[0]["unobserved_required_event_ids"], serde_json::json!([8]));
+    assert_eq!(b[2]["state"], "required_types_observed");
+    assert_eq!(b[2]["coverage_verified"], false);
+    assert_eq!(b[2]["observed_input_counts"]["3"], 1);
+    assert!(report["findings"].as_array().unwrap().is_empty()); // one connection is not periodicity
+    for (lang, text) in [("ja", "証拠不足"), ("en", "Insufficient evidence")] {
+        cmd().args(["analyze", "--input", path.to_str().unwrap(), "--lang", lang])
+            .assert().success().stdout(predicate::str::contains(text));
+    }
+}
+
+#[test]
+fn raw_sysmon_event_ids_do_not_substitute_for_usable_input() {
+    let imported = import();
+    assert!(imported.status.success());
+    let mut events: Vec<serde_json::Value> = String::from_utf8(imported.stdout).unwrap()
+        .lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+    events[1]["provenance"]["target_process_guid"] = serde_json::Value::Null;
+    events[2]["provenance"]["original_time"] = false.into();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("incomplete.jsonl");
+    std::fs::write(&path, events.iter().map(|e| format!("{e}\n")).collect::<String>()).unwrap();
+    let output = cmd().args(["analyze", "--input", path.to_str().unwrap(), "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let agent = &report["agents"]["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"];
+    assert_eq!(agent["sysmon_event_ids"]["8"], 1);
+    assert_eq!(agent["rule_inputs"][0]["unobserved_required_event_ids"], serde_json::json!([8, 3]));
+    assert_eq!(agent["rule_inputs"][0]["state"], "insufficient_evidence");
+}
+
+#[test]
 fn powershell_fragment_analysis_is_bilingual_and_legacy_position_is_unknown() {
     use serde_json::json;
     let dir = TempDir::new().unwrap();

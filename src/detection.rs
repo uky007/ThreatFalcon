@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
+use crate::detection_catalog::{sysmon_provenance, RuleSpec, RULES};
 
 #[path = "detection_recovery.rs"]
 mod recovery;
@@ -92,20 +93,10 @@ impl Detector {
         }
         // V1 timestamps represented observation time and PID-only identities are
         // ambiguous. Do not silently upgrade either into source evidence.
-        let Some(p) = event.provenance.as_ref().filter(|p| {
-            event.schema_version >= 2
-                && p.original_time
-                && p.issues.is_empty()
-                && p.provider_guid
-                    .eq_ignore_ascii_case("5770385f-c22a-43e0-bf4c-06f5698ffbd9")
-        }) else {
+        let Some(p) = sysmon_provenance(event) else {
             self.stats.missing_evidence_events += 1;
             return vec![];
         };
-        if !matches!(event.source, EventSource::Sysmon { event_id } if event_id == p.event_id) {
-            self.stats.missing_evidence_events += 1;
-            return vec![];
-        }
         let Some(actor) = p.process_guid.filter(|g| !g.is_nil()) else {
             self.stats.missing_evidence_events += 1;
             return vec![];
@@ -292,13 +283,11 @@ fn evaluate(event: &ThreatEvent, process: Uuid, t: &mut Timeline) -> Vec<ThreatE
             if !(1..=120_000).contains(&elapsed) {
                 continue;
             }
-            let (rule,en,ja,technique,detail,mut evidence)=match &preceding.fact {
-                Fact::Thread {actor} => ("TF-COR-001","Remote thread followed by target network activity",
-                    "リモートスレッド生成後の対象プロセスの通信","T1055",
+            let (rule,detail,mut evidence)=match &preceding.fact {
+                Fact::Thread {actor} => (&RULES[0],
                     format!("actor=sysmon:{actor}; target=sysmon:{process}; destination={addr}:{port}; elapsed_ms={elapsed}; behavior is suspicious, not proof of injection"),
                     vec![preceding.clone(),connection.clone()]),
-                Fact::ScriptChild {parent,image} => ("TF-COR-002","Office-spawned script host made a network connection",
-                    "Officeが起動したスクリプト実行プロセスの通信","T1059",
+                Fact::ScriptChild {parent,image} => (&RULES[1],
                     format!("parent={parent}; child={image}; destination={addr}:{port}; elapsed_ms={elapsed}; administrative automation may also match"),
                     vec![preceding.clone(),connection.clone()]),
                 _ => continue,
@@ -309,10 +298,10 @@ fn evaluate(event: &ThreatEvent, process: Uuid, t: &mut Timeline) -> Vec<ThreatE
                     evidence.push(access.clone());
                 }
             }
-            let dedup = format!("{rule}|{}", preceding.id);
+            let dedup = format!("{}|{}", rule.id, preceding.id);
             if t.emitted.insert(dedup) {
                 results.push(finding(
-                    event, process, rule, en, ja, technique, detail, &evidence,
+                    event, process, rule, detail, &evidence,
                 ));
             }
         }
@@ -342,18 +331,17 @@ fn evaluate(event: &ThreatEvent, process: Uuid, t: &mut Timeline) -> Vec<ThreatE
             continue;
         };
         // One finding per destination while evidence stays in the 10-minute window.
-        let prefix = "TF-COR-003:";
+        let prefix = format!("{}:", RULES[2].id);
         let suffix = format!("|{addr}:{port}");
         if t.emitted
             .iter()
-            .any(|s| s.starts_with(prefix) && s.ends_with(&suffix))
+            .any(|s| s.starts_with(&prefix) && s.ends_with(&suffix))
         {
             continue;
         }
         t.emitted
             .insert(format!("{prefix}|{}{suffix}", samples[0].id));
-        results.push(finding(event,process,"TF-COR-003","Periodic outbound TCP connections",
-            "周期的な外向きTCP接続","T1071",format!("destination={addr}:{port}; samples=10; mean_interval_secs={mean:.3}; interval_cv={cv:.4}; scheduled benign traffic may also match"),
+        results.push(finding(event,process,&RULES[2],format!("destination={addr}:{port}; samples=10; mean_interval_secs={mean:.3}; interval_cv={cv:.4}; scheduled benign traffic may also match"),
             &samples.iter().map(|o|(*o).clone()).collect::<Vec<_>>()));
     }
     results
@@ -388,13 +376,11 @@ pub fn periodicity(times: &[DateTime<Utc>], minimum: usize) -> Option<(f64, f64)
 fn finding(
     event: &ThreatEvent,
     process: Uuid,
-    id: &str,
-    en: &str,
-    ja: &str,
-    technique: &str,
+    rule: &RuleSpec,
     detail: String,
     evidence: &[Observation],
 ) -> ThreatEvent {
+    let (id, en, ja, technique) = (rule.id, rule.title_en, rule.title_ja, rule.technique_id);
     let start = evidence.iter().map(|o| o.time).min().unwrap();
     let end = evidence.iter().map(|o| o.time).max().unwrap();
     let mut ids: Vec<_> = evidence.iter().map(|o| o.id).collect();

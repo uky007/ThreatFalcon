@@ -4,8 +4,10 @@ mod collectors;
 mod config;
 mod delivery;
 mod detection;
+mod detection_catalog;
 mod diagnostics;
 mod events;
+mod file_storage;
 #[cfg(test)]
 mod fixtures;
 mod index;

@@ -31,7 +31,7 @@ This is an **at-least-once design while the source records remain available**, w
 - ETW remains a live feed: this bookmark does not recover ETW buffers, records already overwritten by Windows, events excluded by Sysmon policy, or periods before Sysmon was installed.
 - Bookmark verification and subscription creation are separate Windows API operations, not a transaction protecting the channel against a privileged concurrent clear/replacement. This is not protection against an attacker who controls the source or checkpoint.
 - A full or failing disk, OS/hardware flush semantics, directory metadata durability, filesystem choice, rotation, concurrent writers, VM snapshots and abrupt power loss require native fault testing. Use a dedicated local disk path and one sensor writer; network shares/removable storage are not validated.
-- File rotation is **not total retention enforcement**. The operator must retain and protect all segments needed for evidence and analysis; file disappearance after acknowledgement is outside the source protocol.
+- File rotation alone is **not retention enforcement**. The optional [file-family byte budget](PRODUCTION_HARDENING.md) stops output before exceeding its limit; it never deletes evidence or acknowledges the failed source batch. The operator must retain and protect all segments needed for evidence and analysis; file disappearance after acknowledgement is outside the source protocol.
 
 再読込による重複はあり得ます。再開位置保存モードでは相関状態・証拠ID・重複抑止状態も復元しますが、ルールの時間窓や容量上限は変わりません。ETW、Sysmonの除外対象、Windows側で既に上書きされたログはこの機構では復元できません。
 

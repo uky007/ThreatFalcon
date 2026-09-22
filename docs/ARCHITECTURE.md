@@ -31,6 +31,11 @@ On-premises and hosted deployments should use the same HTTPS API and storage-ind
 
 ## Delivery milestones / 開発マイルストーン
 
+See [hardening contracts](PRODUCTION_HARDENING.md) for strict configuration,
+non-destructive storage budgets, rule input assessment, and the trust/privilege/
+update/control-plane boundaries that remain unimplemented. The latter are design
+requirements, not deployed services or claims of tamper resistance.
+
 ### M1 Windows sensor hardening / Windowsセンサ強化
 
 - Implemented: ETW session loss statistics, provider results, runtime diagnostics, shutdown queue drain, and a Japanese/English health CLI. See [SENSOR_HEALTH.md](SENSOR_HEALTH.md).

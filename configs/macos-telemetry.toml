@@ -9,6 +9,7 @@ health_interval_secs = 30
 type = "file"
 path = "macos-events.jsonl"
 rotation_size_mb = 100
+max_total_size_mb = 1024 # Stop at 1 GiB; never auto-delete evidence.
 
 [collectors.macos]
 enabled = true

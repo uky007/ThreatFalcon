@@ -1,5 +1,11 @@
 # ThreatFalcon
 
+Local [hardening contracts](docs/PRODUCTION_HARDENING.md): strict configuration,
+per-rule input-evidence reports and non-destructive file budgets. Sample profiles
+cap their log family at 1 GiB and stop without deleting evidence; the built-in
+budget default remains unbounded. These safeguards do not certify detection
+accuracy, tamper resistance or production readiness.
+
 [![crates.io](https://img.shields.io/crates/v/threatfalcon.svg)](https://crates.io/crates/threatfalcon)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

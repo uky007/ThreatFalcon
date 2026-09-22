@@ -43,6 +43,53 @@ fn version_flag() {
 }
 
 #[test]
+fn config_typo_is_rejected_without_creating_sensor_artifacts() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("sensor.toml");
+    fs::write(&config, "[output]\nmax_total_size_mib=1024\n").unwrap();
+    cmd().current_dir(dir.path()).args(["--config", config.to_str().unwrap(), "--validate-config"])
+        .assert().failure().stderr(predicate::str::contains("unknown field"));
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn exhausted_file_budget_exits_nonzero_without_collectors_or_evidence_deletion() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("sensor.toml");
+    fs::write(&config, r#"
+state_path = "agent.state"
+health_interval_secs = 0
+[output]
+type = "file"
+path = "events.jsonl"
+max_total_size_mb = 1
+[collectors.etw]
+enabled = false
+[collectors.sysmon]
+enabled = false
+[collectors.evasion]
+enabled = false
+[collectors.macos]
+enabled = false
+[collectors.linux_audit]
+enabled = false
+[collectors.wfp_audit]
+enabled = false
+"#).unwrap();
+    let archived = dir.path().join("events.jsonl.1");
+    let original = vec![b'x'; 1024 * 1024];
+    fs::write(&archived, &original).unwrap();
+    let output = cmd().current_dir(dir.path()).args(["--config", config.to_str().unwrap()])
+        .output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let diagnostic = format!("{}{}", String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+    assert!(diagnostic.contains("file_storage_budget_exceeded"), "{diagnostic}");
+    assert_eq!(fs::read(archived).unwrap(), original);
+    assert!(fs::read(dir.path().join("events.jsonl")).unwrap().is_empty());
+}
+
+#[test]
 fn dump_default_config() {
     cmd()
         .arg("--dump-default-config")

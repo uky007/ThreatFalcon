@@ -145,6 +145,7 @@ impl Sensor {
                 events_dropped: writer.dropped_events(),
                 spool_files: writer.spool_files(),
                 spool_bytes: writer.spool_bytes(),
+                file_storage: writer.file_storage(),
             }),
         );
         let mut sink_failed = false;
@@ -199,6 +200,7 @@ impl Sensor {
                         events_dropped: writer.dropped_events(),
                         spool_files: writer.spool_files(),
                         spool_bytes: writer.spool_bytes(),
+                        file_storage: writer.file_storage(),
                     };
                     let mut health = self.build_health_event(
                         &collector_states,
@@ -283,6 +285,7 @@ impl Sensor {
             events_dropped: writer.dropped_events(),
             spool_files: writer.spool_files(),
             spool_bytes: writer.spool_bytes(),
+            file_storage: writer.file_storage(),
         };
         let mut final_health = self.build_health_event(
             &collector_states,
@@ -516,6 +519,26 @@ mod tests {
             EventData::CorrelationDetection { .. }
         ));
         assert!(sink.events.iter().all(|event| event.delivery.is_none()));
+    }
+
+    #[tokio::test]
+    async fn exhausted_real_file_budget_never_acknowledges_source_progress() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        config.output.max_total_size_mb = 1;
+        let archived = format!("{}.1", config.output.path.display());
+        let evidence = vec![b'x'; 1024 * 1024];
+        std::fs::write(&archived, &evidence).unwrap();
+        let mut sink = output::FileSink::new(&config.output).unwrap();
+        let (mut receipts, completion) = crate::delivery::Receipt::batch(1);
+        let mut event = crate::fixtures::sysmon(3, 0, crate::fixtures::TARGET);
+        event.delivery = receipts.pop();
+        let mut cache = ProcessCache::new(100);
+        let mut detector = crate::detection::Detector::default();
+        assert!(deliver(event, &mut cache, &mut detector, &mut sink).await.is_err());
+        assert!(matches!(completion.try_recv().unwrap(), crate::delivery::DeliveryResult::Failed));
+        assert_eq!(std::fs::read(archived).unwrap(), evidence);
+        assert!(std::fs::read(&config.output.path).unwrap().is_empty());
     }
 
     #[tokio::test]

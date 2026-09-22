@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use crate::config::{OutputConfig, SinkType};
 use crate::events::ThreatEvent;
 use crate::spool::DiskSpool;
+use crate::file_storage::{private_options, regular_or_absent, FileStorage};
 
 // ---------------------------------------------------------------------------
 // Sink trait
@@ -36,6 +37,7 @@ pub trait Sink: Send {
     fn spool_bytes(&self) -> u64 {
         0
     }
+    fn file_storage(&self) -> Option<crate::events::FileStorageStatus> { None }
 }
 
 /// Construct the appropriate sink from config.
@@ -58,11 +60,15 @@ pub struct FileSink {
     base_path: String,
     generation: u32,
     events_dropped: u64,
+    storage: FileStorage,
+    failed: bool,
 }
 
 impl FileSink {
     pub fn new(config: &OutputConfig) -> Result<Self> {
-        let path = config.path.to_string_lossy().to_string();
+        config.validate()?;
+        let path = config.path.to_str().context("event output requires a UTF-8 path")?.to_owned();
+        let mut storage = FileStorage::open(&config.path, config.max_total_size_mb * 1024 * 1024)?;
         let mut file = open_append(&path)?;
         let mut existing_size = file.metadata()?.len();
         // A crash can leave a partial last JSON line. Preserve every byte of
@@ -72,13 +78,14 @@ impl FileSink {
             let mut last = [0u8; 1];
             file.read_exact(&mut last)?;
             if last[0] != b'\n' {
+                storage.reserve(1)?;
                 file.write_all(b"\n")?;
                 file.sync_all()?;
                 existing_size += 1;
                 tracing::warn!(path = %path, "Separated unterminated log tail; existing bytes preserved, last record may be incomplete");
             }
         }
-        let generation = find_max_generation(&path);
+        let generation = storage.generation;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -87,6 +94,8 @@ impl FileSink {
             base_path: path,
             generation,
             events_dropped: 0,
+            storage,
+            failed: false,
         })
     }
 
@@ -105,9 +114,12 @@ impl FileSink {
             "Rotating event log"
         );
 
-        fs::rename(&self.base_path, &rotated_path)?;
-
-        let file = open_append(&self.base_path)?;
+        // Atomically refuse a destination collision; rename can overwrite on
+        // Unix. If unlink/open fails, the synced evidence remains in the link.
+        fs::hard_link(&self.base_path, &rotated_path)
+            .context("cannot preserve rotated log without overwriting existing evidence")?;
+        fs::remove_file(&self.base_path)?;
+        let file = private_options().create_new(true).read(true).append(true).open(&self.base_path)?;
         self.writer = BufWriter::new(file);
         self.bytes_written = 0;
         Ok(())
@@ -117,8 +129,11 @@ impl FileSink {
 #[async_trait]
 impl Sink for FileSink {
     async fn durable_checkpoint(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        anyhow::ensure!(!self.failed, "file_output_failed: restart required; source progress not acknowledged");
+        if let Err(e) = self.writer.flush().and_then(|_| self.writer.get_ref().sync_all()) {
+            self.failed = true;
+            return Err(e.into());
+        }
         Ok(())
     }
     fn name(&self) -> &str {
@@ -126,12 +141,26 @@ impl Sink for FileSink {
     }
 
     async fn send(&mut self, event: &ThreatEvent) -> Result<()> {
-        let json = serde_json::to_string(event)?;
+        if self.failed {
+            self.events_dropped += 1;
+            anyhow::bail!("file_output_failed: restart required; no further events accepted");
+        }
+        let json = serde_json::to_string(event).inspect_err(|_| {
+            self.failed = true;
+            self.events_dropped += 1;
+        })?;
         let line = format!("{json}\n");
         let len = line.len() as u64;
 
+        if let Err(e) = self.storage.reserve(len) {
+            self.failed = true;
+            self.events_dropped += 1;
+            return Err(e);
+        }
+
         if self.rotation_bytes > 0 && self.bytes_written + len >= self.rotation_bytes {
             if let Err(e) = self.rotate() {
+                self.failed = true;
                 self.events_dropped += 1;
                 return Err(e);
             }
@@ -142,6 +171,7 @@ impl Sink for FileSink {
             .write_all(line.as_bytes())
             .and_then(|_| self.writer.flush())
         {
+            self.failed = true;
             self.events_dropped += 1;
             return Err(e.into());
         }
@@ -151,12 +181,18 @@ impl Sink for FileSink {
     }
 
     async fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        if let Err(e) = self.writer.flush() {
+            self.failed = true;
+            return Err(e.into());
+        }
         Ok(())
     }
 
     fn dropped_events(&self) -> u64 {
         self.events_dropped
+    }
+    fn file_storage(&self) -> Option<crate::events::FileStorageStatus> {
+        Some(self.storage.status())
     }
 }
 
@@ -453,35 +489,9 @@ impl Sink for HttpSink {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Scan for existing rotated files (`base_path.1`, `.2`, ...) and return the
-/// highest generation number found, so the next rotation won't overwrite them.
-fn find_max_generation(base_path: &str) -> u32 {
-    let parent = Path::new(base_path).parent().unwrap_or(Path::new("."));
-    let filename = match Path::new(base_path).file_name().and_then(|n| n.to_str()) {
-        Some(f) => f,
-        None => return 0,
-    };
-
-    let prefix = format!("{filename}.");
-    let mut max_gen = 0u32;
-
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(suffix) = name.strip_prefix(&prefix) {
-                if let Ok(gen) = suffix.parse::<u32>() {
-                    max_gen = max_gen.max(gen);
-                }
-            }
-        }
-    }
-
-    max_gen
-}
-
 fn open_append(path: &str) -> Result<File> {
-    let file = OpenOptions::new()
+    regular_or_absent(Path::new(path))?;
+    let file = private_options()
         .create(true)
         .read(true)
         .append(true)
@@ -530,6 +540,78 @@ mod tests {
     // --- FileSink tests (adapted from EventWriter) ---------------------------
 
     #[tokio::test]
+    async fn file_budget_counts_rotated_evidence_and_failure_is_terminal() {
+        let dir = TempDir::new().unwrap();
+        let mut config = file_config(&dir, 0);
+        config.max_total_size_mb = 1;
+        let event = dummy_event();
+        let line_len = serde_json::to_string(&event).unwrap().len() as u64 + 1;
+        let archived = dir.path().join("events.jsonl.9");
+        let previous = vec![b'x'; (1024 * 1024 - line_len) as usize];
+        fs::write(&archived, &previous).unwrap();
+        let mut sink = FileSink::new(&config).unwrap();
+        sink.send(&event).await.unwrap(); // exactly at the limit
+        sink.durable_checkpoint().await.unwrap();
+        assert_eq!(sink.file_storage().unwrap().accounted_bytes, 1024 * 1024);
+        let written = fs::read(&config.path).unwrap();
+        assert!(sink.send(&event).await.unwrap_err().to_string().contains("file_storage_budget_exceeded"));
+        assert!(sink.file_storage().unwrap().exhausted);
+        assert!(sink.send(&event).await.is_err());
+        assert!(sink.durable_checkpoint().await.is_err());
+        assert_eq!(sink.dropped_events(), 2);
+        assert_eq!(fs::read(&archived).unwrap(), previous);
+        assert_eq!(fs::read(&config.path).unwrap(), written);
+        drop(sink);
+        let reopened = FileSink::new(&config).unwrap();
+        assert_eq!(reopened.file_storage().unwrap().accounted_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn file_budget_does_not_repair_partial_tail_beyond_limit() {
+        let dir = TempDir::new().unwrap();
+        let mut config = file_config(&dir, 0);
+        config.max_total_size_mb = 1;
+        let original = vec![b'x'; 1024 * 1024];
+        fs::write(&config.path, &original).unwrap();
+        assert!(FileSink::new(&config).is_err());
+        assert_eq!(fs::read(&config.path).unwrap(), original);
+        // Existing evidence already over budget is also preserved on startup.
+        fs::write(dir.path().join("events.jsonl.1"), b"old\n").unwrap();
+        assert!(FileSink::new(&config).is_err());
+        assert_eq!(fs::read(&config.path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn file_writer_lock_survives_rotation_and_releases_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let config = file_config(&dir, 0);
+        let mut sink = FileSink::new(&config).unwrap();
+        assert!(FileSink::new(&config).is_err());
+        sink.rotation_bytes = 1;
+        sink.send(&dummy_event()).await.unwrap();
+        assert!(FileSink::new(&config).is_err());
+        drop(sink);
+        let reopened = FileSink::new(&config).unwrap();
+        assert_eq!(reopened.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn file_rotation_collision_never_overwrites_evidence() {
+        let dir = TempDir::new().unwrap();
+        let config = file_config(&dir, 0);
+        let mut sink = FileSink::new(&config).unwrap();
+        sink.send(&dummy_event()).await.unwrap();
+        let original = fs::read(&config.path).unwrap();
+        let collision = dir.path().join("events.jsonl.1");
+        fs::write(&collision, b"unrelated evidence\n").unwrap();
+        sink.rotation_bytes = 1;
+        assert!(sink.send(&dummy_event()).await.is_err());
+        assert!(sink.durable_checkpoint().await.is_err());
+        assert_eq!(fs::read(&config.path).unwrap(), original);
+        assert_eq!(fs::read(&collision).unwrap(), b"unrelated evidence\n");
+    }
+
+    #[tokio::test]
     async fn file_restart_preserves_partial_tail_without_corrupting_next_event() {
         let dir = TempDir::new().unwrap();
         let config = file_config(&dir, 0);
@@ -571,15 +653,8 @@ mod tests {
         let line_len = serde_json::to_string(&evt).unwrap().len() as u64 + 1;
 
         let rotation_bytes = line_len * 2 + 1;
-        let file = open_append(&path.to_string_lossy()).unwrap();
-        let mut sink = FileSink {
-            writer: BufWriter::new(file),
-            bytes_written: 0,
-            rotation_bytes,
-            base_path: path.to_string_lossy().to_string(),
-            generation: 0,
-            events_dropped: 0,
-        };
+        let mut sink = FileSink::new(&file_config(&dir, 0)).unwrap();
+        sink.rotation_bytes = rotation_bytes;
 
         for _ in 0..3 {
             sink.send(&evt).await.unwrap();
@@ -605,7 +680,7 @@ mod tests {
         }
 
         let files: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
-        assert_eq!(files.len(), 1);
+        assert_eq!(files.len(), 2); // active file + persistent writer lock
     }
 
     #[tokio::test]
@@ -617,18 +692,9 @@ mod tests {
         fs::write(dir.path().join("events.jsonl.3"), "old3\n").unwrap();
         fs::write(&base, "").unwrap();
 
-        let gen = find_max_generation(&base.to_string_lossy());
-        assert_eq!(gen, 3);
-
-        let file = open_append(&base.to_string_lossy()).unwrap();
-        let mut sink = FileSink {
-            writer: BufWriter::new(file),
-            bytes_written: 0,
-            rotation_bytes: 10,
-            base_path: base.to_string_lossy().to_string(),
-            generation: gen,
-            events_dropped: 0,
-        };
+        let mut sink = FileSink::new(&file_config(&dir, 0)).unwrap();
+        sink.rotation_bytes = 10;
+        assert_eq!(sink.generation, 3);
 
         let evt = dummy_event();
         sink.send(&evt).await.unwrap();
@@ -677,16 +743,8 @@ mod tests {
     #[tokio::test]
     async fn file_multiple_rotations_increment_generation() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.jsonl");
-        let file = open_append(&path.to_string_lossy()).unwrap();
-        let mut sink = FileSink {
-            writer: BufWriter::new(file),
-            bytes_written: 0,
-            rotation_bytes: 100,
-            base_path: path.to_string_lossy().to_string(),
-            generation: 0,
-            events_dropped: 0,
-        };
+        let mut sink = FileSink::new(&file_config(&dir, 0)).unwrap();
+        sink.rotation_bytes = 100;
 
         let evt = dummy_event();
         for _ in 0..50 {
@@ -701,16 +759,8 @@ mod tests {
     #[tokio::test]
     async fn file_rotated_contains_valid_jsonl() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.jsonl");
-        let file = open_append(&path.to_string_lossy()).unwrap();
-        let mut sink = FileSink {
-            writer: BufWriter::new(file),
-            bytes_written: 0,
-            rotation_bytes: 200,
-            base_path: path.to_string_lossy().to_string(),
-            generation: 0,
-            events_dropped: 0,
-        };
+        let mut sink = FileSink::new(&file_config(&dir, 0)).unwrap();
+        sink.rotation_bytes = 200;
 
         let evt = dummy_event();
         for _ in 0..10 {

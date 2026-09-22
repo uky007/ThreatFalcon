@@ -8,6 +8,7 @@ state_path = "threatfalcon.state"
 type = "file"
 path = "threatfalcon_events.jsonl"
 rotation_size_mb = 100
+max_total_size_mb = 1024 # Stop at 1 GiB; never auto-delete evidence.
 
 [collectors.etw]
 enabled = true

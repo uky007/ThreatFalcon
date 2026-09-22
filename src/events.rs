@@ -480,6 +480,17 @@ pub struct SinkStatus {
     /// Total bytes of spooled data currently on disk.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spool_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_storage: Option<FileStorageStatus>,
+}
+
+/// Conservative logical-byte accounting, not volume free space or retention age.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileStorageStatus {
+    pub accounted_bytes: u64,
+    /// Zero means explicitly unbounded.
+    pub limit_bytes: u64,
+    pub exhausted: bool,
 }
 
 fn is_zero(v: &u64) -> bool {

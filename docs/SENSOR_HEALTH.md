@@ -2,15 +2,15 @@
 
 ## Implemented scope / 実装範囲
 
-Windows collection now reports ETW provider enable results, ETW session loss counters, and collector worker failures. Startup, periodic, and shutdown `SensorHealth` events use the existing local file or optional HTTP destination. macOS/Linux collection and the control server remain planned work. The new `health` command runs on all three OSes and supports Japanese and English; existing investigation commands and runtime logs still use English.
+Windows collection reports ETW provider enable results, ETW session loss counters, and collector worker failures. Startup, periodic, and shutdown `SensorHealth` events use the existing local file or optional HTTP destination. Opt-in macOS Endpoint Security and Linux Audit collection have their own documented limits; the control server remains planned work. The `health` command runs on all three OSes and supports Japanese and English; runtime logs still use English.
 
-Windowsの収集処理で、ETWプロバイダの有効化結果、ETWセッションの欠落統計、収集ワーカーの異常を報告します。起動時・定期・停止時の`SensorHealth`イベントは、既存のローカルファイルまたは任意のHTTP出力先に保存します。macOS/Linuxの実収集とコントロールサーバは未実装です。新しい`health`コマンドは三つのOSで動作し、日本語・英語を選択できます。既存の調査コマンドと実行ログは英語のままです。
+Windowsの収集処理で、ETWプロバイダの有効化結果、ETWセッションの欠落統計、収集ワーカーの異常を報告します。起動時・定期・停止時の`SensorHealth`イベントは、既存のローカルファイルまたは任意のHTTP出力先に保存します。macOS ES／Linux Auditも明示的有効化の収集方式として実装済みですが、それぞれ固有の制限があります。コントロールサーバは未実装です。`health`コマンドは三つのOSで動作し、日本語・英語を選択できます。実行ログは英語です。
 
 ## Use / 使い方
 
-Use [the Windows telemetry profile](../configs/windows-telemetry.toml) for a collection-focused configuration. Relative paths resolve against the config directory. The profile rotates files at 100 MB; it does **not** impose a total retention limit yet.
+Use [the Windows telemetry profile](../configs/windows-telemetry.toml) for a collection-focused configuration. Relative paths resolve against the config directory. The profile rotates at 100 MiB and caps the active plus numbered log files at 1 GiB. Budget exhaustion stops output without deleting evidence. See [storage contracts and limits](PRODUCTION_HARDENING.md).
 
-[Windowsテレメトリ用設定](../configs/windows-telemetry.toml)を配置して実行します。相対パスは設定ファイルのディレクトリ基準です。この設定は100 MBでファイルを分割しますが、総保存容量の制限はまだありません。
+[Windowsテレメトリ用設定](../configs/windows-telemetry.toml)を配置して実行します。相対パスは設定ファイルのディレクトリ基準です。100 MiBで分割し、対象ログの合計上限は1 GiBです。上限超過時は証拠を削除せず停止します。組み込み既定値は互換性のため無制限のままです。詳細は[保存設計と限界](PRODUCTION_HARDENING.md)を参照してください。
 
 ```powershell
 # Validate, then run in an elevated Windows terminal.
@@ -37,6 +37,7 @@ JSONフィールド名・状態・診断コードは言語に依存しません�
 
 | Field | Meaning / 意味 |
 |---|---|
+| `sink.file_storage` | Accounted logical bytes / limit (0=unbounded) / exhausted; not volume free space. A full output may not save final health. / ファイル計上量・上限・上限超過。ディスク空き容量ではなく、上限時は最終ヘルスを保存できない場合がある |
 | `collectors[].state` | `Starting`, `Running`, `Degraded`, `Stopped`, `Disabled`, `Unsupported`, `Error` / 起動中、稼働中、収集品質低下、停止、無効、未対応OS、エラー |
 | `queue_events_dropped` | Rejected sends to the internal bounded queue, including after shutdown begins / 内部キュー満杯または停止開始後に受け付けられなかったイベント数 |
 | `events_lost_before_queue` | Render/parser/panic losses before queueing, separately included in known drops / キュー投入前の描画・解析・パニックによる既知の欠落 |

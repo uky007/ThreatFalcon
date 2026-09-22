@@ -28,6 +28,13 @@ State is bounded to 10,000 host/process timelines, 64 observations each and 50,0
 
 The live sensor and `analyze` use the same detector. `alert` can consume the sensor's emitted detections. `hunt`'s beaconing heuristic now also requires native identities/times and interval regularity (minimum ten samples); other legacy hunt/score rules remain simpler heuristics, not validated advanced-threat classifiers.
 
+`analyze` now reports each rule's required/supporting inputs per agent, counting
+only usable typed evidence. `required_types_observed` is **not** verified coverage,
+a rule match or production readiness; `insufficient_evidence` is not proof that
+policy is disabled. See [rule input contracts](PRODUCTION_HARDENING.md).
+ルール別の入力不足を日英で表示します。観測件数は重複排除・相関時間窓適用前の値であり、
+検知率や未収集件数の測定ではありません。
+
 ## Run a controlled Windows pilot / Windows検証環境での利用
 
 Use `configs/windows-detection.toml` after installing/configuring Sysmon separately. `configs/sysmon-validation.xml` is a high-volume laboratory profile, **not a production filtering policy**. Confirm its schema with the installed Sysmon, inspect existing policy, and approve any replacement separately. ThreatFalcon does not install Sysmon or change endpoint policy automatically. Do not apply broad ProcessAccess/ImageLoad collection to a fleet before performance and data-handling review.

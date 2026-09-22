@@ -36,6 +36,9 @@ pub struct Coverage {
     pub sysmon_event_ids: BTreeMap<u16, u64>,
     pub health_records: u64,
     pub recorded_loss_or_degradation: bool,
+    pub correlation_input_counts: BTreeMap<u16, u64>,
+    pub correlation_tcp_connections: u64,
+    pub rule_inputs: Vec<crate::detection_catalog::RuleInputAssessment>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +90,11 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         );
         let coverage = agents.entry(event.agent_id).or_default();
         coverage.events += 1;
+        if let Some(id) = crate::detection_catalog::input_event_id(&event) {
+            *coverage.correlation_input_counts.entry(id).or_default() += 1;
+            coverage.correlation_tcp_connections += u64::from(matches!(&event.data,
+                EventData::NetworkConnect { protocol, .. } if protocol.eq_ignore_ascii_case("tcp")));
+        }
         if matches!(event.source, EventSource::Etw { .. }) {
             coverage.etw_coverage_unverified = true;
             if let Some(p) = &event.provenance {
@@ -226,6 +234,7 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         if let EventData::SensorHealth {
             events_dropped,
             collectors,
+            sink,
             ..
         } = &event.data
         {
@@ -233,6 +242,8 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
             coverage.etw_coverage_unverified |= collectors.iter().any(|c| c.name == "ETW");
             coverage.wfp_audit_coverage_unknown |= collectors.iter().any(|c| c.wfp_audit.is_some());
             coverage.recorded_loss_or_degradation |= *events_dropped > 0
+                || sink.as_ref().is_some_and(|s| s.events_dropped > 0
+                    || s.file_storage.as_ref().is_some_and(|storage| storage.exhausted))
                 || collectors.iter().any(|c| {
                     c.decode_failures > 0
                         || c.events_lost_before_queue > 0
@@ -268,6 +279,8 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
         }
     }
     let mut limitations = vec![
+        "observed_rule_input_types_do_not_verify_policy_coverage_or_detection_accuracy",
+        "rule_input_counts_are_not_deduplicated_or_time_windowed",
         "no_findings_does_not_mean_clean",
         "behavioral_findings_require_investigation",
         "correlation_requires_v2_sysmon_source_time_and_process_guids",
@@ -334,6 +347,9 @@ pub fn analyze(reader: impl BufRead) -> Result<Report> {
             "powershell_script_id_is_not_process_lifetime_identity",
         ]);
     }
+    for coverage in agents.values_mut() {
+        coverage.rule_inputs = crate::detection_catalog::assess(&coverage.correlation_input_counts, coverage.correlation_tcp_connections);
+    }
     Ok(Report {
         report_version: 1,
         analysis: detector.stats,
@@ -391,6 +407,17 @@ pub fn run(path: &Path, lang: Language, json: bool) -> Result<()> {
     for (agent, c) in &report.agents {
         writeln!(out,"agent={agent} events={} source_time={} process_guid={} native_only={} recorded_loss={}",
             c.events,c.source_time_events,c.stable_process_guid_events,c.native_only_events,c.recorded_loss_or_degradation)?;
+        for input in &c.rule_inputs {
+            let state = match (&input.state, ja) {
+                (crate::detection_catalog::InputState::RequiredTypesObserved, true) => "必要な入力種別を観測（網羅性・ルール成立は未確認）",
+                (crate::detection_catalog::InputState::RequiredTypesObserved, false) => "Required input types observed (coverage and rule match unverified)",
+                (_, true) => "証拠不足（未観測は無効設定や安全の証明ではありません）",
+                (_, false) => "Insufficient evidence (absence does not prove disabled policy or safety)",
+            };
+            writeln!(out, "  {}: {}; {}={:?}", input.rule.id, state,
+                if ja { "未観測の必須Sysmon ID" } else { "unobserved required Sysmon IDs" },
+                input.unobserved_required_event_ids)?;
+        }
         if c.etw_extended_events > 0 {
             writeln!(
                 out,

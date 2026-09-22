@@ -24,7 +24,7 @@ fn default_base_dir() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SensorConfig {
     pub hostname: String,
     pub output: OutputConfig,
@@ -41,7 +41,7 @@ pub struct SensorConfig {
 /// Configuration for hunt, score, and alert rules.
 /// All fields have sensible defaults matching the built-in behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RulesConfig {
     pub hunt: HuntRulesConfig,
     pub score: ScoreWeights,
@@ -50,7 +50,7 @@ pub struct RulesConfig {
 
 /// Configurable process lists and thresholds for hunt rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HuntRulesConfig {
     /// Parent images that should not normally spawn shells/scripting engines.
     pub suspicious_parents: Vec<String>,
@@ -64,7 +64,7 @@ pub struct HuntRulesConfig {
 
 /// Point values for each scoring signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScoreWeights {
     pub detection: u32,
     pub suspicious_parent: u32,
@@ -76,7 +76,7 @@ pub struct ScoreWeights {
 
 /// Default values for the alert subcommand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AlertDefaults {
     /// Score threshold to trigger a score-based alert.
     pub threshold: u32,
@@ -85,7 +85,7 @@ pub struct AlertDefaults {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
     /// Sink type: "file" (default), "stdout", or "http".
     #[serde(rename = "type")]
@@ -94,6 +94,9 @@ pub struct OutputConfig {
     pub path: PathBuf,
     /// Max file size in MB before rotation (0 = no rotation). File sink only.
     pub rotation_size_mb: u64,
+    /// Logical bytes in active + numbered file segments, in MiB. Zero disables
+    /// the budget. Exhaustion stops output; existing evidence is never deleted.
+    pub max_total_size_mb: u64,
     /// Pretty-print JSON output. Stdout sink only.
     pub pretty: bool,
     /// Endpoint URL for HTTP sink.
@@ -137,7 +140,7 @@ pub enum SinkType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CollectorConfig {
     pub wfp_audit: WfpAuditConfig,
     pub linux_audit: LinuxAuditConfig,
@@ -258,7 +261,7 @@ mod macos_config_tests {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EtwConfig {
     pub enabled: bool,
     pub providers: Vec<EtwProviderConfig>,
@@ -282,6 +285,7 @@ impl EtwConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EtwProviderConfig {
     #[serde(default)]
     pub extended: crate::collectors::etw_metadata::CaptureOptions,
@@ -353,7 +357,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SysmonConfig {
     pub enabled: bool,
     /// Opt-in acknowledged EventLog resume. Only supported with local file output.
@@ -361,7 +365,7 @@ pub struct SysmonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EvasionConfig {
     pub enabled: bool,
     pub scan_interval_ms: u64,
@@ -497,6 +501,16 @@ impl SensorConfig {
 
 impl SensorConfig {
     pub fn validate(&self) -> Result<()> {
+        self.output.validate()?;
+        if self.output.sink_type == SinkType::File {
+            let output = path_identity(&self.output.path)?;
+            let lock = format!("{output}.writer.lock");
+            let state = path_identity(&self.state_path)?;
+            let state_is_segment = state.strip_prefix(&format!("{output}."))
+                .is_some_and(|s| s.parse::<u32>().is_ok_and(|n| n > 0));
+            anyhow::ensure!(state != output && state != lock && !state_is_segment,
+                "agent state must not share event output, rotated logs or writer lock paths");
+        }
         // A GUID must have a single capture policy; otherwise the last enable
         // call and the first callback lookup could describe different requests.
         if self.collectors.etw.enabled {
@@ -517,8 +531,8 @@ impl SensorConfig {
                     let rotated_output = path
                         .strip_prefix(&format!("{output}."))
                         .is_some_and(|s| s.parse::<u32>().is_ok_and(|n| n > 0));
-                    anyhow::ensure!(path != state && path != output && !rotated_output,
-                        "checkpoint and SQLite sidecars must not share paths with agent state, event output or rotated logs");
+                    anyhow::ensure!(path != state && path != output && path != format!("{output}.writer.lock") && !rotated_output,
+                        "checkpoint and SQLite sidecars must not share paths with agent state, event output, writer lock or rotated logs");
                 }
             }
         }
@@ -587,6 +601,19 @@ impl Default for SinkType {
 }
 
 impl OutputConfig {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("rotation_size_mb", self.rotation_size_mb),
+            ("max_total_size_mb", self.max_total_size_mb),
+            ("spool_max_mb", self.spool_max_mb),
+        ] {
+            anyhow::ensure!(value.checked_mul(1024 * 1024).is_some(), "{name} overflows bytes");
+        }
+        anyhow::ensure!(self.max_total_size_mb == 0 || self.sink_type == SinkType::File,
+            "max_total_size_mb requires the file sink");
+        Ok(())
+    }
+
     fn with_base_dir(base: Option<&std::path::Path>) -> Self {
         Self {
             sink_type: SinkType::File,
@@ -595,6 +622,7 @@ impl OutputConfig {
                 None => PathBuf::from("threatfalcon_events.jsonl"),
             },
             rotation_size_mb: 100,
+            max_total_size_mb: 0,
             pretty: false,
             url: None,
             batch_size: 100,
@@ -911,6 +939,56 @@ mod tests {
         assert_eq!(cfg.collectors.etw.providers.len(), 8);
         assert_eq!(cfg.output.sink_type, SinkType::File);
         assert_eq!(cfg.output.rotation_size_mb, 100);
+        assert_eq!(cfg.output.max_total_size_mb, 0);
+    }
+
+    #[test]
+    fn unknown_settings_are_rejected_at_every_config_boundary() {
+        for table in ["", "output", "collectors", "collectors.etw", "collectors.sysmon",
+            "collectors.evasion", "collectors.macos", "collectors.linux_audit",
+            "collectors.wfp_audit", "rules", "rules.hunt", "rules.score", "rules.alert"] {
+            let text = if table.is_empty() { "misspelled_option = true".into() }
+                else { format!("[{table}]\nmisspelled_option = true") };
+            let error = toml::from_str::<SensorConfig>(&text).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{table}: {error}");
+        }
+        let text = "[[collectors.etw.providers]]\nname='test'\nguid='11111111-1111-1111-1111-111111111111'\nmisspelled_option=true";
+        assert!(toml::from_str::<SensorConfig>(text).unwrap_err().to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn storage_sizes_and_path_collisions_fail_before_opening_files() {
+        let mut config = SensorConfig::default();
+        config.output.max_total_size_mb = 1;
+        config.output.sink_type = SinkType::Stdout;
+        assert!(config.validate().unwrap_err().to_string().contains("file sink"));
+        config.output.sink_type = SinkType::File;
+        for field in ["max_total_size_mb", "rotation_size_mb", "spool_max_mb"] {
+            let text = format!("[output]\n{field} = 9223372036854775807");
+            let parsed: SensorConfig = toml::from_str(&text).unwrap();
+            assert!(parsed.validate().unwrap_err().to_string().contains("overflows bytes"));
+        }
+        for suffix in ["", ".writer.lock", ".1"] {
+            config.state_path = PathBuf::from(format!("{}{}", config.output.path.display(), suffix));
+            assert!(config.validate().is_err());
+        }
+        config.state_path = PathBuf::from("separate.state");
+        config.collectors.sysmon.enabled = true;
+        config.collectors.sysmon.checkpoint_path = Some(PathBuf::from(format!("{}.writer.lock", config.output.path.display())));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn shipped_profiles_are_strictly_valid() {
+        for profile in [include_str!("../configs/windows-telemetry.toml"),
+            include_str!("../configs/windows-detection.toml"), include_str!("../configs/windows-recovery.toml"),
+            include_str!("../configs/windows-etw-context.toml"), include_str!("../configs/windows-powershell.toml"),
+            include_str!("../configs/windows-wfp-audit.toml"), include_str!("../configs/linux-telemetry.toml"),
+            include_str!("../configs/macos-telemetry.toml")] {
+            let config: SensorConfig = toml::from_str(profile).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.output.max_total_size_mb, 1024);
+        }
     }
 
     #[test]

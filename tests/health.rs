@@ -21,6 +21,25 @@ fn event(agent: &str, timestamp: &str) -> Value {
 const AGENT: &str = "00000000-0000-0000-0000-000000000001";
 
 #[test]
+fn file_storage_budget_is_visible_in_both_languages() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("health.jsonl");
+    let mut sample = event(AGENT, "2026-09-22T00:00:00Z");
+    sample["data"]["sink"] = json!({"sink_type":"file", "events_dropped":1,
+        "file_storage":{"accounted_bytes":100, "limit_bytes":100, "exhausted":true}});
+    std::fs::write(&path, sample.to_string()).unwrap();
+    for (lang, text) in [("ja", "ファイル計上バイト数"), ("en", "File accounted bytes")] {
+        cmd().args(["health", "--input", path.to_str().unwrap(), "--lang", lang])
+            .assert().success().stdout(predicate::str::contains(text)
+                .and(predicate::str::contains("100 / 100 / true")));
+    }
+    let output = cmd().args(["analyze", "--input", path.to_str().unwrap(), "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["agents"][AGENT]["recorded_loss_or_degradation"], true);
+}
+
+#[test]
 fn wfp_health_is_bilingual_and_zero_records_does_not_verify_coverage() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("wfp-health.jsonl");

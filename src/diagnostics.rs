@@ -536,6 +536,12 @@ pub fn run(
                 lang.text("Spool bytes", "送信待ちバイト数"),
                 s.spool_bytes
             )?;
+            if let Some(storage) = &s.file_storage {
+                writeln!(out, "{}: {} / {} / {}",
+                    lang.text("File accounted bytes / limit (0=unbounded) / exhausted",
+                        "ファイル計上バイト数 / 上限（0=無制限）/ 上限超過"),
+                    storage.accounted_bytes, storage.limit_bytes, storage.exhausted)?;
+            }
         }
     }
     if let Some(stats) = &report.event.analysis_status {
