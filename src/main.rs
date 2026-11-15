@@ -7,6 +7,7 @@ mod output;
 #[allow(dead_code)] // some methods only used by evasion collector on Windows
 mod pe;
 mod process_cache;
+mod process_snapshot;
 mod sensor;
 #[cfg(target_os = "windows")]
 mod service;

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::events::{EventData, ProcessContext, ThreatEvent};
+use crate::process_snapshot::RunningProcess;
 
 /// Cached process metadata, populated from ProcessCreate events.
 #[derive(Debug, Clone)]
@@ -153,6 +154,38 @@ impl ProcessCache {
         }
     }
 
+    /// Add processes that were already running when the sensor started:
+    /// they never get a ProcessCreate event, so their activity would carry
+    /// no process name otherwise. Entries already cached are kept, and a
+    /// later ProcessCreate for the same PID replaces a seeded entry. Only
+    /// the image path, parent and creation time are known for these.
+    /// Returns how many were added.
+    pub fn seed(&mut self, processes: impl IntoIterator<Item = RunningProcess>) -> usize {
+        let mut added = 0;
+        for process in processes {
+            if self.entries.len() >= self.capacity {
+                break;
+            }
+            if self.entries.contains_key(&process.pid) {
+                continue;
+            }
+            self.entries.insert(
+                process.pid,
+                CacheEntry {
+                    process_key: make_process_key(process.pid, process.create_time),
+                    create_time: process.create_time,
+                    image_path: process.image_path,
+                    command_line: String::new(),
+                    user: String::new(),
+                    integrity_level: String::new(),
+                    ppid: process.ppid,
+                },
+            );
+            added += 1;
+        }
+        added
+    }
+
     /// Number of cached process entries.
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -258,6 +291,88 @@ mod tests {
                 direction: NetworkDirection::Outbound,
             },
         )
+    }
+
+    fn running(pid: u32, ppid: u32, image: &str, create_time: Option<u64>) -> RunningProcess {
+        RunningProcess {
+            pid,
+            ppid,
+            image_path: image.into(),
+            create_time,
+        }
+    }
+
+    const SVCHOST: &str = r"\Device\HarddiskVolume3\Windows\System32\svchost.exe";
+
+    #[test]
+    fn seeded_processes_name_their_activity() {
+        let mut cache = ProcessCache::new(100);
+        let added = cache.seed([
+            running(4860, 812, SVCHOST, Some(133_000_000_000_000_000)),
+            running(4, 0, "System", None),
+        ]);
+        assert_eq!(added, 2);
+
+        let mut net = network_event(4860);
+        cache.enrich(&mut net);
+        let ctx = net.process_context.expect("context from the snapshot");
+        assert_eq!(ctx.process_key, "4860:133000000000000000");
+        assert_eq!(ctx.image_path.as_deref(), Some(SVCHOST));
+        assert_eq!(ctx.ppid, Some(812));
+        // Not known for processes from the snapshot
+        assert_eq!(ctx.command_line, None);
+        assert_eq!(ctx.user, None);
+
+        let mut system = network_event(4);
+        cache.enrich(&mut system);
+        let ctx = system.process_context.unwrap();
+        assert_eq!(ctx.process_key, "4:0");
+        assert_eq!(ctx.image_path.as_deref(), Some("System"));
+    }
+
+    #[test]
+    fn seeding_keeps_entries_from_events_and_events_replace_seeds() {
+        let mut cache = ProcessCache::new(100);
+        let mut create = process_create_event(100, Some(42));
+        cache.enrich(&mut create);
+        // Already known from a ProcessCreate: the snapshot does not replace it
+        assert_eq!(cache.seed([running(100, 9, SVCHOST, Some(1))]), 0);
+        let mut net = network_event(100);
+        cache.enrich(&mut net);
+        assert_eq!(net.process_context.unwrap().process_key, "100:42");
+
+        // A ProcessCreate after seeding (PID reuse) replaces the seed
+        cache.seed([running(200, 9, SVCHOST, Some(7))]);
+        let mut create = process_create_event(200, Some(8));
+        cache.enrich(&mut create);
+        let mut net = network_event(200);
+        cache.enrich(&mut net);
+        let ctx = net.process_context.unwrap();
+        assert_eq!(ctx.process_key, "200:8");
+        assert_eq!(ctx.command_line.as_deref(), Some("cmd.exe /c whoami"));
+    }
+
+    #[test]
+    fn seeded_process_is_evicted_by_its_terminate() {
+        let mut cache = ProcessCache::new(100);
+        cache.seed([running(300, 9, SVCHOST, Some(555))]);
+        // A terminate of a different process instance (PID reuse) keeps it
+        let mut other = process_terminate_event(300, Some(556));
+        cache.enrich(&mut other);
+        assert_eq!(cache.len(), 1);
+
+        let mut term = process_terminate_event(300, Some(555));
+        cache.enrich(&mut term);
+        assert_eq!(term.process_context.unwrap().image_path.as_deref(), Some(SVCHOST));
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn seeding_respects_the_capacity() {
+        let mut cache = ProcessCache::new(2);
+        let added = cache.seed((1..=5).map(|pid| running(pid, 0, SVCHOST, Some(u64::from(pid)))));
+        assert_eq!(added, 2);
+        assert_eq!(cache.len(), 2);
     }
 
     fn dns_event(pid: u32) -> ThreatEvent {

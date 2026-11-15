@@ -110,6 +110,11 @@ impl Sensor {
 
         let mut writer = output::create_sink(&self.config.output)?;
         let mut process_cache = ProcessCache::new(PROCESS_CACHE_CAPACITY);
+        // Name the processes that were already running (no ProcessCreate).
+        let seeded = process_cache.seed(crate::process_snapshot::running_processes());
+        if seeded > 0 {
+            info!(processes = seeded, "Process cache seeded with running processes");
+        }
         let mut event_count = 0u64;
 
         // Health tick — interval of 0 disables periodic health events
