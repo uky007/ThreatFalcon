@@ -184,6 +184,10 @@ pub enum EventData {
         pid: u32,
         path: String,
         operation: FileOperation,
+        /// New name of a renamed file, when the sensor could tell it apart
+        /// from the old one (`path`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_path: Option<String>,
     },
     FileDelete {
         pid: u32,
@@ -312,7 +316,7 @@ pub enum CollectorState {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileOperation {
     Create,
     Modify,
@@ -327,7 +331,7 @@ pub enum NetworkDirection {
     Inbound,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistryOperation {
     CreateKey,
     DeleteKey,

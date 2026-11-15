@@ -103,6 +103,13 @@ The default ETW provider set includes:
 - `Microsoft-Antimalware-Scan-Interface`
 - `Microsoft-Windows-Threat-Intelligence`
 
+From `Microsoft-Windows-Kernel-File` and `Microsoft-Windows-Kernel-Registry`, only creations and modifications are recorded:
+
+- files: a new file (`FileCreate` / `Create`), the first write or size change through each handle (`Modify`), the first attribute or timestamp change through each handle (`SetInfo`), deletion (`FileDelete`) and rename (`Rename`, with `new_path` when the new name can be told apart from the old one)
+- registry: a newly created key (`CreateKey`), key deletion, and values set or deleted; failed operations are not recorded
+
+Opening (or closing) files and keys is not recorded. Writes and value changes are matched to the name the file or key was opened under, so writes through handles opened before the sensor started are not recorded, and value changes on keys opened before it started may have an empty `key`.
+
 ## Architecture
 
 ThreatFalcon is split into a small number of clear components:

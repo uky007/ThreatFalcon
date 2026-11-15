@@ -289,6 +289,7 @@ pub fn map_to_threat_event(
                 pid: parsed.get_u32("ProcessId"),
                 path: parsed.get_string("TargetFilename"),
                 operation: FileOperation::Create,
+                new_path: None,
             },
         ),
 
@@ -326,6 +327,7 @@ pub fn map_to_threat_event(
                 pid: parsed.get_u32("ProcessId"),
                 path: parsed.get_string("TargetFilename"),
                 operation: FileOperation::StreamCreate,
+                new_path: None,
             },
         ),
 

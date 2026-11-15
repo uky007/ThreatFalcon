@@ -4456,10 +4456,13 @@ fn event_summary(data: &EventData) -> String {
             pid,
             path,
             operation,
-            ..
-        } => {
-            format!("FileCreate        pid:{pid} {operation:?} {path}")
-        }
+            new_path,
+        } => match new_path {
+            Some(new_path) => {
+                format!("FileCreate        pid:{pid} {operation:?} {path} -> {new_path}")
+            }
+            None => format!("FileCreate        pid:{pid} {operation:?} {path}"),
+        },
         EventData::FileDelete { pid, path, .. } => {
             format!("FileDelete        pid:{pid} {path}")
         }

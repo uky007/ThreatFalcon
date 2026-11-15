@@ -307,6 +307,7 @@ mod tests {
                 pid,
                 path: "C:\\temp\\test.txt".into(),
                 operation: FileOperation::Create,
+                new_path: None,
             },
         )
     }
