@@ -398,8 +398,9 @@ mod platform {
     use super::parser::{UserDataReader, dns_query_type_name};
     use super::process_parser::*;
     use crate::events::*;
+    use crate::collectors::kernel_io::KernelObjects;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use windows::core::GUID;
     use windows::Win32::Foundation::*;
     use windows::Win32::System::Diagnostics::Etw::*;
@@ -524,6 +525,8 @@ mod platform {
         dropped: Arc<AtomicU64>,
         /// Counter for scan requests dropped due to channel backpressure.
         scan_requests_dropped: Arc<AtomicU64>,
+        /// File and key names by kernel object (Kernel-File/-Registry).
+        kernel_objects: Mutex<KernelObjects>,
     }
 
     /// Start an ETW real-time trace session, enable the configured providers,
@@ -647,6 +650,7 @@ mod platform {
                 stop: stop_clone,
                 dropped,
                 scan_requests_dropped,
+                kernel_objects: Mutex::new(KernelObjects::new()),
             });
             let ctx_ptr = Box::into_raw(ctx);
 
@@ -733,9 +737,17 @@ mod platform {
 
         let provider_name = provider_display_name(&provider);
 
-        if let Some(ref event) =
-            unsafe { map_event(rec, provider_name, event_id, event_version, pid, &ctx.agent) }
-        {
+        if let Some(ref event) = unsafe {
+            map_event(
+                rec,
+                provider_name,
+                event_id,
+                event_version,
+                pid,
+                &ctx.agent,
+                &ctx.kernel_objects,
+            )
+        } {
             // Send scan requests for relevant events
             if let Some(ref scan_tx) = ctx.scan_tx {
                 send_scan_requests(
@@ -864,6 +876,7 @@ mod platform {
         event_version: u8,
         pid: u32,
         agent: &crate::events::AgentInfo,
+        kernel_objects: &Mutex<KernelObjects>,
     ) -> Option<ThreatEvent> {
         let data = unsafe { user_data_slice(rec) };
         let ps = ptr_size(rec);
@@ -977,115 +990,14 @@ mod platform {
             // -----------------------------------------------------------
             // Kernel-File
             // -----------------------------------------------------------
-            "Microsoft-Windows-Kernel-File" => match event_id {
-                10 => {
-                    // NameCreate: FileObject(ptr), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?;
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::Create,
-                        },
-                    )
-                }
-                11 => {
-                    // NameDelete: FileObject(ptr), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?;
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileDelete { pid, path },
-                    )
-                }
-                12 => {
-                    // Create: IrpPtr(ptr), FileObject(ptr), TTID(u32),
-                    //   CreateOptions(u32), CreateAttributes(u32),
-                    //   ShareAccess(u32), OpenPath(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?; // IrpPtr
-                            r.read_pointer()?; // FileObject
-                            r.read_u32()?; // TTID
-                            r.read_u32()?; // CreateOptions
-                            r.read_u32()?; // CreateAttributes
-                            r.read_u32()?; // ShareAccess
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::Create,
-                        },
-                    )
-                }
-                13 => {
-                    // SetInfo: IrpPtr(ptr), FileObject(ptr), TTID(u32),
-                    //   InfoClass(u32), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?; // IrpPtr
-                            r.read_pointer()?; // FileObject
-                            r.read_u32()?; // TTID
-                            r.read_u32()?; // InfoClass
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::SetInfo,
-                        },
-                    )
-                }
-                14 => {
-                    // Rename: IrpPtr(ptr), FileObject(ptr), TTID(u32),
-                    //   InfoClass(u32), FileName(wstr)
-                    let path = data
-                        .and_then(|d| {
-                            let mut r = UserDataReader::new(d, ps);
-                            r.read_pointer()?; // IrpPtr
-                            r.read_pointer()?; // FileObject
-                            r.read_u32()?; // TTID
-                            r.read_u32()?; // InfoClass
-                            Some(r.read_utf16_nul())
-                        })
-                        .unwrap_or_default();
-                    (
-                        EventCategory::File,
-                        Severity::Info,
-                        EventData::FileCreate {
-                            pid,
-                            path,
-                            operation: FileOperation::Rename,
-                        },
-                    )
-                }
-                _ => return None,
-            },
+            "Microsoft-Windows-Kernel-File" => {
+                // Creations and modifications only (see kernel_io)
+                let event_data = kernel_objects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .file_event(event_id, event_version, data?, ps, pid)?;
+                (EventCategory::File, Severity::Info, event_data)
+            }
 
             // -----------------------------------------------------------
             // Kernel-Network
@@ -1236,113 +1148,12 @@ mod platform {
             // Kernel-Registry
             // -----------------------------------------------------------
             "Microsoft-Windows-Kernel-Registry" => {
-                let operation = match event_id {
-                    1 => RegistryOperation::CreateKey,
-                    2 => RegistryOperation::CreateKey, // OpenKey
-                    3 => RegistryOperation::DeleteKey,
-                    4 => RegistryOperation::RenameKey,
-                    5 => RegistryOperation::SetValue,
-                    6 => RegistryOperation::DeleteValue,
-                    _ => return None,
-                };
-
-                let (key, value_name, value_data) = data
-                    .and_then(|d| {
-                        let mut r = UserDataReader::new(d, ps);
-                        match event_id {
-                            1 | 2 => {
-                                // CreateKey/OpenKey: BaseObject(ptr),
-                                //   KeyObject(ptr), Status(u32),
-                                //   [Disposition(u32) for event 1],
-                                //   BaseName(wstr), RelativeName(wstr)
-                                r.read_pointer()?;
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                if event_id == 1 {
-                                    r.read_u32()?;
-                                }
-                                let base = r.read_utf16_nul();
-                                let rel = r.read_utf16_nul();
-                                let key = if base.is_empty() {
-                                    rel
-                                } else if rel.is_empty() {
-                                    base
-                                } else {
-                                    format!("{base}\\{rel}")
-                                };
-                                Some((key, None, None))
-                            }
-                            3 => {
-                                // DeleteKey: KeyObject(ptr), Status(u32),
-                                //   KeyName(wstr)
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                Some((r.read_utf16_nul(), None, None))
-                            }
-                            4 => {
-                                // RenameKey: KeyObject(ptr), Status(u32),
-                                //   OldKeyName(wstr), NewKeyName(wstr)
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                let old_name = r.read_utf16_nul();
-                                let new_name = r.read_utf16_nul();
-                                Some((old_name, Some(new_name), None))
-                            }
-                            5 => {
-                                // SetValueKey: KeyObject(ptr), Status(u32),
-                                //   Type(u32), DataSize(u32),
-                                //   KeyName(wstr), ValueName(wstr),
-                                //   CapturedDataSize(u16), CapturedData(bytes)
-                                r.read_pointer()?;
-                                r.read_u32()?; // Status
-                                let reg_type = r.read_u32()?;
-                                let _data_size = r.read_u32()?;
-                                let key = r.read_utf16_nul();
-                                let vn = r.read_utf16_nul();
-                                // Try to capture REG_SZ (1) / REG_EXPAND_SZ (2)
-                                // value data from CapturedData if present
-                                let vd = if matches!(reg_type, 1 | 2) {
-                                    if let Some(cap_size) = r.read_u16() {
-                                        let cap = cap_size as usize;
-                                        if cap > 0 && r.remaining() >= cap {
-                                            Some(r.read_utf16_bytes(cap))
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-                                Some((key, Some(vn), vd))
-                            }
-                            6 => {
-                                // DeleteValueKey: KeyObject(ptr),
-                                //   Status(u32), KeyName(wstr),
-                                //   ValueName(wstr)
-                                r.read_pointer()?;
-                                r.read_u32()?;
-                                let key = r.read_utf16_nul();
-                                let vn = r.read_utf16_nul();
-                                Some((key, Some(vn), None))
-                            }
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or_default();
-
-                (
-                    EventCategory::Registry,
-                    Severity::Info,
-                    EventData::RegistryEvent {
-                        pid,
-                        operation,
-                        key,
-                        value_name,
-                        value_data,
-                    },
-                )
+                // Key creations and key/value changes only (see kernel_io)
+                let event_data = kernel_objects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .registry_event(event_id, data?, ps, pid)?;
+                (EventCategory::Registry, Severity::Info, event_data)
             }
 
             // -----------------------------------------------------------
@@ -2786,30 +2597,6 @@ mod tests {
         assert!(sig_level < 4, "sig_level < 4 means unsigned");
     }
 
-    // --- Registry: RenameKey (ID 4) ------------------------------------------
-
-    #[test]
-    fn fixture_registry_rename_key_payload() {
-        // Kernel-Registry event ID 4 (RenameKey):
-        //   KeyObject(ptr), Status(u32), OldKeyName(wstr), NewKeyName(wstr)
-        let mut data = Vec::new();
-        data.extend_from_slice(&0xAAAA_BBBBu64.to_le_bytes()); // KeyObject
-        data.extend_from_slice(&0u32.to_le_bytes()); // Status
-        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\OldApp"));
-        data.extend_from_slice(&utf16_nul(r"HKLM\SOFTWARE\NewApp"));
-
-        let mut r = UserDataReader::new(&data, 8);
-        let _key_obj = r.read_pointer().unwrap();
-        let _status = r.read_u32().unwrap();
-        let old_name = r.read_utf16_nul();
-        let new_name = r.read_utf16_nul();
-
-        assert_eq!(old_name, r"HKLM\SOFTWARE\OldApp");
-        assert_eq!(new_name, r"HKLM\SOFTWARE\NewApp");
-    }
-
-    // --- Registry: SetValue with captured data (REG_SZ) ----------------------
-
     #[test]
     fn fixture_registry_set_value_with_data() {
         // SetValueKey with REG_SZ CapturedData
@@ -2896,52 +2683,6 @@ mod tests {
         assert_eq!(query_name, "nx.example.com");
         assert_ne!(status, 0);
         assert!(response.is_none());
-    }
-
-    // --- File: SetInfo (ID 13) and Rename (ID 14) ----------------------------
-
-    #[test]
-    fn fixture_file_setinfo_payload() {
-        // Kernel-File event ID 13 (SetInfo):
-        //   IrpPtr(ptr), FileObject(ptr), TTID(u32), InfoClass(u32),
-        //   FileName(wstr)
-        let mut data = Vec::new();
-        data.extend_from_slice(&0xFFFF_0000u64.to_le_bytes()); // IrpPtr
-        data.extend_from_slice(&0xAAAA_0000u64.to_le_bytes()); // FileObject
-        data.extend_from_slice(&100u32.to_le_bytes()); // TTID
-        data.extend_from_slice(&4u32.to_le_bytes()); // InfoClass
-        data.extend_from_slice(&utf16_nul(r"C:\Users\Admin\file.txt"));
-
-        let mut r = UserDataReader::new(&data, 8);
-        let _irp = r.read_pointer().unwrap();
-        let _fobj = r.read_pointer().unwrap();
-        let _ttid = r.read_u32().unwrap();
-        let _info_class = r.read_u32().unwrap();
-        let path = r.read_utf16_nul();
-
-        assert_eq!(path, r"C:\Users\Admin\file.txt");
-    }
-
-    #[test]
-    fn fixture_file_rename_payload() {
-        // Kernel-File event ID 14 (Rename):
-        //   IrpPtr(ptr), FileObject(ptr), TTID(u32), InfoClass(u32),
-        //   FileName(wstr)
-        let mut data = Vec::new();
-        data.extend_from_slice(&0xBBBB_0000u64.to_le_bytes()); // IrpPtr
-        data.extend_from_slice(&0xCCCC_0000u64.to_le_bytes()); // FileObject
-        data.extend_from_slice(&200u32.to_le_bytes()); // TTID
-        data.extend_from_slice(&10u32.to_le_bytes()); // InfoClass (FileRenameInformation)
-        data.extend_from_slice(&utf16_nul(r"C:\Users\Admin\renamed.txt"));
-
-        let mut r = UserDataReader::new(&data, 8);
-        let _irp = r.read_pointer().unwrap();
-        let _fobj = r.read_pointer().unwrap();
-        let _ttid = r.read_u32().unwrap();
-        let _info_class = r.read_u32().unwrap();
-        let path = r.read_utf16_nul();
-
-        assert_eq!(path, r"C:\Users\Admin\renamed.txt");
     }
 
     // --- TI: SuspendThread (ID 9) / ResumeThread (ID 10) --------------------
