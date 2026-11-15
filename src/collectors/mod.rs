@@ -3,6 +3,9 @@ pub mod evasion;
 // Used by the Windows ETW collector only (tested on every platform).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub mod kernel_io;
+// Used by the Windows ETW collector only (tested on every platform).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub mod script_rules;
 pub mod sysmon;
 pub mod sysmon_parser;
 

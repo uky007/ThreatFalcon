@@ -399,6 +399,7 @@ mod platform {
     use super::process_parser::*;
     use crate::events::*;
     use crate::collectors::kernel_io::KernelObjects;
+    use crate::collectors::script_rules;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use windows::core::GUID;
@@ -1240,17 +1241,38 @@ mod platform {
                     });
                     let (content, script_block_id, script_path) =
                         parsed.unwrap_or_default();
-                    (
-                        EventCategory::Script,
-                        Severity::Medium,
-                        EventData::ScriptBlock {
-                            pid,
-                            script_engine: "PowerShell".into(),
-                            content,
-                            script_path,
-                            script_block_id,
-                        },
-                    )
+                    // Info unless suspicious (see script_rules); PowerShell
+                    // logs blocks it considers suspicious at Warning level.
+                    let flagged = rec.EventHeader.EventDescriptor.Level
+                        == script_rules::POWERSHELL_WARNING_LEVEL;
+                    let assessment = script_rules::assess(&content, flagged);
+                    let data = EventData::ScriptBlock {
+                        pid,
+                        script_engine: "PowerShell".into(),
+                        content,
+                        script_path,
+                        script_block_id,
+                    };
+                    let source = EventSource::Etw {
+                        provider: provider.to_string(),
+                    };
+                    return Some(match assessment.rule {
+                        Some(rule) => ThreatEvent::with_rule(
+                            agent,
+                            source,
+                            EventCategory::Script,
+                            assessment.severity,
+                            data,
+                            rule,
+                        ),
+                        None => ThreatEvent::new(
+                            agent,
+                            source,
+                            EventCategory::Script,
+                            assessment.severity,
+                            data,
+                        ),
+                    });
                 }
                 _ => return None,
             },
