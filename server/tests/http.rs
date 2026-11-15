@@ -783,6 +783,24 @@ async fn read_api_exports_stored_events() {
             .1,
         format!("{}\n", event(3))
     );
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?min_severity=Medium"))
+            .await
+            .1,
+        ""
+    );
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?detections=true"))
+            .await
+            .1,
+        ""
+    );
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?min_severity=info&limit=1"))
+            .await
+            .1,
+        format!("{}\n", event(1))
+    );
     // A configured agent without data
     assert_eq!(
         srv.read_as_reader("/api/v1/agents/lab-ws02/events").await,

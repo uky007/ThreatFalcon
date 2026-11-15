@@ -465,13 +465,23 @@ Every request except `/healthz` needs `Authorization: Bearer <reader token>`
   |-----------|---------|
   | `from`, `to` | inclusive bounds on the event `timestamp` (RFC 3339, e.g. `2026-11-15T05:00:00Z`) |
   | `category` | e.g. `File`, `Registry`, `Process` (case-insensitive) |
+  | `min_severity` | `Info`, `Low`, `Medium`, `High` or `Critical`: that severity and above |
+  | `detections` | `true`: only events with detection rule metadata (`rule`) |
   | `contains` | substring of the stored JSON line (as stored: `\` in paths is `\\`), up to 256 bytes |
   | `limit` | events to return, default 100000, at most 1000000; if exactly `limit` lines come back there may be more: continue with `from` set to the last timestamp |
 
   Unknown parameters and agents are refused (400, 404). At most two exports
-  run at a time (503 with `Retry-After` beyond that). Files whose write
-  times show they cannot hold events of the requested range (allowing 24 h
-  of agent clock skew) are not read.
+  run at a time (503 with `Retry-After` beyond that).
+
+  Reading the files is what an export costs, so files that cannot hold a
+  match are not read. Rotated files never change: the first export that
+  reads one in full records its summary (event time range, counts by
+  category and severity, detections) in `.export-index.json` in the agent
+  directory, and later exports skip it when the filters rule it out. Files
+  without a summary, and the active file, can only be ruled out by a time
+  range, by their write times (allowing 24 h of agent clock skew). The
+  first filtered export after a lot of new data is therefore slower than
+  the ones after it.
 
 ## Running without AWS
 

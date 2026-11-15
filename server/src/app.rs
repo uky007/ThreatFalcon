@@ -703,6 +703,8 @@ async fn export_events(
                 agent = %agent,
                 events = stats.events,
                 files = stats.files,
+                files_skipped = stats.files_skipped,
+                summaries_built = stats.summaries_built,
                 limit_reached = stats.limit_reached,
                 aborted = stats.aborted,
                 "events exported"
