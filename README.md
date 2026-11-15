@@ -446,7 +446,7 @@ Example enriched NetworkConnect event:
 
 ## Management Server
 
-`server/` contains `threatfalcon-server`, which receives the HTTP sink's batches from many agents, authenticates each agent with its own token, and stores the events per agent in the same JSONL layout as the file sink, so every investigation command below also works on the server. It also reports agent liveness and sensor health (status API, Prometheus metrics).
+`server/` contains `threatfalcon-server`, which receives the HTTP sink's batches from many agents, authenticates each agent with its own token, and stores the events per agent in the same JSONL layout as the file sink, so every investigation command below also works on the server. It also reports agent liveness and sensor health (status API, Prometheus metrics). An optional read API (port 8443, opened by the security group to a single workstation, with separate reader tokens) exports agent status and stored events, so they can be investigated with the CLI on your own machine.
 
 `deploy/` contains a CloudFormation template (EC2 in `ap-northeast-1`, Caddy with Let's Encrypt) and a GitHub Actions workflow that tests, builds and deploys the server on every push to `main`. Installation and operations: [deploy/README.md](deploy/README.md).
 

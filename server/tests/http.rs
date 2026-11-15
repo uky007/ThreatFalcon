@@ -16,11 +16,13 @@ use tokio::task::JoinHandle;
 const TOKEN_1: &str = "tfs_1111111111111111111111111111111111111111111111111111111111111111";
 const TOKEN_2: &str = "tfs_2222222222222222222222222222222222222222222222222222222222222222";
 const AGENT_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+const READER_TOKEN: &str = "tfr_3333333333333333333333333333333333333333333333333333333333333333";
 
 struct TestServer {
     dir: TempDir,
     ingest: String,
     admin: String,
+    reader: Option<String>,
     client: reqwest::Client,
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
@@ -56,6 +58,7 @@ token_sha256 = "{}"
         let server = Server::bind(&config).await.unwrap();
         let ingest = format!("http://{}", server.ingest_addr().unwrap());
         let admin = format!("http://{}", server.admin_addr().unwrap());
+        let reader = server.reader_addr().map(|a| format!("http://{a}"));
         let (tx, rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(server.run(async move {
             let _ = rx.await;
@@ -64,6 +67,7 @@ token_sha256 = "{}"
             dir,
             ingest,
             admin,
+            reader,
             client: reqwest::Client::new(),
             shutdown: Some(tx),
             handle: Some(handle),
@@ -98,6 +102,20 @@ token_sha256 = "{}"
             req = req.bearer_auth(t);
         }
         req.send().await.unwrap()
+    }
+
+    async fn read(&self, path: &str, token: Option<&str>) -> reqwest::Response {
+        let base = self.reader.as_ref().expect("reader listener enabled");
+        let mut req = self.client.get(format!("{base}{path}"));
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req.send().await.unwrap()
+    }
+
+    async fn read_as_reader(&self, path: &str) -> (StatusCode, String) {
+        let resp = self.read(path, Some(READER_TOKEN)).await;
+        (resp.status(), resp.text().await.unwrap())
     }
 
     async fn agents(&self) -> Value {
@@ -650,5 +668,154 @@ async fn second_instance_on_same_data_dir_is_refused() {
     let config = ServerConfig::load(&path).unwrap();
     let err = Server::bind(&config).await.err().expect("must fail");
     assert!(format!("{err:#}").contains("locked"), "{err:#}");
+    srv.stop().await;
+}
+
+fn reader_config() -> String {
+    format!(
+        "reader_listen = \"127.0.0.1:0\"\n\n[[readers]]\nname = \"laptop\"\ntoken_sha256 = \"{}\"\n",
+        token_sha256_hex(READER_TOKEN)
+    )
+}
+
+#[tokio::test]
+async fn reader_listener_is_off_by_default() {
+    let srv = TestServer::start("").await;
+    assert!(srv.reader.is_none());
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn read_api_requires_a_reader_token() {
+    let srv = TestServer::start(&reader_config()).await;
+    // Open, for checking that the port is reachable
+    assert_eq!(srv.read("/healthz", None).await.status(), StatusCode::OK);
+
+    let paths = [
+        "/api/v1/agents",
+        "/api/v1/agents/lab-ws01/events",
+        "/api/v1/agents/lab-ws01/events?bogus=1",
+    ];
+    for token in [None, Some(TOKEN_1), Some("tfr_wrong")] {
+        for path in paths {
+            let resp = srv.read(path, token).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path} {token:?}");
+        }
+    }
+    // A reader token cannot ingest
+    let resp = srv.post(Some(READER_TOKEN), batch(&[event(1)])).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The read API is not served by the ingest listener
+    let resp = srv
+        .client
+        .get(format!("{}/api/v1/agents/lab-ws01/events", srv.ingest))
+        .bearer_auth(READER_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let metrics = srv
+        .client
+        .get(format!("{}/metrics", srv.admin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("threatfalcon_server_reader_auth_failures_total 9"),
+        "{metrics}"
+    );
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn read_api_exports_stored_events() {
+    let srv = TestServer::start(&reader_config()).await;
+    let mut events: Vec<String> = (1..=5).map(event).collect();
+    assert_eq!(
+        srv.post(Some(TOKEN_1), batch(&events)).await.status(),
+        StatusCode::OK
+    );
+    let health = health(9, "Running");
+    assert_eq!(
+        srv.post(Some(TOKEN_1), batch(std::slice::from_ref(&health)))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    events.push(health.clone());
+
+    let resp = srv
+        .read("/api/v1/agents/lab-ws01/events", Some(READER_TOKEN))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/x-ndjson");
+    let all: String = events.iter().map(|e| format!("{e}\n")).collect();
+    assert_eq!(resp.text().await.unwrap(), all);
+
+    let base = "/api/v1/agents/lab-ws01/events";
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?category=health"))
+            .await
+            .1,
+        format!("{health}\n")
+    );
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?limit=2"))
+            .await
+            .1
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?from=2026-11-15T00:00:30Z"))
+            .await
+            .1,
+        format!("{health}\n")
+    );
+    assert_eq!(
+        srv.read_as_reader(&format!("{base}?contains=8000-000000000003"))
+            .await
+            .1,
+        format!("{}\n", event(3))
+    );
+    // A configured agent without data
+    assert_eq!(
+        srv.read_as_reader("/api/v1/agents/lab-ws02/events").await,
+        (StatusCode::OK, String::new())
+    );
+    // Errors, once authenticated
+    for path in [
+        "/api/v1/agents/nobody/events",
+        "/api/v1/agents/%2e%2e/events",
+    ] {
+        assert_eq!(
+            srv.read_as_reader(path).await.0,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    for query in ["bogus=1", "from=yesterday", "limit=0", "category=File%3B"] {
+        assert_eq!(
+            srv.read_as_reader(&format!("{base}?{query}")).await.0,
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
+
+    // Agent status through the read API
+    let (status, body) = srv.read_as_reader("/api/v1/agents").await;
+    assert_eq!(status, StatusCode::OK);
+    let agents: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 2);
+    assert!(srv
+        .read_as_reader("/api/v1/agents?format=text")
+        .await
+        .1
+        .contains("lab-ws01"));
     srv.stop().await;
 }

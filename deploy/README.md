@@ -14,7 +14,9 @@ directory contains everything needed to run it on AWS (Tokyo region,
  | spool on failure  |                    | threatfalcon-server (sandboxed, no root) |
  +-------------------+                    |   /var/lib/threatfalcon-server/agents/*  |
                                           |   admin API 127.0.0.1:8081 (not exposed) |
-                                          +------------------------------------------+
+ Workstation (optional)   HTTPS :8443     |   read API  127.0.0.1:8082               |
+ curl + threatfalcon CLI ---------------> |   (8443 open to ReaderCidr only)         |
+   Bearer tfr_...                         +------------------------------------------+
  git push main -> GitHub Actions: test, build -> S3 bundle -> SSM (fixed document)
                -> threatfalcon-server-deploy: verify, install, restart, health check
 ```
@@ -119,13 +121,15 @@ Optional parameters:
 | `VolumeSize` | `30` | GiB; telemetry lives on this volume |
 | `SnapshotRetention` | `7` | daily snapshots of the volume to keep |
 | `IngressCidr` | `0.0.0.0/0` | restrict 443 to your agents' egress IPs if they are fixed |
+| `ReaderCidr` | (none) | the one address (e.g. `203.0.113.10/32`) allowed to reach the [read API](#7-read-api-from-your-workstation-optional) on 8443; empty keeps 8443 closed |
 | `HostedZoneId` | (none) | Route 53 zone of `DomainName`; creates the A record |
 | `VpcId`, `SubnetId` | default VPC | both or neither; the subnet must be public |
 | `GitHubRepository` | `uky007/ThreatFalcon` | repository allowed to deploy |
 | `GitHubOidcProviderArn` | (create one) | set this if the account already has the `token.actions.githubusercontent.com` provider, e.g. `arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com` |
 
 The stack creates: the EC2 instance with an Elastic IP (IMDSv2 only,
-encrypted gp3 volume), a security group that only opens 443, a private and
+encrypted gp3 volume), a security group that opens 443 (and 8443 to
+`ReaderCidr` when it is set), a private and
 encrypted S3 bucket for release bundles (expired after 30 days), the
 instance role (SSM agent + read bundles), the GitHub OIDC provider and deploy
 role, the deploy SSM document, and a Data Lifecycle Manager policy that
@@ -209,6 +213,62 @@ The file contains the token: restrict it to SYSTEM and Administrators
 (`icacls C:\ProgramData\ThreatFalcon\threatfalcon.toml /inheritance:r /grant:r SYSTEM:F Administrators:F`).
 Within a minute (one health interval) the agent shows up as `ok` in the status API.
 
+### 7. Read API from your workstation (optional)
+
+To investigate from your own machine instead of a Session Manager shell, the
+server can serve agent status and stored events on port 8443. Access needs
+both: the security group opens 8443 only to `ReaderCidr`, and every request
+needs a reader token. Reader tokens are separate from agent tokens (neither
+works in place of the other) and are created on the workstation, so only
+their hash ever reaches the server.
+
+1. On the workstation, create the token (kept as a curl header file) and
+   print its hash:
+
+   ```bash
+   umask 077 && mkdir -p ~/.config/threatfalcon
+   t="tfr_$(openssl rand -hex 32)"
+   printf 'Authorization: Bearer %s\n' "$t" > ~/.config/threatfalcon/reader.header
+   printf '%s' "$t" | sha256sum | cut -d' ' -f1; unset t
+   ```
+
+2. On the server, register the hash (this also enables `reader_listen`):
+
+   ```bash
+   sudo threatfalcon-server reader add laptop --token-sha256 <hash>
+   sudo systemctl restart threatfalcon-server
+   ```
+
+3. Open 8443 to the workstation's address, by updating the stack (in
+   CloudShell, other parameters keep their values):
+
+   ```bash
+   aws cloudformation deploy --stack-name threatfalcon-server \
+     --template-file deploy/aws/threatfalcon-server.yaml \
+     --capabilities CAPABILITY_NAMED_IAM \
+     --parameter-overrides ReaderCidr=203.0.113.10/32
+   ```
+
+   When the address changes, run it again with the new one; an empty
+   `ReaderCidr=` closes 8443 again. (Editing the security group by hand
+   also works, but the next stack update reverts it.)
+
+4. Servers installed before the read API existed also need the Caddy site
+   for 8443: re-apply the host config (see [Operations](#operations)).
+
+Then, from the workstation:
+
+```bash
+H=~/.config/threatfalcon/reader.header
+U=https://tf.example.com:8443/api/v1
+curl -sS -H @$H "$U/agents?format=text"
+curl -sS --compressed -H @$H \
+  "$U/agents/lab-ws01/events?from=2026-11-15T05:00:00Z&category=File" > events.jsonl
+threatfalcon stats --input events.jsonl
+```
+
+See [Read API](#read-api-port-8443) for the parameters.
+
 ## Operations
 
 All commands run on the server (`aws ssm start-session --target <InstanceId>`).
@@ -224,6 +284,8 @@ All commands run on the server (`aws ssm start-session --target <InstanceId>`).
 | Investigate | `sudo -u threatfalcon threatfalcon hunt --rotated --input /var/lib/threatfalcon-server/agents/lab-ws01/events.jsonl` (also `query`, `stats`, `score`, `tree`, `ioc`, `explain`, `bundle`). `--rotated` includes the rotated files `events.jsonl.N` (older history); without it only the active file is read and a note says how many older files were left out |
 | Follow live | `sudo -u threatfalcon threatfalcon tail --input /var/lib/threatfalcon-server/agents/lab-ws01/events.jsonl` |
 | Revoke an agent | `sudo threatfalcon-server token remove lab-ws01 && sudo systemctl restart threatfalcon-server` (its data is kept) |
+| Revoke a reader | `sudo threatfalcon-server reader remove laptop && sudo systemctl restart threatfalcon-server`; `reader list` shows the readers |
+| Read API log | `/var/log/caddy/threatfalcon-reader-access.log`; exports are also logged by the server (`journalctl -u threatfalcon-server`, "events exported") |
 | Rotate a token | `token remove` then `token add` with the same name |
 | Releases on disk | `ls -lt /opt/threatfalcon-server/releases` (`current` is a symlink) |
 | Manual rollback | `sudo ln -sfn /opt/threatfalcon-server/releases/<dir> /opt/threatfalcon-server/current && sudo systemctl restart threatfalcon-server`, or re-run an older successful run of the deploy workflow |
@@ -325,6 +387,7 @@ need.
 |-----|---------|---------|
 | `listen` | `127.0.0.1:8080` | ingest listener (plain HTTP behind Caddy) |
 | `admin_listen` | `127.0.0.1:8081` | status API and metrics; must be loopback (unauthenticated) |
+| `reader_listen` | off | read API (reader tokens); must be loopback, published by Caddy on 8443; set by the first `reader add` |
 | `data_dir` | `/var/lib/threatfalcon-server` | storage root |
 | `public_url` | - | only used in `token add` output |
 | `limits.max_body_mb` | 16 | request body as received |
@@ -338,6 +401,7 @@ need.
 | `storage.fsync` | true | fsync each batch before acknowledging |
 | `status.stale_after_secs` | 300 | |
 | `[[agents]]` `name`, `token_sha256` | - | managed by `threatfalcon-server token add/remove/list` |
+| `[[readers]]` `name`, `token_sha256` | - | managed by `threatfalcon-server reader add/remove/list` |
 
 Unknown keys are rejected. Check a config with
 `threatfalcon-server check-config --config <path>`.
@@ -384,6 +448,30 @@ information is exposed publicly).
   `..._agent_failed_requests_total`; globally `..._auth_failures_total`,
   `..._server_errors_total`, `..._disk_available_bytes`, ... (all prefixed
   `threatfalcon_server_`)
+
+### Read API (port 8443)
+
+Behind Caddy on `https://<domain>:8443`, reachable only from `ReaderCidr`.
+Every request except `/healthz` needs `Authorization: Bearer <reader token>`
+(401 otherwise, before anything else in the request is looked at). Read only.
+
+- `GET /healthz`: `ok` (to check that the port is reachable)
+- `GET /api/v1/agents[?format=text]`: per-agent status, as on the admin API
+- `GET /api/v1/agents/<agent>/events`: the agent's stored events as JSON
+  lines (`application/x-ndjson`, gzip with `--compressed`), oldest first,
+  rotated files included. Query parameters, all optional:
+
+  | Parameter | Meaning |
+  |-----------|---------|
+  | `from`, `to` | inclusive bounds on the event `timestamp` (RFC 3339, e.g. `2026-11-15T05:00:00Z`) |
+  | `category` | e.g. `File`, `Registry`, `Process` (case-insensitive) |
+  | `contains` | substring of the stored JSON line (as stored: `\` in paths is `\\`), up to 256 bytes |
+  | `limit` | events to return, default 100000, at most 1000000; if exactly `limit` lines come back there may be more: continue with `from` set to the last timestamp |
+
+  Unknown parameters and agents are refused (400, 404). At most two exports
+  run at a time (503 with `Retry-After` beyond that). Files whose write
+  times show they cannot hold events of the requested range (allowing 24 h
+  of agent clock skew) are not read.
 
 ## Running without AWS
 

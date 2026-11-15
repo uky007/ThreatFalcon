@@ -9,7 +9,7 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: "Server" }
-        Parameters: [DomainName, AcmeEmail, ImageId, InstanceType, VolumeSize, IngressCidr, SnapshotRetention]
+        Parameters: [DomainName, AcmeEmail, ImageId, InstanceType, VolumeSize, IngressCidr, ReaderCidr, SnapshotRetention]
       - Label: { default: "Network (optional; default VPC when empty)" }
         Parameters: [VpcId, SubnetId, HostedZoneId]
       - Label: { default: "GitHub deployment" }
@@ -57,6 +57,13 @@ Parameters:
     Default: 0.0.0.0/0
     Description: Addresses allowed to reach HTTPS (443). Narrow this if your agents have fixed egress IPs.
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  ReaderCidr:
+    Type: String
+    Default: ""
+    Description: >-
+      Address allowed to reach the read API on port 8443, e.g. 203.0.113.10/32
+      (the workstation that investigates). Empty keeps port 8443 closed.
+    AllowedPattern: '^$|^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
   VpcId:
     Type: String
     Default: ""
@@ -100,11 +107,16 @@ Rules:
           - !And [!Equals [!Ref VpcId, ""], !Equals [!Ref SubnetId, ""]]
           - !And [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
         AssertDescription: Set both VpcId and SubnetId, or neither (default VPC).
+  ReaderNotPublic:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ReaderCidr, "0.0.0.0/0"]]
+        AssertDescription: ReaderCidr must name the investigating workstation, not the whole internet.
 
 Conditions:
   HasCustomNetwork: !Not [!Equals [!Ref SubnetId, ""]]
   HasCustomVpc: !Not [!Equals [!Ref VpcId, ""]]
   HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasReader: !Not [!Equals [!Ref ReaderCidr, ""]]
   CreateOidcProvider: !Equals [!Ref GitHubOidcProviderArn, ""]
 
 Resources:
@@ -197,6 +209,14 @@ Resources:
           ToPort: 443
           CidrIp: !Ref IngressCidr
           Description: HTTPS ingest from ThreatFalcon agents
+        - !If
+          - HasReader
+          - IpProtocol: tcp
+            FromPort: 8443
+            ToPort: 8443
+            CidrIp: !Ref ReaderCidr
+            Description: Read API for the investigating workstation
+          - !Ref AWS::NoValue
       # Egress: the default allow-all rule (apt, Let's Encrypt, SSM, S3).
 
   # The instance volume is the only copy of the stored telemetry. Neither a
@@ -391,6 +411,10 @@ Outputs:
   IngestUrl:
     Description: Agent [output] url
     Value: !Sub "https://${DomainName}/api/v1/events"
+  ReaderUrl:
+    Condition: HasReader
+    Description: Read API (reader token required)
+    Value: !Sub "https://${DomainName}:8443/api/v1/agents"
   InstanceId:
     Value: !Ref Instance
   DeployBucketName:

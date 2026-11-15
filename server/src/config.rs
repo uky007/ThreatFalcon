@@ -23,6 +23,12 @@ pub struct ServerConfig {
     /// bound to a loopback address.
     #[serde(default = "default_admin_listen")]
     pub admin_listen: SocketAddr,
+    /// Read API listener (agent status and stored events for investigation
+    /// clients, with reader tokens). Off unless set; must be a loopback
+    /// address, published through the TLS proxy on a port that the network
+    /// only opens to the readers' addresses.
+    #[serde(default)]
+    pub reader_listen: Option<SocketAddr>,
     /// Root directory for stored telemetry. Relative paths are resolved
     /// against the directory that contains the config file.
     #[serde(default = "default_data_dir")]
@@ -39,6 +45,9 @@ pub struct ServerConfig {
     /// One entry per agent. Managed with `threatfalcon-server token add`.
     #[serde(default)]
     pub agents: Vec<AgentEntry>,
+    /// Read API clients. Managed with `threatfalcon-server reader add`.
+    #[serde(default)]
+    pub readers: Vec<AgentEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,6 +175,16 @@ impl ServerConfig {
         if self.listen == self.admin_listen && self.listen.port() != 0 {
             bail!("listen and admin_listen must differ");
         }
+        if let Some(reader) = self.reader_listen {
+            if !reader.ip().is_loopback() {
+                bail!(
+                    "reader_listen ({reader}) must be a loopback address: publish it through the TLS proxy"
+                );
+            }
+            if reader.port() != 0 && (reader == self.listen || reader == self.admin_listen) {
+                bail!("reader_listen must differ from listen and admin_listen");
+            }
+        }
         if let Some(url) = &self.public_url {
             if !(url.starts_with("https://") || url.starts_with("http://")) {
                 bail!("public_url must start with https:// or http://");
@@ -218,6 +237,28 @@ impl ServerConfig {
             }
             if !hashes.insert(agent.token_sha256.as_str()) {
                 bail!("agent {:?} reuses another agent's token", agent.name);
+            }
+        }
+        let mut reader_names = HashSet::new();
+        for reader in &self.readers {
+            if !is_valid_agent_name(&reader.name) {
+                bail!(
+                    "invalid reader name {:?}: use 1-{MAX_AGENT_NAME_LEN} characters from [a-z0-9._-], starting with a letter or digit",
+                    reader.name
+                );
+            }
+            if !is_valid_token_hash(&reader.token_sha256) {
+                bail!(
+                    "reader {:?}: token_sha256 must be 64 lowercase hex characters",
+                    reader.name
+                );
+            }
+            if !reader_names.insert(reader.name.as_str()) {
+                bail!("duplicate reader name {:?}", reader.name);
+            }
+            // A token must never be valid for both ingest and reading.
+            if !hashes.insert(reader.token_sha256.as_str()) {
+                bail!("reader {:?} reuses another token", reader.name);
             }
         }
         Ok(())
@@ -330,6 +371,35 @@ mod tests {
     fn rejects_public_admin_listener() {
         let err = parse("admin_listen = \"0.0.0.0:8081\"").unwrap_err();
         assert!(format!("{err:#}").contains("loopback"));
+    }
+
+    #[test]
+    fn reader_listener_is_off_by_default_and_loopback_only() {
+        assert_eq!(parse("").unwrap().reader_listen, None);
+        let cfg = parse("reader_listen = \"127.0.0.1:8082\"").unwrap();
+        assert_eq!(cfg.reader_listen, Some("127.0.0.1:8082".parse().unwrap()));
+        let err = parse("reader_listen = \"0.0.0.0:8082\"").unwrap_err();
+        assert!(format!("{err:#}").contains("loopback"));
+        assert!(parse("reader_listen = \"127.0.0.1:8081\"").is_err());
+    }
+
+    #[test]
+    fn validates_readers() {
+        let reader = |name: &str, hash: &str| {
+            format!("[[readers]]\nname = {name:?}\ntoken_sha256 = {hash:?}\n")
+        };
+        let cfg = parse(&reader("laptop", HASH_A)).unwrap();
+        assert_eq!(cfg.readers.len(), 1);
+        assert!(parse(&reader("Laptop!", HASH_A)).is_err());
+        assert!(parse(&reader("laptop", "short")).is_err());
+        assert!(parse(&format!("{}{}", reader("a", HASH_A), reader("a", HASH_B))).is_err());
+        // A reader token must not also be an agent token
+        let shared = format!(
+            "[[agents]]\nname = \"ws\"\ntoken_sha256 = \"{HASH_A}\"\n{}",
+            reader("laptop", HASH_A)
+        );
+        let err = parse(&shared).unwrap_err();
+        assert!(format!("{err:#}").contains("reuses"), "{err:#}");
     }
 
     #[test]

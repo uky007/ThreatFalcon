@@ -1,5 +1,6 @@
-//! `token add | remove | list`: edit the `[[agents]]` list in the config
-//! file in place, preserving its comments and formatting.
+//! `token add | remove | list` and `reader add | remove | list`: edit the
+//! `[[agents]]` and `[[readers]]` lists in the config file in place,
+//! preserving its comments and formatting.
 
 use std::fs::{self, OpenOptions, Permissions};
 use std::io::Write;
@@ -10,7 +11,10 @@ use anyhow::{bail, Context, Result};
 use toml_edit::{value, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::auth::{generate_token, token_sha256_hex};
-use crate::config::{is_valid_agent_name, ServerConfig};
+use crate::config::{is_valid_agent_name, is_valid_token_hash, ServerConfig};
+
+/// `reader_listen` set by the first `reader add` when none is configured.
+pub const DEFAULT_READER_LISTEN: &str = "127.0.0.1:8082";
 
 /// Add an agent with a freshly generated token. Returns the token, which is
 /// not stored anywhere (only its hash is).
@@ -30,38 +34,82 @@ pub fn add_agent(config_path: &Path, name: &str) -> Result<String> {
     let token = generate_token()?;
     let hash = token_sha256_hex(&token);
     let mut doc = parse_document(&text, &path)?;
+    push_entry(&mut doc, "agents", name, &hash, &path)?;
+    write_validated(&path, &doc)?;
+    Ok(token)
+}
+
+/// Add a read API client by the SHA-256 of a token generated on the client,
+/// so the token itself never reaches the server. Also sets `reader_listen`
+/// to [`DEFAULT_READER_LISTEN`] if it is not set; returns whether it did.
+pub fn add_reader(config_path: &Path, name: &str, token_sha256: &str) -> Result<bool> {
+    if !is_valid_agent_name(name) {
+        bail!(
+            "invalid reader name {name:?}: use 1-64 characters from [a-z0-9._-], starting with a letter or digit"
+        );
+    }
+    if !is_valid_token_hash(token_sha256) {
+        bail!("the token hash must be 64 lowercase hex characters (sha256sum of the token)");
+    }
+    let path = resolve(config_path)?;
+    let text = read(&path)?;
+    let config = ServerConfig::parse(&text, &path)?;
+    if config.readers.iter().any(|r| r.name == name) {
+        bail!("reader {name:?} already exists in {}", path.display());
+    }
+
+    let mut doc = parse_document(&text, &path)?;
+    push_entry(&mut doc, "readers", name, token_sha256, &path)?;
+    let enable = config.reader_listen.is_none();
+    if enable {
+        doc["reader_listen"] = value(DEFAULT_READER_LISTEN);
+    }
+    // Validation also refuses a hash that is already an agent's token.
+    write_validated(&path, &doc)?;
+    Ok(enable)
+}
+
+fn push_entry(doc: &mut DocumentMut, key: &str, name: &str, hash: &str, path: &Path) -> Result<()> {
     match doc
-        .entry("agents")
+        .entry(key)
         .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
     {
         Item::ArrayOfTables(tables) => {
             let mut table = Table::new();
             table.insert("name", value(name));
-            table.insert("token_sha256", value(&hash));
+            table.insert("token_sha256", value(hash));
             tables.push(table);
         }
         Item::Value(Value::Array(array)) => {
             let mut table = InlineTable::new();
             table.insert("name", name.into());
-            table.insert("token_sha256", hash.as_str().into());
+            table.insert("token_sha256", hash.into());
             array.push(table);
         }
         _ => bail!(
-            "`agents` in {} must be an array of tables ([[agents]])",
+            "`{key}` in {} must be an array of tables ([[{key}]])",
             path.display()
         ),
     }
-    write_validated(&path, &doc)?;
-    Ok(token)
+    Ok(())
 }
 
 /// Remove an agent. Its stored telemetry is left in place.
 pub fn remove_agent(config_path: &Path, name: &str) -> Result<()> {
+    remove_entry(config_path, "agents", "agent", name)
+}
+
+/// Remove a read API client.
+pub fn remove_reader(config_path: &Path, name: &str) -> Result<()> {
+    remove_entry(config_path, "readers", "reader", name)
+}
+
+fn remove_entry(config_path: &Path, key: &str, kind: &str, name: &str) -> Result<()> {
     let path = resolve(config_path)?;
     let text = read(&path)?;
     ServerConfig::parse(&text, &path)?;
     let mut doc = parse_document(&text, &path)?;
-    let removed = match doc.get_mut("agents") {
+    let removed = match doc.get_mut(key) {
         Some(Item::ArrayOfTables(tables)) => {
             let before = tables.len();
             tables.retain(|t| t.get("name").and_then(Item::as_str) != Some(name));
@@ -80,7 +128,7 @@ pub fn remove_agent(config_path: &Path, name: &str) -> Result<()> {
         _ => 0,
     };
     if removed == 0 {
-        bail!("agent {name:?} not found in {}", path.display());
+        bail!("{kind} {name:?} not found in {}", path.display());
     }
     write_validated(&path, &doc)
 }
@@ -88,11 +136,20 @@ pub fn remove_agent(config_path: &Path, name: &str) -> Result<()> {
 /// Configured agents as (name, first 12 hex characters of the token hash).
 pub fn list_agents(config_path: &Path) -> Result<Vec<(String, String)>> {
     let config = ServerConfig::load(config_path)?;
-    Ok(config
-        .agents
+    Ok(short_hashes(config.agents))
+}
+
+/// Configured readers as (name, first 12 hex characters of the token hash).
+pub fn list_readers(config_path: &Path) -> Result<Vec<(String, String)>> {
+    let config = ServerConfig::load(config_path)?;
+    Ok(short_hashes(config.readers))
+}
+
+fn short_hashes(entries: Vec<crate::config::AgentEntry>) -> Vec<(String, String)> {
+    entries
         .into_iter()
         .map(|a| (a.name, a.token_sha256[..12].to_string()))
-        .collect())
+        .collect()
 }
 
 /// Operate on the real file if the config path is a symlink.
@@ -173,6 +230,55 @@ mod tests {
         fs::write(&path, text).unwrap();
         fs::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
         path
+    }
+
+    #[test]
+    fn reader_add_enables_the_listener_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, BASE);
+        let hash = token_sha256_hex("tfr_client_side_secret");
+
+        assert!(add_reader(&path, "laptop", &hash).unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# ThreatFalcon server\n"), "{text}");
+        let config = ServerConfig::load(&path).unwrap();
+        assert_eq!(
+            config.reader_listen,
+            Some(DEFAULT_READER_LISTEN.parse().unwrap())
+        );
+        let readers = TokenTable::new(&config.readers).unwrap();
+        assert_eq!(
+            readers.verify("tfr_client_side_secret").as_deref(),
+            Some("laptop")
+        );
+        assert!(config.agents.is_empty());
+
+        // The listener is only set once; names must be unique
+        let other = token_sha256_hex("another");
+        assert!(!add_reader(&path, "desk", &other).unwrap());
+        assert!(add_reader(&path, "desk", &token_sha256_hex("third")).is_err());
+        assert_eq!(list_readers(&path).unwrap().len(), 2);
+
+        remove_reader(&path, "laptop").unwrap();
+        assert!(remove_reader(&path, "laptop").is_err());
+        let names: Vec<_> = list_readers(&path)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(names, ["desk"]);
+    }
+
+    #[test]
+    fn reader_add_rejects_bad_hashes_and_agent_tokens() {
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, BASE);
+        assert!(add_reader(&path, "laptop", "not-a-hash").is_err());
+        assert!(add_reader(&path, "laptop", &"A".repeat(64)).is_err());
+        let agent_token = add_agent(&path, "ws01").unwrap();
+        let err = add_reader(&path, "laptop", &token_sha256_hex(&agent_token)).unwrap_err();
+        assert!(format!("{err:#}").contains("reuses"), "{err:#}");
+        assert!(list_readers(&path).unwrap().is_empty());
     }
 
     #[test]

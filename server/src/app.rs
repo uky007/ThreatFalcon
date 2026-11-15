@@ -1,17 +1,23 @@
-//! HTTP layer: the ingest listener (agents, behind the TLS proxy) and the
-//! loopback-only admin listener (status API, metrics).
+//! HTTP layer: the ingest listener (agents, behind the TLS proxy), the
+//! loopback-only admin listener (status API, metrics) and the optional read
+//! API listener (status and stored events for reader tokens, behind the TLS
+//! proxy on a port the network opens only to the readers).
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::body::Body;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,10 +27,11 @@ use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::auth::{bearer_token, TokenTable};
 use crate::config::ServerConfig;
+use crate::export::{self, ExportFilter, ExportQuery};
 use crate::ingest::{self, BatchSummary, ContentEncoding, IngestError};
 use crate::status::{self, BatchRecord, StatusRegistry};
 use crate::store::{FreeSpace, Store, StoreSettings, WriteOutcome, DEFAULT_DEDUP_WINDOW};
@@ -33,9 +40,17 @@ use crate::store::{FreeSpace, Store, StoreSettings, WriteOutcome, DEFAULT_DEDUP_
 const PERMIT_WAIT: Duration = Duration::from_secs(10);
 /// How long in-flight requests may run after a shutdown signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+/// Event exports running at the same time (each reads files on a blocking
+/// thread).
+const MAX_CONCURRENT_EXPORTS: usize = 2;
 
 pub struct AppState {
     tokens: TokenTable,
+    /// Read API tokens, separate from the agents' tokens.
+    readers: TokenTable,
+    /// Configured agents: the read API serves only these.
+    agent_names: HashSet<String>,
+    exports: Arc<Semaphore>,
     store: Store,
     status: StatusRegistry,
     limits: Limits,
@@ -53,6 +68,8 @@ struct Limits {
 
 #[derive(Default)]
 struct Metrics {
+    reader_requests: AtomicU64,
+    reader_auth_failures: AtomicU64,
     auth_failures: AtomicU64,
     batches_ok: AtomicU64,
     client_errors: AtomicU64,
@@ -63,10 +80,11 @@ pub struct Server {
     state: Arc<AppState>,
     ingest: TcpListener,
     admin: TcpListener,
+    reader: Option<TcpListener>,
 }
 
 impl Server {
-    /// Open the data directory and bind both listeners.
+    /// Open the data directory and bind the listeners.
     pub async fn bind(config: &ServerConfig) -> Result<Self> {
         let store = Store::open(
             &config.data_dir,
@@ -99,9 +117,20 @@ impl Server {
         let admin = TcpListener::bind(config.admin_listen)
             .await
             .with_context(|| format!("failed to bind admin listener {}", config.admin_listen))?;
+        let reader = match config.reader_listen {
+            Some(addr) => Some(
+                TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("failed to bind reader listener {addr}"))?,
+            ),
+            None => None,
+        };
 
         let state = AppState {
             tokens,
+            readers: TokenTable::new(&config.readers)?,
+            agent_names: config.agents.iter().map(|a| a.name.clone()).collect(),
+            exports: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
             store,
             status,
             limits: Limits {
@@ -118,6 +147,7 @@ impl Server {
             state: Arc::new(state),
             ingest,
             admin,
+            reader,
         })
     }
 
@@ -129,12 +159,23 @@ impl Server {
         self.admin.local_addr()
     }
 
+    /// The read API listener's address, if it is enabled.
+    pub fn reader_addr(&self) -> Option<SocketAddr> {
+        self.reader.as_ref().and_then(|l| l.local_addr().ok())
+    }
+
     /// Serve until `shutdown` resolves, then let in-flight requests finish
     /// (bounded by `SHUTDOWN_GRACE`).
     pub async fn run<F>(self, shutdown: F) -> Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let Self {
+            state,
+            ingest,
+            admin,
+            reader,
+        } = self;
         let (tx, rx) = watch::channel(false);
         tokio::spawn(async move {
             shutdown.await;
@@ -145,13 +186,28 @@ impl Server {
         };
 
         let ingest = axum::serve(
-            self.ingest,
-            ingest_router(self.state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+            ingest,
+            ingest_router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(stopped(rx.clone()));
-        let admin = axum::serve(self.admin, admin_router(self.state.clone()))
+        let admin = axum::serve(admin, admin_router(state.clone()))
             .with_graceful_shutdown(stopped(rx.clone()));
-        let serve_both = async { tokio::try_join!(ingest.into_future(), admin.into_future()) };
+        let reader_rx = rx.clone();
+        let reader = async move {
+            match reader {
+                Some(listener) => {
+                    axum::serve(
+                        listener,
+                        reader_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(stopped(reader_rx))
+                    .await
+                }
+                None => Ok(()),
+            }
+        };
+        let serve_both =
+            async { tokio::try_join!(ingest.into_future(), admin.into_future(), reader) };
         let deadline = async {
             stopped(rx.clone()).await;
             tokio::time::sleep(SHUTDOWN_GRACE).await;
@@ -180,6 +236,15 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(admin_health))
         .route("/api/v1/agents", get(list_agents))
         .route("/metrics", get(metrics))
+        .fallback(not_found)
+        .with_state(state)
+}
+
+pub fn reader_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/api/v1/agents", get(reader_agents))
+        .route("/api/v1/agents/{agent}/events", get(export_events))
         .fallback(not_found)
         .with_state(state)
 }
@@ -547,6 +612,135 @@ async fn list_agents(
     .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Read API
+// ---------------------------------------------------------------------------
+
+/// The reader for a valid reader token (failures are counted and logged).
+fn authorize_reader(state: &AppState, peer: SocketAddr, headers: &HeaderMap) -> Option<Arc<str>> {
+    state
+        .metrics
+        .reader_requests
+        .fetch_add(1, Ordering::Relaxed);
+    let reader = header_str(headers, header::AUTHORIZATION)
+        .and_then(bearer_token)
+        .and_then(|token| state.readers.verify(token));
+    if reader.is_none() {
+        state
+            .metrics
+            .reader_auth_failures
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(remote = %client_addr(peer, headers), "rejected read request: missing or invalid token");
+    }
+    reader
+}
+
+fn unauthorized() -> Response {
+    let mut resp = error_body(
+        StatusCode::UNAUTHORIZED,
+        "missing or invalid bearer token",
+        &[],
+    );
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    resp
+}
+
+async fn reader_agents(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    query: Query<AgentsQuery>,
+) -> Response {
+    if authorize_reader(&state, peer, &headers).is_none() {
+        return unauthorized();
+    }
+    list_agents(State(state), query).await
+}
+
+/// `GET /api/v1/agents/{agent}/events`: the agent's stored events that match
+/// the query, oldest first, as JSON lines (`application/x-ndjson`).
+async fn export_events(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(agent): Path<String>,
+    headers: HeaderMap,
+    query: Result<Query<ExportQuery>, QueryRejection>,
+) -> Response {
+    // Authenticate before looking at anything else in the request.
+    let Some(reader) = authorize_reader(&state, peer, &headers) else {
+        return unauthorized();
+    };
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(e) => return error_body(StatusCode::BAD_REQUEST, &e.body_text(), &[]),
+    };
+    if !state.agent_names.contains(&agent) {
+        return error_body(StatusCode::NOT_FOUND, "unknown agent", &[]);
+    }
+    let filter = match ExportFilter::from_query(query) {
+        Ok(filter) => filter,
+        Err(message) => return error_body(StatusCode::BAD_REQUEST, &message, &[]),
+    };
+    let Ok(permit) = state.exports.clone().try_acquire_owned() else {
+        return Failure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many exports in progress, retry later",
+        )
+        .retry_after(10)
+        .into_response();
+    };
+
+    let dir = state.store.agent_dir(&agent);
+    let remote = client_addr(peer, &headers);
+    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(8);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match export::export(&dir, &filter, |chunk| tx.blocking_send(Ok(chunk)).is_ok()) {
+            Ok(stats) => tracing::info!(
+                reader = %reader,
+                remote = %remote,
+                agent = %agent,
+                events = stats.events,
+                files = stats.files,
+                limit_reached = stats.limit_reached,
+                aborted = stats.aborted,
+                "events exported"
+            ),
+            Err(e) => {
+                tracing::error!(reader = %reader, agent = %agent, error = %e, "event export failed");
+                // Ends the response with an error, so the client sees an
+                // incomplete transfer rather than a short but valid one.
+                let _ = tx.blocking_send(Err(e));
+            }
+        }
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::new(ChunkBody { rx }))
+        .unwrap_or_else(|_| error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal error", &[]))
+}
+
+/// Response body fed by an export running on a blocking thread.
+struct ChunkBody {
+    rx: mpsc::Receiver<io::Result<Bytes>>,
+}
+
+impl http_body::Body for ChunkBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, io::Error>>> {
+        self.rx
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(|result| result.map(http_body::Frame::data)))
+    }
+}
+
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let now = Utc::now();
     let views = state.status.snapshot(now);
@@ -594,6 +788,18 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "counter",
         "Ingest requests rejected for a missing or invalid token.",
         &global(m.auth_failures.load(Ordering::Relaxed) as f64),
+    );
+    metric(
+        "reader_requests_total",
+        "counter",
+        "Requests to the read API.",
+        &global(m.reader_requests.load(Ordering::Relaxed) as f64),
+    );
+    metric(
+        "reader_auth_failures_total",
+        "counter",
+        "Read API requests rejected for a missing or invalid reader token.",
+        &global(m.reader_auth_failures.load(Ordering::Relaxed) as f64),
     );
     metric(
         "batches_ok_total",
