@@ -57,8 +57,8 @@ On every push to `main` (and on manual runs), `.github/workflows/deploy-server.y
    If that fails, the previous release is restored and the workflow fails.
 
 Caddy holds incoming requests for up to 10 s while the service restarts, and
-agents with `spool_dir` keep any batch that still fails, so deployments do not
-lose telemetry.
+agents keep retrying any batch that still fails (newer batches wait in memory,
+then in `spool_dir`), so deployments do not lose telemetry.
 
 What CI is allowed to do, by design:
 
@@ -357,13 +357,17 @@ server update. Elements that fail the check are quarantined, not dropped.
 | Status | Meaning | Sensor behaviour |
 |--------|---------|------------------|
 | 200 | durable; body `{"accepted": n, "duplicates": d, "quarantined": q, "errors": [...]}` (new events stored, already stored events skipped, invalid elements quarantined, first validation errors) | done |
-| 400 | body is not a JSON array, or bad gzip | retries, then spools |
-| 401 | missing or unknown token | retries, then spools |
-| 413 | body, decoded payload or event count over the limits | retries, then spools |
-| 415 | unsupported `Content-Type` / `Content-Encoding` | retries, then spools |
-| 503 | too many concurrent requests (`Retry-After`) | retries, then spools |
-| 507 | low disk space (`Retry-After`) | retries, then spools |
-| 500 | storage error | retries, then spools |
+| 400 | body is not a JSON array, or bad gzip | drops the batch and counts it (not retried) |
+| 401 | missing or unknown token | retries with backoff |
+| 413 | body, decoded payload or event count over the limits | drops the batch and counts it (not retried) |
+| 415 | unsupported `Content-Type` / `Content-Encoding` | retries with backoff |
+| 503 | too many concurrent requests (`Retry-After`) | retries with backoff |
+| 507 | low disk space (`Retry-After`) | retries with backoff |
+| 500 | storage error | retries with backoff |
+
+While the sensor retries a batch, newer batches wait in its memory
+(`queue_max_mb`) and then in its spool (`spool_dir`); collection is never
+paused for delivery.
 
 `GET /healthz` returns `ok` (used for the external smoke test; no version
 information is exposed publicly).
@@ -405,11 +409,11 @@ Outside the stack there are no automatic snapshots: back up
   volume itself is lost. Restoring is manual (see above).
 - No web UI and no built-in alerting yet: use the status API / metrics for
   liveness and the CLI on the server for investigation.
-- The sensor retries and spools on every non-2xx response, so a request the
-  server rejects as a whole (400/413/415) stays in the agent's spool. Invalid
-  elements inside a batch do not cause this (they are quarantined); with the
-  official sensor it only happens if the server limits are set below what the
-  agents send.
+- A batch the server rejects as a whole with 400 or 413 is dropped by the
+  sensor (and counted in its health event, shown as `sink dropped N events`).
+  Invalid elements inside a batch do not cause this (they are quarantined);
+  with the official sensor it only happens if the server limits are set below
+  what the agents send: lower the agents' `batch_size` or raise the limits.
 - Duplicate suppression covers the last 200,000 events per agent (about 12 MB
   of memory per agent). That covers the sensor's re-sends (a retried batch
   follows its original within a few batches), but a re-send of more than

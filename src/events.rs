@@ -295,6 +295,9 @@ pub struct SinkStatus {
     /// Total bytes of spooled data currently on disk.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spool_bytes: u64,
+    /// Bytes of batches waiting in memory for delivery (HTTP sink).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queue_bytes: u64,
 }
 
 fn is_zero(v: &u64) -> bool {

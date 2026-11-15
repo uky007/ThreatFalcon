@@ -124,6 +124,11 @@ pub struct OutputConfig {
     /// Maximum total spool size in MB (default: 256). HTTP sink only.
     /// When exceeded, new spool writes fall back to dropping events.
     pub spool_max_mb: u64,
+    /// Memory for sealed batches waiting to be sent, in MB (default: 64).
+    /// HTTP sink only. Batches are sent in the background; when delivery
+    /// falls behind (slow or unreachable endpoint), batches beyond this
+    /// budget go to the spool, or are dropped if there is no spool.
+    pub queue_max_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -382,6 +387,7 @@ impl OutputConfig {
             gzip: false,
             spool_dir: None,
             spool_max_mb: 256,
+            queue_max_mb: 64,
         }
     }
 }
