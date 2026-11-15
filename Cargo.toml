@@ -6,6 +6,8 @@ description = "Lightweight endpoint telemetry sensor for Windows threat detectio
 license = "MIT"
 repository = "https://github.com/uky007/ThreatFalcon"
 readme = "README.md"
+# Server deployment files are not part of the sensor crate.
+exclude = ["/deploy"]
 keywords = ["security", "edr", "telemetry", "etw", "windows"]
 categories = ["os::windows-apis"]
 
@@ -52,3 +54,8 @@ predicates = "3"
 opt-level = 3
 lto = true
 strip = true
+
+# The management server (telemetry ingest) lives in server/. It is a
+# separate package so the sensor binary does not pull in server code.
+[workspace]
+members = ["server"]
