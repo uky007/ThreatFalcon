@@ -765,7 +765,7 @@ fn file_ident(file: &File) -> io::Result<(u64, u64)> {
 }
 
 /// Generations `N` of `<name>.N` files in `dir`, ascending.
-fn rotated_generations(dir: &Path, name: &str) -> io::Result<Vec<u32>> {
+pub(crate) fn rotated_generations(dir: &Path, name: &str) -> io::Result<Vec<u32>> {
     let prefix = format!("{name}.");
     let mut generations: Vec<u32> = fs::read_dir(dir)?
         .flatten()

@@ -10,6 +10,7 @@
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod export;
 pub mod ingest;
 pub mod status;
 pub mod store;

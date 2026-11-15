@@ -9,6 +9,10 @@
 listen = "127.0.0.1:8080"
 # Admin listener (agent status API, Prometheus metrics). Loopback only.
 admin_listen = "127.0.0.1:8081"
+# Read API listener (agent status and stored events, for reader tokens),
+# published by Caddy on port 8443. Off until set; `threatfalcon-server
+# reader add` sets it to this address when it adds the first reader.
+# reader_listen = "127.0.0.1:8082"
 # Telemetry is stored under <data_dir>/agents/<name>/events.jsonl.
 data_dir = "/var/lib/threatfalcon-server"
 # Printed in agent config snippets by `token add`.

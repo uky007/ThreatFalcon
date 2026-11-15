@@ -26,6 +26,9 @@ enum Command {
     /// Manage agent tokens
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Manage read API clients
+    #[command(subcommand)]
+    Reader(ReaderCommand),
 }
 
 #[derive(Args)]
@@ -66,12 +69,39 @@ enum TokenCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ReaderCommand {
+    /// Add a read API client by the SHA-256 of a token generated on the
+    /// client (the token itself never comes to the server)
+    Add {
+        /// Reader name: [a-z0-9._-]
+        name: String,
+        /// Lowercase hex SHA-256 of the client's token
+        #[arg(long, value_name = "HEX")]
+        token_sha256: String,
+        #[command(flatten)]
+        cfg: ConfigArg,
+    },
+    /// Remove a read API client
+    Remove {
+        name: String,
+        #[command(flatten)]
+        cfg: ConfigArg,
+    },
+    /// List read API clients
+    List {
+        #[command(flatten)]
+        cfg: ConfigArg,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Serve(arg) => serve(&arg.config),
         Command::CheckConfig(arg) => check_config(&arg.config),
         Command::Token(cmd) => token(cmd),
+        Command::Reader(cmd) => reader(cmd),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -96,8 +126,10 @@ fn serve(config_path: &Path) -> Result<()> {
             revision = REVISION,
             ingest = %server.ingest_addr()?,
             admin = %server.admin_addr()?,
+            reader = server.reader_addr().map(|a| a.to_string()).unwrap_or_else(|| "off".into()),
             data_dir = %config.data_dir.display(),
             agents = config.agents.len(),
+            readers = config.readers.len(),
             "threatfalcon-server started"
         );
         if config.agents.is_empty() {
@@ -140,8 +172,13 @@ fn check_config(config_path: &Path) -> Result<()> {
     println!("config OK: {}", config_path.display());
     println!("  ingest listener: {}", config.listen);
     println!("  admin listener:  {}", config.admin_listen);
+    match config.reader_listen {
+        Some(addr) => println!("  reader listener: {addr}"),
+        None => println!("  reader listener: off"),
+    }
     println!("  data directory:  {}", config.data_dir.display());
     println!("  agents:          {}", config.agents.len());
+    println!("  readers:         {}", config.readers.len());
     Ok(())
 }
 
@@ -189,6 +226,43 @@ fn token(cmd: TokenCommand) -> Result<()> {
                 println!("no agents configured");
             }
             for (name, hash_prefix) in agents {
+                println!("{name:<32} sha256:{hash_prefix}...");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn reader(cmd: ReaderCommand) -> Result<()> {
+    match cmd {
+        ReaderCommand::Add {
+            name,
+            token_sha256,
+            cfg,
+        } => {
+            let enabled = tokens::add_reader(&cfg.config, &name, &token_sha256)?;
+            println!("Added reader \"{name}\" to {}.", cfg.config.display());
+            if enabled {
+                println!(
+                    "Enabled the read API listener: reader_listen = \"{}\".",
+                    tokens::DEFAULT_READER_LISTEN
+                );
+            }
+            println!("Apply on the server:  sudo systemctl restart threatfalcon-server");
+            Ok(())
+        }
+        ReaderCommand::Remove { name, cfg } => {
+            tokens::remove_reader(&cfg.config, &name)?;
+            println!("Removed reader \"{name}\" from {}.", cfg.config.display());
+            println!("Apply:  sudo systemctl restart threatfalcon-server");
+            Ok(())
+        }
+        ReaderCommand::List { cfg } => {
+            let readers = tokens::list_readers(&cfg.config)?;
+            if readers.is_empty() {
+                println!("no readers configured");
+            }
+            for (name, hash_prefix) in readers {
                 println!("{name:<32} sha256:{hash_prefix}...");
             }
             Ok(())
