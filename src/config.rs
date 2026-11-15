@@ -153,7 +153,28 @@ pub struct CollectorConfig {
 #[serde(default)]
 pub struct EtwConfig {
     pub enabled: bool,
+    /// Size of each ETW session buffer, in KB (default 256).
+    pub buffer_size_kb: u32,
+    /// Session buffers allocated up front (default 32).
+    pub min_buffers: u32,
+    /// Buffers the session may grow to under load (default 128). Memory use
+    /// is at most `max_buffers` x `buffer_size_kb`. When all are full, ETW
+    /// drops events before the sensor sees them; health events report how
+    /// many (`etw.events_lost`).
+    pub max_buffers: u32,
     pub providers: Vec<EtwProviderConfig>,
+}
+
+impl EtwConfig {
+    /// Buffer settings clamped to what ETW accepts:
+    /// (buffer size in KB, minimum buffers, maximum buffers).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn buffer_settings(&self) -> (u32, u32, u32) {
+        let size = self.buffer_size_kb.clamp(4, 1024);
+        let min = self.min_buffers.clamp(2, 1024);
+        let max = self.max_buffers.clamp(min, 2048);
+        (size, min, max)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +433,9 @@ impl Default for EtwConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            buffer_size_kb: 256,
+            min_buffers: 32,
+            max_buffers: 128,
             providers: default_etw_providers(),
         }
     }
@@ -595,6 +619,24 @@ mod tests {
         assert_eq!(cfg.output.sink_type, SinkType::File);
         assert_eq!(cfg.output.rotation_size_mb, 100);
         assert_eq!(cfg.collectors.etw.providers.len(), 8);
+    }
+
+    #[test]
+    fn etw_buffer_settings_default_and_clamp() {
+        let cfg = SensorConfig::default();
+        assert_eq!(cfg.collectors.etw.buffer_settings(), (256, 32, 128));
+        let parsed: SensorConfig =
+            toml::from_str("[collectors.etw]\nbuffer_size_kb = 512\nmax_buffers = 64\n").unwrap();
+        assert_eq!(parsed.collectors.etw.buffer_settings(), (512, 32, 64));
+        // Providers keep their defaults when only buffers are set
+        assert_eq!(parsed.collectors.etw.providers.len(), 8);
+        let extreme = EtwConfig {
+            buffer_size_kb: 1 << 20,
+            min_buffers: 0,
+            max_buffers: 1,
+            ..EtwConfig::default()
+        };
+        assert_eq!(extreme.buffer_settings(), (1024, 2, 2));
     }
 
     #[test]

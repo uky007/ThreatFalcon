@@ -278,6 +278,9 @@ pub enum EventData {
         collectors: Vec<CollectorStatus>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sink: Option<SinkStatus>,
+        /// Counters of the ETW session (ETW collector running).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        etw: Option<EtwSessionStats>,
     },
 }
 
@@ -286,6 +289,21 @@ pub enum EventData {
 pub struct CollectorStatus {
     pub name: String,
     pub state: CollectorState,
+}
+
+/// ETW session counters, included in health events. ETW keeps them for the
+/// lifetime of the session (one sensor run).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtwSessionStats {
+    /// Events ETW could not store because all session buffers were full.
+    /// They never reached the sensor.
+    pub events_lost: u64,
+    /// Full buffers ETW discarded before the sensor consumed them.
+    pub realtime_buffers_lost: u64,
+    /// Buffers currently allocated, and how many of them are free.
+    pub buffers: u32,
+    pub free_buffers: u32,
+    pub buffer_size_kb: u32,
 }
 
 /// Status of the output sink, included in health events.
@@ -408,6 +426,35 @@ mod tests {
     }
 
     #[test]
+    fn health_event_carries_etw_counters_when_present() {
+        let health = |etw| EventData::SensorHealth {
+            uptime_secs: 60,
+            events_total: 10,
+            events_dropped: 0,
+            collectors: vec![],
+            sink: None,
+            etw,
+        };
+        let with = serde_json::to_string(&health(Some(EtwSessionStats {
+            events_lost: 7,
+            realtime_buffers_lost: 1,
+            buffers: 128,
+            free_buffers: 0,
+            buffer_size_kb: 256,
+        })))
+        .unwrap();
+        assert!(with.contains(r#""etw":{"events_lost":7,"realtime_buffers_lost":1,"buffers":128,"free_buffers":0,"buffer_size_kb":256}"#), "{with}");
+        let without = serde_json::to_string(&health(None)).unwrap();
+        assert!(!without.contains("etw"), "{without}");
+        // Health events of earlier versions (no etw field) still read
+        let old = r#"{"type":"SensorHealth","uptime_secs":60,"events_total":10,"events_dropped":0,"collectors":[]}"#;
+        match serde_json::from_str::<EventData>(old).unwrap() {
+            EventData::SensorHealth { etw, .. } => assert_eq!(etw, None),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn health_event_serialization() {
         let event = ThreatEvent::new(
             &test_agent(),
@@ -419,6 +466,7 @@ mod tests {
                 events_total: 5000,
                 events_dropped: 3,
                 sink: None,
+                etw: None,
                 collectors: vec![
                     CollectorStatus {
                         name: "ETW".into(),
@@ -470,6 +518,7 @@ mod tests {
                 events_dropped: 0,
                 collectors: vec![],
                 sink: None,
+                etw: None,
             },
         );
 
@@ -612,6 +661,7 @@ mod tests {
                 events_dropped: 0,
                 collectors: vec![],
                 sink: None,
+                etw: None,
             },
         );
         let json = serde_json::to_string(&event).unwrap();

@@ -286,6 +286,7 @@ impl Sensor {
                 events_dropped,
                 collectors,
                 sink: sink_info,
+                etw: self.collectors.iter().find_map(|c| c.etw_session()),
             },
         )
     }

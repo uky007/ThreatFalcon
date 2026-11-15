@@ -4775,6 +4775,7 @@ mod tests {
                 events_dropped: 0,
                 collectors: vec![],
                 sink: None,
+                etw: None,
             },
         )
     }
@@ -5228,6 +5229,7 @@ mod tests {
                 events_dropped: 0,
                 collectors: vec![],
                 sink: None,
+                etw: None,
             }),
         ];
 
