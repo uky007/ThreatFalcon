@@ -216,7 +216,7 @@ fn run_service() -> Result<()> {
 
     tracing::info!(
         "ThreatFalcon service v{} starting",
-        env!("CARGO_PKG_VERSION")
+        env!("THREATFALCON_VERSION")
     );
 
     // Load config.

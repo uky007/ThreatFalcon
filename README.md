@@ -151,6 +151,8 @@ Cross-check Windows compilation from another platform:
 cargo check --target x86_64-pc-windows-msvc
 ```
 
+A build from a git checkout reports its commit along with the version, as `0.5.0+443155e`: in `--version`, in the startup log and as `sensor_version` in every event (the management server's agent list shows it), so you can tell which build an agent runs. Set `THREATFALCON_BUILD_COMMIT` to supply the commit yourself; builds outside a git checkout (for example from crates.io) report the plain version. Uncommitted changes are not reflected.
+
 ## Run
 
 ThreatFalcon is intended to run on Windows.

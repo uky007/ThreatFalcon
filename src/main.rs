@@ -32,7 +32,7 @@ mod exit_code {
 
 /// ThreatFalcon — lightweight endpoint telemetry sensor for Windows
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = env!("THREATFALCON_VERSION"), about)]
 struct Cli {
     /// Path to config file (default: threatfalcon.toml in current directory)
     #[arg(long, value_name = "PATH")]
@@ -228,7 +228,7 @@ async fn run_foreground(cli: Cli) -> Result<()> {
         .with_thread_ids(true)
         .init();
 
-    tracing::info!("ThreatFalcon Sensor v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("ThreatFalcon Sensor v{}", env!("THREATFALCON_VERSION"));
 
     #[cfg(not(target_os = "windows"))]
     tracing::warn!("ThreatFalcon is designed for Windows — running in development mode");
