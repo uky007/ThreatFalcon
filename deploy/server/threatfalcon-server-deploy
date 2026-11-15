@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Install a threatfalcon-server release bundle and restart the service.
+#
+# Installed by bootstrap.sh as /usr/local/sbin/threatfalcon-server-deploy and
+# run as root by the SSM document that the GitHub deploy workflow invokes:
+#
+#   threatfalcon-server-deploy <bundle-key> <sha256>
+#
+# This script is deliberately the only thing the CI/CD role can trigger on
+# the host: it accepts nothing but a bundle key in the deploy bucket and the
+# bundle's SHA-256, installs exactly two binaries, and runs them only as the
+# unprivileged, sandboxed service user. Host configuration (systemd unit,
+# Caddy, config) is changed by re-running bootstrap.sh, never by CI.
+#
+# On a failed health check the previous release is restored.
+set -euo pipefail
+umask 022
+
+readonly BUNDLE_NAME="threatfalcon-server-linux-x86_64.tar.gz"
+readonly PREFIX="/opt/threatfalcon-server"
+readonly RELEASES="$PREFIX/releases"
+readonly DEPLOY_ENV="/etc/threatfalcon-server/deploy.env"
+readonly SERVICE="threatfalcon-server"
+readonly KEEP_RELEASES=5
+readonly HEALTH_TIMEOUT_SECS=30
+
+log() { printf '[deploy] %s\n' "$*"; logger -t threatfalcon-server-deploy -- "$*" 2>/dev/null || true; }
+die() { printf '[deploy] ERROR: %s\n' "$*" >&2; logger -t threatfalcon-server-deploy -- "ERROR: $*" 2>/dev/null || true; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ $# -eq 2 ]] || die "usage: $0 <bundle-key> <sha256>"
+
+key=$1
+expected_sha=$2
+[[ $key =~ ^releases/([0-9a-f]{40})/threatfalcon-server-linux-x86_64\.tar\.gz$ ]] || die "invalid bundle key"
+rev=${BASH_REMATCH[1]}
+[[ $expected_sha =~ ^[0-9a-f]{64}$ ]] || die "invalid sha256"
+
+# deploy.env is parsed, not sourced.
+conf() { sed -n "s/^$1=//p" "$DEPLOY_ENV" | tail -n 1; }
+[[ -f $DEPLOY_ENV ]] || die "$DEPLOY_ENV not found (run bootstrap.sh first)"
+bucket=$(conf DEPLOY_BUCKET)
+region=$(conf AWS_REGION)
+health_url=$(conf HEALTH_URL)
+health_url=${health_url:-http://127.0.0.1:8081/healthz}
+[[ $bucket =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "DEPLOY_BUCKET in $DEPLOY_ENV is missing or invalid"
+[[ $region =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || die "AWS_REGION in $DEPLOY_ENV is missing or invalid"
+[[ $health_url =~ ^http://(127\.0\.0\.1|\[::1\]|localhost):[0-9]+/healthz$ ]] || die "HEALTH_URL must be a loopback /healthz URL"
+
+aws_cli=$(command -v aws || true)
+[[ -n $aws_cli ]] || aws_cli=/snap/bin/aws
+[[ -x $aws_cli ]] || die "AWS CLI not found"
+
+exec 9>/run/lock/threatfalcon-server-deploy.lock
+flock -n 9 || die "another deployment is in progress"
+
+work=$(mktemp -d /var/tmp/threatfalcon-deploy.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+
+log "deploying revision $rev"
+"$aws_cli" s3 cp --only-show-errors --region "$region" "s3://$bucket/$key" "$work/$BUNDLE_NAME" \
+    || die "download failed"
+actual_sha=$(sha256sum "$work/$BUNDLE_NAME" | cut -d' ' -f1)
+[[ $actual_sha == "$expected_sha" ]] || die "checksum mismatch (expected $expected_sha, got $actual_sha)"
+
+# Accept exactly the expected regular files: no links, devices, extra paths.
+mapfile -t entries < <(tar -tzf "$work/$BUNDLE_NAME")
+[[ ${#entries[@]} -eq 3 ]] || die "unexpected bundle layout"
+for entry in "${entries[@]}"; do
+    case $entry in
+        REVISION | bin/threatfalcon-server | bin/threatfalcon) ;;
+        *) die "unexpected bundle entry: $entry" ;;
+    esac
+done
+while read -r mode _; do
+    [[ ${mode:0:1} == "-" ]] || die "bundle contains a non-regular file"
+done < <(tar -tvzf "$work/$BUNDLE_NAME")
+
+mkdir "$work/x"
+tar -xzf "$work/$BUNDLE_NAME" -C "$work/x" --no-same-owner --no-same-permissions
+[[ $(tr -d '\n' <"$work/x/REVISION") == "$rev" ]] || die "bundle REVISION does not match $rev"
+for bin in threatfalcon-server threatfalcon; do
+    [[ -f $work/x/bin/$bin && ! -L $work/x/bin/$bin ]] || die "bundle is missing bin/$bin"
+    [[ $(head -c 4 "$work/x/bin/$bin" | od -An -tx1 | tr -d ' \n') == "7f454c46" ]] || die "bin/$bin is not an ELF binary"
+done
+
+release_dir="$RELEASES/$rev-$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 0755 "$RELEASES" "$release_dir.tmp/bin"
+install -m 0755 -o root -g root "$work/x/bin/threatfalcon-server" "$release_dir.tmp/bin/threatfalcon-server"
+install -m 0755 -o root -g root "$work/x/bin/threatfalcon" "$release_dir.tmp/bin/threatfalcon"
+printf '%s\n' "$rev" >"$release_dir.tmp/REVISION"
+mv -T "$release_dir.tmp" "$release_dir"
+
+previous=$(readlink -f "$PREFIX/current" 2>/dev/null || true)
+[[ -n $previous && -d $previous ]] || previous=""
+
+switch_to() {
+    ln -sfn "$1" "$PREFIX/current.new"
+    mv -Tf "$PREFIX/current.new" "$PREFIX/current"
+}
+
+# Wait until the service reports the expected revision on its admin port.
+healthy() {
+    local want=$1 got
+    for _ in $(seq "$HEALTH_TIMEOUT_SECS"); do
+        if systemctl is-active --quiet "$SERVICE"; then
+            got=$(curl -fsS --max-time 2 "$health_url" 2>/dev/null | jq -r '.revision // empty' 2>/dev/null || true)
+            [[ $got == "$want" ]] && return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+switch_to "$release_dir"
+log "restarting $SERVICE"
+systemctl restart "$SERVICE" || true
+if ! healthy "$rev"; then
+    log "health check failed for $rev (see: journalctl -u $SERVICE on the server)"
+    if [[ -n $previous && $previous != "$release_dir" ]]; then
+        prev_rev=$(tr -d '\n' <"$previous/REVISION" 2>/dev/null || true)
+        switch_to "$previous"
+        systemctl restart "$SERVICE" || true
+        if healthy "$prev_rev"; then
+            log "rolled back to ${prev_rev:-previous release}"
+        else
+            log "rollback to ${prev_rev:-previous release} is not healthy either"
+        fi
+    fi
+    rm -rf -- "$release_dir"
+    exit 1
+fi
+log "revision $rev is live"
+
+# Keep the newest releases (by install time), the current one and the
+# previous one (for manual rollback).
+current=$(readlink -f "$PREFIX/current")
+mapfile -t old < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
+    sort -rn | tail -n +$((KEEP_RELEASES + 1)) | cut -d' ' -f2-)
+for dir in "${old[@]}"; do
+    [[ $dir == "$current" || $dir == "$previous" ]] && continue
+    rm -rf -- "$dir"
+done

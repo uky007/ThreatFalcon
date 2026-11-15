@@ -1,0 +1,36 @@
+# ThreatFalcon management server configuration.
+# Docs: https://github.com/uky007/ThreatFalcon/blob/main/deploy/README.md
+#
+# Agents are added with:   sudo threatfalcon-server token add <name>
+# and removed with:        sudo threatfalcon-server token remove <name>
+# Apply changes with:      sudo systemctl restart threatfalcon-server
+
+# Ingest listener. Plain HTTP on loopback; Caddy terminates TLS in front.
+listen = "127.0.0.1:8080"
+# Admin listener (agent status API, Prometheus metrics). Loopback only.
+admin_listen = "127.0.0.1:8081"
+# Telemetry is stored under <data_dir>/agents/<name>/events.jsonl.
+data_dir = "/var/lib/threatfalcon-server"
+# Printed in agent config snippets by `token add`.
+public_url = "https://__TFS_DOMAIN__/api/v1/events"
+
+[limits]
+max_body_mb = 16
+max_decompressed_mb = 32
+max_events_per_batch = 10000
+max_concurrent_requests = 8
+request_timeout_secs = 30
+# Below this much free disk space, batches are refused with HTTP 507 and
+# agents keep them (spool) until space is available again.
+min_free_disk_mb = 1024
+
+[storage]
+rotation_size_mb = 100
+# Per agent. With the defaults an agent uses at most ~5 GB.
+max_rotated_files = 50
+fsync = true
+
+[status]
+# Report an agent as stale after this long without data. Sensors send at
+# least one health event per health_interval_secs (default 60).
+stale_after_secs = 300

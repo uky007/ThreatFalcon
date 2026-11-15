@@ -1,0 +1,141 @@
+name: Deploy management server
+
+# Every push to main is tested, built and deployed to the production server.
+# See deploy/README.md for the one-time AWS and GitHub setup. Until that setup
+# has set the SERVER_DEPLOY_ENABLED repository variable, only the build runs.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "deploy/aws/**"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: deploy-management-server
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BUNDLE: threatfalcon-server-linux-x86_64.tar.gz
+
+jobs:
+  build:
+    name: Test and build
+    # Must match the server OS: binaries link against its glibc.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: deploy-server
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build release binaries
+        env:
+          THREATFALCON_SERVER_REVISION: ${{ github.sha }}
+        run: cargo build --release --locked -p threatfalcon-server -p threatfalcon
+
+      - name: Package bundle
+        run: deploy/server/package-bundle.sh "$GITHUB_SHA" target/release dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-bundle
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    if: vars.SERVER_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-1
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: server-bundle
+          path: dist
+
+      - name: Verify bundle checksum
+        working-directory: dist
+        run: sha256sum --check "$BUNDLE.sha256"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: threatfalcon-server-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+
+      - name: Upload bundle to S3
+        env:
+          DEPLOY_BUCKET: ${{ secrets.DEPLOY_BUCKET }}
+        run: |
+          aws s3 cp --only-show-errors "dist/$BUNDLE" "s3://$DEPLOY_BUCKET/releases/$GITHUB_SHA/$BUNDLE"
+
+      - name: Install on the server (SSM)
+        env:
+          INSTANCE_ID: ${{ secrets.DEPLOY_INSTANCE_ID }}
+          DOCUMENT: ${{ secrets.DEPLOY_SSM_DOCUMENT }}
+        run: |
+          set -euo pipefail
+          sha256=$(cut -d' ' -f1 "dist/$BUNDLE.sha256")
+          params=$(jq -cn --arg key "releases/$GITHUB_SHA/$BUNDLE" --arg sha "$sha256" \
+            '{bundleKey: [$key], sha256: [$sha]}')
+          command_id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "$DOCUMENT" \
+            --comment "threatfalcon-server ${GITHUB_SHA::12}" \
+            --parameters "$params" \
+            --query Command.CommandId --output text)
+          echo "SSM command: $command_id"
+
+          status=Pending
+          for _ in $(seq 120); do
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$command_id" \
+              --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in
+              Pending | InProgress | Delayed) ;;
+              *) break ;;
+            esac
+          done
+
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text || true
+          echo "Result: $status"
+          test "$status" = Success
+
+      # Smoke test through DNS, TLS and Caddy. Informational only: right after
+      # the first setup DNS or the certificate may not be ready yet.
+      - name: Check public endpoint
+        if: vars.PUBLIC_HEALTH_URL != ''
+        continue-on-error: true
+        env:
+          PUBLIC_HEALTH_URL: ${{ vars.PUBLIC_HEALTH_URL }}
+        run: curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "$PUBLIC_HEALTH_URL"
