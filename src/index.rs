@@ -80,6 +80,7 @@ impl EventIndex {
         // Rebuild from scratch if file was truncated or schema changed
         if file_size < indexed_up_to || stored_version != SCHEMA_VERSION as u64 {
             self.conn.execute("DELETE FROM events", [])?;
+            self.set_meta_u64("skipped_lines", 0)?;
             self.index_range(jsonl_path, 0, file_size)
         } else if indexed_up_to < file_size {
             self.index_range(jsonl_path, indexed_up_to, file_size)
@@ -91,10 +92,17 @@ impl EventIndex {
         }
     }
 
+    /// Lines of the JSONL file that could not be indexed because they are
+    /// not events this version can read (newer sensor, or damaged).
+    pub fn skipped_lines(&self) -> u64 {
+        self.get_meta_u64("skipped_lines").unwrap_or(0)
+    }
+
     /// Force a full rebuild (drop all rows and re-index).
     pub fn rebuild(&self, jsonl_path: &Path) -> Result<IndexStats> {
         self.conn.execute("DELETE FROM events", [])?;
         self.set_meta_u64("indexed_up_to", 0)?;
+        self.set_meta_u64("skipped_lines", 0)?;
         let file_size = std::fs::metadata(jsonl_path)
             .with_context(|| format!("cannot stat {}", jsonl_path.display()))?
             .len();
@@ -329,6 +337,7 @@ impl EventIndex {
         let mut offset = start_offset;
         let mut line_buf = String::new();
         let mut new_events = 0u64;
+        let mut skipped = 0u64;
 
         loop {
             line_buf.clear();
@@ -367,6 +376,8 @@ impl EventIndex {
                         bytes_read as i64,
                     ])?;
                     new_events += 1;
+                } else {
+                    skipped += 1;
                 }
             }
 
@@ -375,6 +386,8 @@ impl EventIndex {
 
         drop(stmt);
         self.set_meta_u64("indexed_up_to", offset)?;
+        let skipped_total = self.get_meta_u64("skipped_lines").unwrap_or(0) + skipped;
+        self.set_meta_u64("skipped_lines", skipped_total)?;
         self.set_meta_u64("schema_version", SCHEMA_VERSION as u64)?;
         tx.commit()?;
 
