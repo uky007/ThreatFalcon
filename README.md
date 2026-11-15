@@ -379,6 +379,8 @@ The sensor maintains an in-memory process context cache, populated from `Process
 
 `ProcessCreate` events receive a `process_context` containing only the `process_key` (the remaining fields are already in the event payload). `ProcessTerminate` events receive full context from the cache before the entry is evicted.
 
+Processes that were already running when the sensor started (services, the shell, anything started before it) never get a `ProcessCreate` event. On Windows the sensor therefore seeds the cache at start from a snapshot of the running processes: their `image_path` (in the same `\Device\HarddiskVolumeN\...` form ETW uses, or just the executable name when the path cannot be read, e.g. for `System`), `ppid` and creation time (so their `process_key` matches what ETW reports when they exit). Their `command_line`, `user` and `integrity_level` are not known.
+
 The cache is bounded (10,000 entries) and keyed by PID. When a PID is reused, the new `ProcessCreate` replaces the old entry. `ProcessTerminate` events verify `create_time` to avoid evicting a newer process that reused the same PID.
 
 ETW events carry a precise OS-level creation timestamp (`create_time`), which produces PID-reuse-safe process keys. Sysmon events do not carry a comparable timestamp, so the cache applies source priority: an ETW-backed entry is never overwritten or evicted by a Sysmon event that lacks `create_time`. In Sysmon-only mode, process keys use a zero create_time (`{pid}:0`) and PID-reuse protection is best-effort.
