@@ -1126,6 +1126,19 @@ When using `explain` on a ScriptBlock, AmsiScan, or AMSI bypass detection event,
 
 Note: TF-EVA-004 detects the **presence** of syscall stubs in non-system modules. It does not confirm that the stubs were executed or that ntdll hooks were actively bypassed. Confidence is Medium to reflect this distinction.
 
+## PowerShell Script Block Rules
+
+PowerShell script block logging (`Microsoft-Windows-PowerShell` event 4104) records every block PowerShell compiles, most of it PowerShell's own module code. A `ScriptBlock` event is therefore `Info` unless something in it is suspicious; suspicious blocks carry rule metadata (and count as detections, e.g. for `query --rule-id` and the management server's `detections=true`):
+
+| Rule ID | Name | Triggers | MITRE | Severity / Confidence |
+|---------|------|----------|-------|-----------------------|
+| TF-PS-001 | Suspicious PowerShell script block | downloading or Base64-decoding code and running it (`IEX`, `Invoke-Expression`, `[ScriptBlock]::Create`), loading an assembly from memory, process memory/injection APIs (`VirtualAlloc`, `WriteProcessMemory`, `CreateRemoteThread`, `GetDelegateForFunctionPointer`), weakening Defender (`Set-/Add-MpPreference` with `-Disable*`/`-Exclusion*`) | T1059.001 | Medium / Medium |
+| TF-PS-001 | (same) | known offensive tooling (`Invoke-Mimikatz`, `Invoke-Shellcode`, PowerSploit, ...) | T1059.001 | High / High |
+| TF-PS-001 | (same) | only PowerShell's own suspicious-content check (it logs such blocks at the Warning level; it also flags common administrative code such as `Add-Type`) | T1059.001 | Medium / Low |
+| TF-PS-002 | AMSI tampering in PowerShell | references to AMSI internals used by in-process AMSI bypasses (`AmsiUtils`, `amsiInitFailed`, `AmsiScanBuffer`, `amsiContext`) | T1562.001 | High / High |
+
+Matching is case-insensitive on the block's text; the evidence lists what matched. Large scripts are logged in parts, and each part is assessed on its own.
+
 ## Limitations
 
 - No installer or packaging yet (service registration is manual via `sc.exe`)
