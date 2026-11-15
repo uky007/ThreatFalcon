@@ -3739,3 +3739,153 @@ fn alert_webhook_failure_does_not_crash() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("webhook error"), "expected webhook error in stderr, got: {stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// Rotated generations (--rotated) and unreadable lines
+// ---------------------------------------------------------------------------
+
+fn gen_id(n: u32) -> String {
+    format!("{n:08x}-0000-4000-8000-000000000000")
+}
+
+/// `events.jsonl.1` (oldest), `events.jsonl.2`, then `events.jsonl` (newest),
+/// as written by the file sink and the management server. All three events
+/// belong to the same process.
+fn write_generations(dir: &TempDir) -> std::path::PathBuf {
+    let base = dir.path().join("events.jsonl");
+    let line = |n| sample_event(&gen_id(n), 100, "100:42", "Network") + "\n";
+    fs::write(dir.path().join("events.jsonl.1"), line(1)).unwrap();
+    fs::write(dir.path().join("events.jsonl.2"), line(2)).unwrap();
+    fs::write(&base, line(3)).unwrap();
+    // Not generations: sidecar files and non-canonical names.
+    fs::write(dir.path().join("events.jsonl.1.idx.sqlite"), "").unwrap();
+    fs::write(dir.path().join("events.jsonl.01"), line(9)).unwrap();
+    base
+}
+
+#[test]
+fn rotated_flag_reads_all_generations_oldest_first() {
+    let dir = TempDir::new().unwrap();
+    let base = write_generations(&dir);
+    let output = cmd()
+        .args(["query", "--input", base.to_str().unwrap(), "--rotated"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("3 event(s) matched"))
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let ids: Vec<&str> = text.lines().map(|l| &l[7..15]).collect();
+    assert_eq!(ids, vec!["00000001", "00000002", "00000003"]);
+}
+
+#[test]
+fn without_rotated_flag_older_files_are_pointed_out() {
+    let dir = TempDir::new().unwrap();
+    let base = write_generations(&dir);
+    cmd()
+        .args(["stats", "--input", base.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total events: 1"))
+        .stderr(
+            predicate::str::contains("2 older rotated file(s)")
+                .and(predicate::str::contains("--rotated")),
+        );
+    cmd()
+        .args(["stats", "--input", base.to_str().unwrap(), "--rotated"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total events: 3"))
+        .stderr(predicate::str::contains("older rotated").not());
+    for sub in ["hunt", "score", "ioc"] {
+        cmd()
+            .args([sub, "--input", base.to_str().unwrap(), "--rotated"])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn explain_and_bundle_reach_into_older_generations() {
+    let dir = TempDir::new().unwrap();
+    let base = write_generations(&dir);
+    let base = base.to_str().unwrap();
+
+    // The target lives in events.jsonl.1: not found without --rotated.
+    cmd()
+        .args(["explain", "--event", &gen_id(1), "--input", base])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("event not found"));
+
+    let output = cmd()
+        .args(["explain", "--event", &gen_id(1), "--input", base, "--rotated", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(explain["target_event"]["id"], gen_id(1));
+    assert_eq!(explain["timeline"].as_array().unwrap().len(), 3);
+
+    let bundle_path = dir.path().join("bundle.json");
+    cmd()
+        .args([
+            "bundle",
+            "--event",
+            &gen_id(1),
+            "--input",
+            base,
+            "--rotated",
+            "--output",
+            bundle_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let bundle: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&bundle_path).unwrap()).unwrap();
+    assert_eq!(bundle["related_events"].as_array().unwrap().len(), 2);
+
+    // An id prefix is resolved over all generations, including ambiguity.
+    cmd()
+        .args(["explain", "--event", "0000000", "--input", base, "--rotated"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ambiguous"));
+}
+
+#[test]
+fn unreadable_lines_are_reported_not_silently_skipped() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let known = sample_event(&gen_id(4), 100, "100:42", "Network");
+    let newer = sample_event(&gen_id(5), 100, "100:42", "Network")
+        .replace("\"NetworkConnect\"", "\"SomethingNew\"");
+    fs::write(&path, format!("{known}\n{newer}\n{{garbage\n")).unwrap();
+    let path = path.to_str().unwrap();
+
+    cmd()
+        .args(["stats", "--input", path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total events: 1"))
+        .stderr(predicate::str::contains("2 line(s) are not events this version"));
+
+    // Through the SQLite index as well.
+    cmd()
+        .args(["index", "--input", path])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("2 line(s) are not events this version"));
+    cmd()
+        .args(["query", "--input", path])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("(indexed)")
+                .and(predicate::str::contains("2 line(s) are not events this version")),
+        );
+}

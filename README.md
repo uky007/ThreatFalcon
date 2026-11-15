@@ -25,6 +25,7 @@ ThreatFalcon is early-stage software.
 - JSONL event replay (`replay`) with speed control for offline testing and rule tuning
 - Hunt/score/alert rule parameters are configurable via `[rules]` in `threatfalcon.toml`
 - Optional SQLite index for fast lookups on large JSONL files (transparent fallback to full scan)
+- A management server (`threatfalcon-server`) receives telemetry from the HTTP sink, with per-agent tokens and continuous deployment to AWS (see [deploy/README.md](deploy/README.md))
 - The event schema and collector behavior may still change
 
 ## Goals
@@ -116,6 +117,7 @@ ThreatFalcon is split into a small number of clear components:
 - `src/pe.rs`: cross-platform PE header parser (sections, imports, exports)
 - `src/investigate.rs`: local investigation CLI (query, explain, bundle)
 - `src/collectors/evasion.rs`: evasion-oriented process inspection
+- `server/`: management server that receives HTTP sink batches and stores them per agent ([deploy/README.md](deploy/README.md))
 
 ## Build
 
@@ -434,9 +436,28 @@ Example enriched NetworkConnect event:
 }
 ```
 
+## Management Server
+
+`server/` contains `threatfalcon-server`, which receives the HTTP sink's batches from many agents, authenticates each agent with its own token, and stores the events per agent in the same JSONL layout as the file sink, so every investigation command below also works on the server. It also reports agent liveness and sensor health (status API, Prometheus metrics).
+
+`deploy/` contains a CloudFormation template (EC2 in `ap-northeast-1`, Caddy with Let's Encrypt) and a GitHub Actions workflow that tests, builds and deploys the server on every push to `main`. Installation and operations: [deploy/README.md](deploy/README.md).
+
+Agent side:
+
+```toml
+[output]
+type = "http"
+url = "https://tf.example.com/api/v1/events"
+bearer_token = "tfs_..."   # from `threatfalcon-server token add <name>`
+gzip = true
+spool_dir = "spool"
+```
+
 ## Local Investigation CLI
 
 ThreatFalcon includes built-in investigation commands that read JSONL telemetry output directly — no external SIEM or database required.
+
+`query`, `explain`, `bundle`, `stats`, `tree`, `score`, `hunt` and `ioc` read only the `--input` file by default. Add `--rotated` to also read its rotated files (`<input>.1`, `<input>.2`, ..., as written by the file sink and the management server), oldest first; without it, a note on stderr says how many older files were left out. Lines that cannot be read as events (for example events of a newer sensor version, or damaged lines) are skipped with a warning on stderr.
 
 ### Query
 

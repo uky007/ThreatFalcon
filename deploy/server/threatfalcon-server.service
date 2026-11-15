@@ -1,0 +1,55 @@
+[Unit]
+Description=ThreatFalcon management server (telemetry ingest)
+Documentation=https://github.com/uky007/ThreatFalcon/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+# Nothing to run until the first deployment has installed a binary.
+ConditionPathExists=/opt/threatfalcon-server/current/bin/threatfalcon-server
+
+[Service]
+Type=exec
+User=threatfalcon
+Group=threatfalcon
+ExecStart=/opt/threatfalcon-server/current/bin/threatfalcon-server serve --config /etc/threatfalcon-server/server.toml
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+StateDirectory=threatfalcon-server
+StateDirectoryMode=0750
+UMask=0027
+LimitNOFILE=65536
+
+# Sandboxing. The service only needs to read its config, write its state
+# directory and accept TCP connections on loopback.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Keep the instance metadata service (and the instance role's credentials)
+# out of reach of the network-facing process.
+IPAddressDeny=169.254.169.254 fd00:ec2::254
+
+[Install]
+WantedBy=multi-user.target

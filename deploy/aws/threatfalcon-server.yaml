@@ -1,0 +1,404 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ThreatFalcon management server: one Ubuntu 24.04 EC2 instance running Caddy
+  and threatfalcon-server, a private S3 bucket for release bundles, and a
+  GitHub Actions (OIDC) deploy role that can only upload bundles and run a
+  fixed deploy document on that instance.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Server" }
+        Parameters: [DomainName, AcmeEmail, ImageId, InstanceType, VolumeSize, IngressCidr, SnapshotRetention]
+      - Label: { default: "Network (optional; default VPC when empty)" }
+        Parameters: [VpcId, SubnetId, HostedZoneId]
+      - Label: { default: "GitHub deployment" }
+        Parameters: [GitHubRepository, GitHubEnvironment, BootstrapRef, GitHubOidcProviderArn]
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: >-
+      FQDN the agents connect to (e.g. tf.example.com). Point its A record at
+      the PublicIp output (done for you when HostedZoneId is set).
+    AllowedPattern: '^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
+  AcmeEmail:
+    Type: String
+    Default: ""
+    Description: Optional contact address for the Let's Encrypt account.
+    AllowedPattern: '^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Ubuntu 24.04 LTS amd64 AMI. Current one: aws ssm get-parameter
+      --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+      --query Parameter.Value --output text. It is a plain parameter on
+      purpose, so stack updates never replace the instance unless you pass a
+      new AMI (changing it replaces the instance and its data volume).
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: x86_64 instance type (release binaries are built for x86_64).
+    AllowedPattern: '^[a-z][a-z0-9-]*\.[a-z0-9]+$'
+  VolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 16
+    MaxValue: 2048
+    Description: Root volume size in GiB (holds the stored telemetry).
+  SnapshotRetention:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: Daily snapshots of the server volume to keep (taken at 18:00 UTC / 03:00 JST).
+  IngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Addresses allowed to reach HTTPS (443). Narrow this if your agents have fixed egress IPs.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  VpcId:
+    Type: String
+    Default: ""
+    Description: Optional VPC. Leave empty (together with SubnetId) to use the default VPC.
+    AllowedPattern: '^$|^vpc-[0-9a-f]{8,17}$'
+  SubnetId:
+    Type: String
+    Default: ""
+    Description: Optional public subnet in VpcId.
+    AllowedPattern: '^$|^subnet-[0-9a-f]{8,17}$'
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Optional Route 53 hosted zone for DomainName; if set, the A record is created.
+  GitHubRepository:
+    Type: String
+    Default: uky007/ThreatFalcon
+    Description: owner/repo allowed to deploy (case-sensitive, as GitHub reports it).
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  GitHubEnvironment:
+    Type: String
+    Default: production
+    Description: GitHub Actions environment the deploy job runs in. Only jobs in this environment can assume the deploy role.
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+  BootstrapRef:
+    Type: String
+    Default: main
+    Description: Branch or tag of GitHubRepository whose deploy/server/ is used to set up the host.
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+  GitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of an existing token.actions.githubusercontent.com OIDC provider in
+      this account. Leave empty to create one (there can be only one per account).
+
+Rules:
+  VpcAndSubnetTogether:
+    Assertions:
+      - Assert: !Or
+          - !And [!Equals [!Ref VpcId, ""], !Equals [!Ref SubnetId, ""]]
+          - !And [!Not [!Equals [!Ref VpcId, ""]], !Not [!Equals [!Ref SubnetId, ""]]]
+        AssertDescription: Set both VpcId and SubnetId, or neither (default VPC).
+
+Conditions:
+  HasCustomNetwork: !Not [!Equals [!Ref SubnetId, ""]]
+  HasCustomVpc: !Not [!Equals [!Ref VpcId, ""]]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  CreateOidcProvider: !Equals [!Ref GitHubOidcProviderArn, ""]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # Release bundles
+  # -------------------------------------------------------------------------
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-release-bundles
+            Status: Enabled
+            Prefix: releases/
+            ExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  DeployBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeployBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DeployBucket.Arn
+              - !Sub "${DeployBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # -------------------------------------------------------------------------
+  # Server instance
+  # -------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: ThreatFalcon server instance (SSM agent, read release bundles)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: read-release-bundles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DeployBucket.Arn}/releases/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    # Retained together with the instance that uses it (see Instance).
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      GroupDescription: ThreatFalcon server - HTTPS ingest only (administration via SSM Session Manager)
+      VpcId: !If [HasCustomVpc, !Ref VpcId, !Ref AWS::NoValue]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref IngressCidr
+          Description: HTTPS ingest from ThreatFalcon agents
+      # Egress: the default allow-all rule (apt, Let's Encrypt, SSM, S3).
+
+  # The instance volume is the only copy of the stored telemetry. Neither a
+  # stack update that replaces the instance (new ImageId, subnet) nor stack
+  # deletion terminates it, terminating it keeps the volume, and the volume
+  # is snapshotted daily (BackupPolicy). See deploy/README.md for restore.
+  Instance:
+    Type: AWS::EC2::Instance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      SubnetId: !If [HasCustomNetwork, !Ref SubnetId, !Ref AWS::NoValue]
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref VolumeSize
+            Encrypted: true
+            DeleteOnTermination: false
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: threatfalcon:backup
+          Value: !Ref AWS::StackName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec >>/var/log/threatfalcon-bootstrap.log 2>&1
+          echo "bootstrap started: $(date -u +%FT%TZ)"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y -q
+          apt-get install -y -q git
+          rm -rf /opt/threatfalcon-server/src
+          git clone --depth 1 --branch '${BootstrapRef}' 'https://github.com/${GitHubRepository}.git' /opt/threatfalcon-server/src
+          /opt/threatfalcon-server/src/deploy/server/bootstrap.sh \
+            --domain '${DomainName}' \
+            --email '${AcmeEmail}' \
+            --deploy-bucket '${DeployBucket}' \
+            --region '${AWS::Region}'
+          echo "bootstrap finished: $(date -u +%FT%TZ)"
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Data Lifecycle Manager role for ThreatFalcon server snapshots
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole"
+
+  # Snapshots outlive the instance, the volume and this policy.
+  BackupPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: Daily snapshots of the ThreatFalcon server
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt BackupRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes: [INSTANCE]
+        TargetTags:
+          - Key: threatfalcon:backup
+            Value: !Ref AWS::StackName
+        Schedules:
+          - Name: daily
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times: ["18:00"]
+            RetainRule:
+              Count: !Ref SnapshotRetention
+            CopyTags: true
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      TTL: "300"
+      ResourceRecords:
+        - !GetAtt ElasticIp.PublicIp
+
+  # -------------------------------------------------------------------------
+  # Deployment from GitHub Actions
+  # -------------------------------------------------------------------------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # The only command CI can run on the instance. Parameters are restricted
+  # to a bundle key and a SHA-256, so the deploy role cannot run arbitrary
+  # shell commands.
+  DeployDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: "2.2"
+        description: Install a threatfalcon-server release bundle from the deploy bucket.
+        parameters:
+          bundleKey:
+            type: String
+            description: S3 key of the bundle (releases/<commit>/threatfalcon-server-linux-x86_64.tar.gz)
+            allowedPattern: '^releases/[0-9a-f]{40}/threatfalcon-server-linux-x86_64\.tar\.gz$'
+          sha256:
+            type: String
+            description: SHA-256 of the bundle
+            allowedPattern: '^[0-9a-f]{64}$'
+        mainSteps:
+          - action: aws:runShellScript
+            name: deploy
+            inputs:
+              timeoutSeconds: "600"
+              runCommand:
+                - /usr/local/sbin/threatfalcon-server-deploy '{{ bundleKey }}' '{{ sha256 }}'
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: GitHub Actions deploy role for the ThreatFalcon server
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateOidcProvider, !Ref GitHubOidcProvider, !Ref GitHubOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubRepository}:environment:${GitHubEnvironment}"
+      Policies:
+        - PolicyName: deploy-threatfalcon-server
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UploadReleaseBundles
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${DeployBucket.Arn}/releases/*"
+              - Sid: RunDeployDocumentOnServer
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Instance}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DeployDocument}"
+              - Sid: ReadCommandResults
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: "*"
+
+Outputs:
+  PublicIp:
+    Description: Point the A record of DomainName here (automatic when HostedZoneId is set).
+    Value: !GetAtt ElasticIp.PublicIp
+  IngestUrl:
+    Description: Agent [output] url
+    Value: !Sub "https://${DomainName}/api/v1/events"
+  InstanceId:
+    Value: !Ref Instance
+  DeployBucketName:
+    Value: !Ref DeployBucket
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+  DeployDocumentName:
+    Value: !Ref DeployDocument
+  SessionCommand:
+    Description: Shell on the server (needs the Session Manager plugin)
+    Value: !Sub "aws ssm start-session --region ${AWS::Region} --target ${Instance}"

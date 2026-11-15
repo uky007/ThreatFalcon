@@ -24,6 +24,10 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
 
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
+
         /// Filter by process ID
         #[arg(long)]
         pid: Option<u32>,
@@ -79,6 +83,10 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
 
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
+
         /// Time window in minutes around the target event (default: 5)
         #[arg(long, default_value = "5")]
         window: u64,
@@ -101,6 +109,10 @@ pub enum Command {
         /// Path to JSONL event file
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
+
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
 
         /// Time window in minutes around the target event (default: 5)
         #[arg(long, default_value = "5")]
@@ -136,6 +148,10 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
 
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
+
         /// Output as structured JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -146,6 +162,10 @@ pub enum Command {
         /// Path to JSONL event file
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
+
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
 
         /// Root process ID to display the tree for
         #[arg(long)]
@@ -181,6 +201,10 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
 
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
+
         /// Path to config file for rule settings (optional)
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
@@ -199,6 +223,10 @@ pub enum Command {
         /// Path to JSONL event file
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
+
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
 
         /// Path to config file for rule settings (optional)
         #[arg(long, value_name = "PATH")]
@@ -222,6 +250,10 @@ pub enum Command {
         /// Path to JSONL event file
         #[arg(long, value_name = "PATH")]
         input: PathBuf,
+
+        /// Also read the rotated files <PATH>.1, <PATH>.2, ... (oldest first)
+        #[arg(long)]
+        rotated: bool,
 
         /// Show only IOCs of a specific type (ip, domain, hash)
         #[arg(long)]
@@ -334,6 +366,7 @@ pub fn run(command: Command) -> Result<()> {
             to,
             limit,
             no_index,
+            rotated,
         } => {
             let from = from
                 .map(|s| parse_datetime(&s))
@@ -360,7 +393,7 @@ pub fn run(command: Command) -> Result<()> {
                 to,
             };
 
-            run_query(&input, &filter, limit, no_index)
+            run_query(&EventLog::from_args(&input, rotated), &filter, limit, no_index)
         }
 
         Command::Explain {
@@ -369,7 +402,14 @@ pub fn run(command: Command) -> Result<()> {
             window,
             json,
             no_index,
-        } => run_explain(&input, &event, window, json, no_index),
+            rotated,
+        } => run_explain(
+            &EventLog::from_args(&input, rotated),
+            &event,
+            window,
+            json,
+            no_index,
+        ),
 
         Command::Bundle {
             event,
@@ -377,7 +417,14 @@ pub fn run(command: Command) -> Result<()> {
             window,
             output,
             no_index,
-        } => run_bundle(&input, &event, window, output.as_deref(), no_index),
+            rotated,
+        } => run_bundle(
+            &EventLog::from_args(&input, rotated),
+            &event,
+            window,
+            output.as_deref(),
+            no_index,
+        ),
 
         Command::Index {
             input,
@@ -385,7 +432,11 @@ pub fn run(command: Command) -> Result<()> {
             status,
         } => run_index(&input, rebuild, status),
 
-        Command::Stats { input, json } => run_stats(&input, json),
+        Command::Stats {
+            input,
+            json,
+            rotated,
+        } => run_stats(&EventLog::from_args(&input, rotated), json),
 
         Command::Tree {
             input,
@@ -393,13 +444,26 @@ pub fn run(command: Command) -> Result<()> {
             process_key,
             ancestors,
             json,
-        } => run_tree(&input, pid, process_key.as_deref(), ancestors, json),
+            rotated,
+        } => run_tree(
+            &EventLog::from_args(&input, rotated),
+            pid,
+            process_key.as_deref(),
+            ancestors,
+            json,
+        ),
 
         Command::Inspect { file, json } => run_inspect(&file, json),
 
-        Command::Score { input, config, limit, json } => {
+        Command::Score {
+            input,
+            config,
+            limit,
+            json,
+            rotated,
+        } => {
             let rules = load_rules_config(config.as_deref())?;
-            run_score(&input, limit, json, &rules)
+            run_score(&EventLog::from_args(&input, rotated), limit, json, &rules)
         }
 
         Command::Hunt {
@@ -408,9 +472,16 @@ pub fn run(command: Command) -> Result<()> {
             rule,
             limit,
             json,
+            rotated,
         } => {
             let rules = load_rules_config(config.as_deref())?;
-            run_hunt(&input, rule.as_deref(), limit, json, &rules)
+            run_hunt(
+                &EventLog::from_args(&input, rotated),
+                rule.as_deref(),
+                limit,
+                json,
+                &rules,
+            )
         }
 
         Command::Ioc {
@@ -418,7 +489,13 @@ pub fn run(command: Command) -> Result<()> {
             r#type,
             limit,
             json,
-        } => run_ioc(&input, r#type.as_deref(), limit, json),
+            rotated,
+        } => run_ioc(
+            &EventLog::from_args(&input, rotated),
+            r#type.as_deref(),
+            limit,
+            json,
+        ),
 
         Command::Alert {
             input,
@@ -603,16 +680,18 @@ impl QueryFilter {
     }
 }
 
-fn run_query(input: &Path, filter: &QueryFilter, limit: usize, no_index: bool) -> Result<()> {
+fn run_query(log: &EventLog, filter: &QueryFilter, limit: usize, no_index: bool) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let mut count = 0;
 
     // Try index-accelerated query if applicable
-    if !no_index && filter.contains.is_none() {
-        if let Some(idx) = index::try_open_and_update(input)? {
+    // (the index covers a single file, so it is not used with --rotated)
+    if !no_index && filter.contains.is_none() && !log.has_rotated() {
+        if let Some(idx) = index::try_open_and_update(log.path())? {
+            warn_skipped(idx.skipped_lines());
             let idx_filter = filter.to_index_filter(Some(limit));
             let locations = idx.query_locations(&idx_filter)?;
-            let events = index::fetch_events(input, &locations)?;
+            let events = index::fetch_events(log.path(), &locations)?;
             for event in &events {
                 if filter.matches(event) {
                     if let Ok(json) = serde_json::to_string(event) {
@@ -627,7 +706,7 @@ fn run_query(input: &Path, filter: &QueryFilter, limit: usize, no_index: bool) -
     }
 
     // Fallback: full JSONL scan
-    for_each_event(input, |event| {
+    log.for_each(|event| {
         if count >= limit {
             return false; // stop iteration
         }
@@ -663,17 +742,21 @@ struct ExplainOutput {
     rule: Option<crate::events::RuleMetadata>,
 }
 
-fn run_explain(input: &Path, event_id: &str, window_mins: u64, json: bool, no_index: bool) -> Result<()> {
-    // Try index-accelerated lookup
-    if !no_index {
-        if let Some(idx) = index::try_open_and_update(input)? {
-            return run_explain_indexed(input, &idx, event_id, window_mins, json);
+fn run_explain(log: &EventLog, event_id: &str, window_mins: u64, json: bool, no_index: bool) -> Result<()> {
+    // Try index-accelerated lookup (single file only)
+    if !no_index && !log.has_rotated() {
+        if let Some(idx) = index::try_open_and_update(log.path())? {
+            warn_skipped(idx.skipped_lines());
+            return run_explain_indexed(log.path(), &idx, event_id, window_mins, json);
         }
     }
 
-    // Fallback: full JSONL scan
-    let events = read_all_events(input)?;
-    let target = find_event(&events, event_id)?;
+    // Fallback: stream the files, keeping only the events explain can show
+    let (target_id, events) = log.event_context(event_id, window_mins)?;
+    let target = events
+        .iter()
+        .find(|e| e.id == target_id)
+        .context("target event missing from its context")?;
 
     // --- Build timeline ---
     let process_key = target.process_context.as_ref().map(|c| c.process_key.as_str());
@@ -859,22 +942,27 @@ struct EvidenceBundle {
 }
 
 fn run_bundle(
-    input: &Path,
+    log: &EventLog,
     event_id: &str,
     window_mins: u64,
     output: Option<&Path>,
     no_index: bool,
 ) -> Result<()> {
-    // Try index-accelerated lookup
-    if !no_index {
-        if let Some(idx) = index::try_open_and_update(input)? {
-            return run_bundle_indexed(input, &idx, event_id, window_mins, output);
+    // Try index-accelerated lookup (single file only)
+    if !no_index && !log.has_rotated() {
+        if let Some(idx) = index::try_open_and_update(log.path())? {
+            warn_skipped(idx.skipped_lines());
+            return run_bundle_indexed(log.path(), &idx, event_id, window_mins, output);
         }
     }
 
-    // Fallback: full JSONL scan
-    let events = read_all_events(input)?;
-    let target = find_event(&events, event_id)?.clone();
+    // Fallback: stream the files, keeping only the events a bundle can contain
+    let (target_id, events) = log.event_context(event_id, window_mins)?;
+    let target = events
+        .iter()
+        .find(|e| e.id == target_id)
+        .cloned()
+        .context("target event missing from its context")?;
 
     let process_key = target
         .process_context
@@ -1070,6 +1158,7 @@ fn run_index(input: &Path, rebuild: bool, status: bool) -> Result<()> {
         stats.total_events,
         index::index_path_for(input).display()
     );
+    warn_skipped(idx.skipped_lines());
     Ok(())
 }
 
@@ -1103,7 +1192,7 @@ struct ProcessEntry {
     count: u64,
 }
 
-fn run_stats(input: &Path, json: bool) -> Result<()> {
+fn run_stats(log: &EventLog, json: bool) -> Result<()> {
     use std::collections::HashMap;
 
     let mut total: u64 = 0;
@@ -1124,7 +1213,7 @@ fn run_stats(input: &Path, json: bool) -> Result<()> {
     }
     let mut by_process: HashMap<String, ProcessInfo> = HashMap::new();
 
-    for_each_event(input, |event| {
+    log.for_each(|event| {
         total += 1;
 
         // Time range
@@ -1369,7 +1458,7 @@ impl ScoreBreakdown {
     }
 }
 
-fn run_score(input: &Path, limit: usize, json: bool, rules: &RulesConfig) -> Result<()> {
+fn run_score(log: &EventLog, limit: usize, json: bool, rules: &RulesConfig) -> Result<()> {
     use std::collections::{HashMap, HashSet};
 
     struct ProcAcc {
@@ -1393,7 +1482,7 @@ fn run_score(input: &Path, limit: usize, json: bool, rules: &RulesConfig) -> Res
     }
     let mut proc_creates: Vec<ProcCreate> = Vec::new();
 
-    for_each_event(input, |event| {
+    log.for_each(|event| {
         total += 1;
 
         let event_key = event
@@ -1706,7 +1795,7 @@ fn is_public_ip(addr: &str) -> bool {
     }
 }
 
-fn run_ioc(input: &Path, type_filter: Option<&str>, limit: usize, json: bool) -> Result<()> {
+fn run_ioc(log: &EventLog, type_filter: Option<&str>, limit: usize, json: bool) -> Result<()> {
     use std::collections::HashMap;
 
     // Validate --type early
@@ -1743,7 +1832,7 @@ fn run_ioc(input: &Path, type_filter: Option<&str>, limit: usize, json: bool) ->
         acc.sources.insert(source);
     };
 
-    for_each_event(input, |event| {
+    log.for_each(|event| {
         total += 1;
         let ts = event.timestamp;
 
@@ -1926,7 +2015,7 @@ struct HuntFinding {
     timestamp: String,
 }
 
-fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, rules: &RulesConfig) -> Result<()> {
+fn run_hunt(log: &EventLog, rule_filter: Option<&str>, limit: usize, json: bool, rules: &RulesConfig) -> Result<()> {
     use std::collections::HashMap;
 
     if let Some(r) = rule_filter {
@@ -1966,7 +2055,7 @@ fn run_hunt(input: &Path, rule_filter: Option<&str>, limit: usize, json: bool, r
 
     // Single pass: collect ProcessCreate events and handle streaming rules
     // (unsigned-dll, beaconing, lolbin) that don't depend on parent lookup.
-    for_each_event(input, |event| {
+    log.for_each(|event| {
         total += 1;
         let ts = event.timestamp;
 
@@ -2252,7 +2341,7 @@ struct ProcInfo {
 }
 
 fn run_tree(
-    input: &Path,
+    log: &EventLog,
     target_pid: u32,
     target_key: Option<&str>,
     ancestors: bool,
@@ -2262,7 +2351,7 @@ fn run_tree(
 
     let mut procs: Vec<ProcInfo> = Vec::new();
 
-    for_each_event(input, |event| {
+    log.for_each(|event| {
         if let EventData::ProcessCreate {
             pid,
             ppid,
@@ -2943,6 +3032,7 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
     };
 
     let is_stdin = input.as_os_str() == "-";
+    let mut skips = SkipReporter::default();
 
     // File identity for rotation detection (file mode only).
     let mut file_id = FileIdentity {
@@ -3053,7 +3143,12 @@ fn run_alert(input: &Path, threshold: u32, cooldown_secs: u64, json: bool, rules
                 }
                 let event = match serde_json::from_str::<ThreatEvent>(line) {
                     Ok(e) => e,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Not silently: a newer sensor's events would
+                        // otherwise escape detection unnoticed.
+                        skips.record(line);
+                        continue;
+                    }
                 };
 
                 let event_key = event
@@ -3463,6 +3558,7 @@ fn run_replay(input: &Path, speed: f64) -> Result<()> {
     }
 
     let mut events: Vec<(String, DateTime<Utc>)> = Vec::new();
+    let mut skipped = 0u64;
 
     let file = std::fs::File::open(input)
         .with_context(|| format!("cannot open {}", input.display()))?;
@@ -3475,8 +3571,11 @@ fn run_replay(input: &Path, speed: f64) -> Result<()> {
         }
         if let Ok(event) = serde_json::from_str::<ThreatEvent>(&line) {
             events.push((line, event.timestamp));
+        } else {
+            skipped += 1;
         }
     }
+    warn_skipped(skipped);
 
     if events.is_empty() {
         eprintln!("No events to replay.");
@@ -3538,6 +3637,7 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
 
     let mut stdout = std::io::stdout().lock();
     let mut line_buf = String::new();
+    let mut skips = SkipReporter::default();
 
     loop {
         line_buf.clear();
@@ -3587,9 +3687,41 @@ fn run_tail(input: &Path, filter: &QueryFilter, json: bool) -> Result<()> {
                         )?;
                     }
                     stdout.flush()?;
+                } else {
+                    skips.record(line);
                 }
             }
             Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Reports lines that `alert` / `tail` cannot read while following a file
+/// (the first one, then every 1000th), so that events of a newer sensor are
+/// not dropped unnoticed.
+#[derive(Default)]
+struct SkipReporter {
+    skipped: u64,
+}
+
+impl SkipReporter {
+    fn record(&mut self, line: &str) {
+        self.skipped += 1;
+        if self.skipped != 1 && !self.skipped.is_multiple_of(1000) {
+            return;
+        }
+        let kind = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("data")?.get("type")?.as_str().map(|t| t.chars().take(64).collect::<String>()));
+        match kind {
+            Some(kind) => eprintln!(
+                "warning: {} unreadable line(s) skipped so far (latest: event type {kind:?}, unknown to this version of threatfalcon)",
+                self.skipped
+            ),
+            None => eprintln!(
+                "warning: {} unreadable line(s) skipped so far (damaged or not an event)",
+                self.skipped
+            ),
         }
     }
 }
@@ -3995,30 +4127,231 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| anyhow::anyhow!("expected RFC 3339 datetime (e.g., 2026-03-13T00:00:00Z): {e}"))
 }
 
-/// Iterate over events in a JSONL file. The callback returns `true` to
-/// continue or `false` to stop early.
-fn for_each_event(path: &Path, mut f: impl FnMut(ThreatEvent) -> bool) -> Result<()> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
-    let reader = std::io::BufReader::new(file);
+/// The JSONL files an investigation command reads: `--input` itself, or
+/// with `--rotated` also its rotated generations `<input>.1`, `<input>.2`,
+/// ... (the rotation scheme of the sensor's file sink and of the management
+/// server; a higher number is newer), read oldest first.
+pub(crate) struct EventLog {
+    path: PathBuf,
+    files: Vec<PathBuf>,
+}
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Skip lines that don't parse — JSONL files may have partial writes
-        if let Ok(event) = serde_json::from_str::<ThreatEvent>(&line) {
-            if !f(event) {
-                break;
-            }
+impl EventLog {
+    /// Just `path`.
+    pub(crate) fn single(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            files: vec![path.to_path_buf()],
         }
     }
 
-    Ok(())
+    /// From the command line. Without `--rotated`, says so when rotated
+    /// generations exist, so that their events are not missed silently.
+    pub(crate) fn from_args(path: &Path, rotated: bool) -> Self {
+        let generations = rotated_generations(path);
+        if !rotated {
+            if let (Some(first), Some(last)) = (generations.first(), generations.last()) {
+                eprintln!(
+                    "note: {} older rotated file(s) ({} .. {}) are not included; add --rotated to read them too",
+                    generations.len(),
+                    first.display(),
+                    last.display()
+                );
+            }
+            return Self::single(path);
+        }
+        let mut files = generations;
+        files.push(path.to_path_buf());
+        Self {
+            path: path.to_path_buf(),
+            files,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// True if more than the `--input` file is read.
+    fn has_rotated(&self) -> bool {
+        self.files.len() > 1
+    }
+
+    /// Open every file up front, so that a rotation (rename) or a pruned
+    /// generation (unlink) while reading does not change what is read.
+    fn open(&self) -> Result<Vec<(PathBuf, std::fs::File)>> {
+        let mut opened = Vec::with_capacity(self.files.len());
+        for (i, path) in self.files.iter().enumerate() {
+            match std::fs::File::open(path) {
+                Ok(file) => opened.push((path.clone(), file)),
+                // A rotated generation can be pruned between listing and opening.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && i + 1 < self.files.len() => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot open {}", path.display()))
+                }
+            }
+        }
+        Ok(opened)
+    }
+
+    /// Stream all events in order. The callback returns `true` to continue
+    /// or `false` to stop early. Lines that are not events this version can
+    /// read are counted and reported on stderr.
+    fn for_each(&self, f: impl FnMut(ThreatEvent) -> bool) -> Result<()> {
+        let mut files = self.open()?;
+        let skipped = scan_events(&mut files, f)?;
+        warn_skipped(skipped);
+        Ok(())
+    }
+
+    /// The target event (exact id, or a unique id prefix, over all files)
+    /// and the events `explain` / `bundle` may show for it: those of the same
+    /// process (`process_key`, or acting PID when the target has no process
+    /// context) within the time window, plus the target itself. Two passes
+    /// over the files instead of loading them, so memory use does not grow
+    /// with the size of the log.
+    fn event_context(
+        &self,
+        event_id: &str,
+        window_mins: u64,
+    ) -> Result<(uuid::Uuid, Vec<ThreatEvent>)> {
+        let mut files = self.open()?;
+
+        let mut exact = None;
+        let mut first_prefix_match = None;
+        let mut prefix_matches = 0usize;
+        scan_events(&mut files, |event| {
+            let id = event.id.to_string();
+            if id == event_id {
+                exact = Some(event);
+                return false;
+            }
+            if id.starts_with(event_id) {
+                prefix_matches += 1;
+                if first_prefix_match.is_none() {
+                    first_prefix_match = Some(event);
+                }
+            }
+            true
+        })?;
+        let target = match (exact, prefix_matches) {
+            (Some(target), _) => target,
+            (None, 0) => anyhow::bail!("event not found: {event_id}"),
+            (None, 1) => first_prefix_match.expect("one prefix match"),
+            (None, n) => {
+                anyhow::bail!("ambiguous event ID prefix '{event_id}' matches {n} events")
+            }
+        };
+
+        let process_key = target.process_context.as_ref().map(|c| c.process_key.clone());
+        let target_pid = target.data.acting_pid();
+        let window = chrono::Duration::minutes(window_mins as i64);
+        let (t_start, t_end) = (target.timestamp - window, target.timestamp + window);
+        let mut context = Vec::new();
+        let skipped = scan_events(&mut files, |event| {
+            let same_process = match &process_key {
+                Some(key) => {
+                    event.process_context.as_ref().map(|c| &c.process_key) == Some(key)
+                }
+                None => target_pid.is_some() && event.data.acting_pid() == target_pid,
+            };
+            let in_window = event.timestamp >= t_start && event.timestamp <= t_end;
+            if event.id == target.id || (same_process && in_window) {
+                context.push(event);
+            }
+            true
+        })?;
+        warn_skipped(skipped);
+        Ok((target.id, context))
+    }
 }
 
-/// Read all events from a JSONL file into memory.
+/// Rotated generations `<path>.N` next to `path`, oldest (lowest N) first.
+fn rotated_generations(path: &Path) -> Vec<PathBuf> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}.");
+    let mut generations: Vec<(u32, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let suffix = file_name.to_str()?.strip_prefix(&prefix)?.to_owned();
+            if suffix.is_empty()
+                || suffix.starts_with('0')
+                || !suffix.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            Some((suffix.parse().ok()?, path.with_file_name(file_name)))
+        })
+        .collect();
+    generations.sort_by_key(|(generation, _)| *generation);
+    generations.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Stream the events of already opened files (from their start). Returns
+/// the number of non-empty lines that could not be read as events.
+fn scan_events(
+    files: &mut [(PathBuf, std::fs::File)],
+    mut f: impl FnMut(ThreatEvent) -> bool,
+) -> Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut skipped = 0u64;
+    let mut line = Vec::new();
+    for (path, file) in files.iter_mut() {
+        file.seek(SeekFrom::Start(0))?;
+        let mut reader = std::io::BufReader::new(&*file);
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            let text = line.trim_ascii();
+            if text.is_empty() {
+                continue;
+            }
+            // Partial writes, damaged lines, or events of a newer sensor.
+            match serde_json::from_slice::<ThreatEvent>(text) {
+                Ok(event) => {
+                    if !f(event) {
+                        return Ok(skipped);
+                    }
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+    Ok(skipped)
+}
+
+/// Report lines that were skipped because they are not readable events.
+pub(crate) fn warn_skipped(skipped: u64) {
+    if skipped > 0 {
+        eprintln!(
+            "warning: {skipped} line(s) are not events this version of threatfalcon can read and were skipped (written by a newer sensor, or damaged)"
+        );
+    }
+}
+
+/// Iterate over events in a single JSONL file (tests).
+#[cfg(test)]
+fn for_each_event(path: &Path, f: impl FnMut(ThreatEvent) -> bool) -> Result<()> {
+    EventLog::single(path).for_each(f)
+}
+
+/// Read all events from a single JSONL file into memory (tests).
+#[cfg(test)]
 fn read_all_events(path: &Path) -> Result<Vec<ThreatEvent>> {
     let mut events = Vec::new();
     for_each_event(path, |event| {
@@ -4029,6 +4362,7 @@ fn read_all_events(path: &Path) -> Result<Vec<ThreatEvent>> {
 }
 
 /// Find an event by ID (prefix match supported).
+#[cfg(test)]
 fn find_event<'a>(events: &'a [ThreatEvent], id: &str) -> Result<&'a ThreatEvent> {
     // Try exact match first
     if let Some(event) = events.iter().find(|e| e.id.to_string() == id) {
@@ -4797,7 +5131,7 @@ mod tests {
         let output_path = dir.path().join("bundle.json");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&output_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&output_path), false).unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
@@ -4820,7 +5154,7 @@ mod tests {
         let output_path = dir.path().join("bundle.json");
 
         let event_id = events[0].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&output_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&output_path), false).unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
@@ -5025,7 +5359,7 @@ mod tests {
         let path = write_events(&dir, &[evt_b.clone(), evt_a.clone(), evt_c.clone()]);
         let output_path = dir.path().join("bundle.json");
 
-        run_bundle(&path, &evt_b.id.to_string(), 5, Some(&output_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &evt_b.id.to_string(), 5, Some(&output_path), false).unwrap();
 
         let content = std::fs::read_to_string(&output_path).unwrap();
         let bundle: EvidenceBundle = serde_json::from_str(&content).unwrap();
@@ -5422,7 +5756,7 @@ mod tests {
         let zip_path = dir.path().join("bundle.zip");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&zip_path), false).unwrap();
 
         // Open and verify the zip
         let file = std::fs::File::open(&zip_path).unwrap();
@@ -5455,7 +5789,7 @@ mod tests {
         let zip_path = dir.path().join("out.zip");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -5481,7 +5815,7 @@ mod tests {
         let zip_path = dir.path().join("target.zip");
 
         let event_id = events[0].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -5507,7 +5841,7 @@ mod tests {
 
         // Target is events[1]; related should be events[0] and events[2]
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -5540,8 +5874,8 @@ mod tests {
         let json_path = dir.path().join("full.json");
 
         let event_id = events[1].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&json_path), false).unwrap();
-        run_bundle(&path, &event_id, 5, Some(&zip_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&json_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&zip_path), false).unwrap();
 
         // Read bundle.json from the zip
         let file = std::fs::File::open(&zip_path).unwrap();
@@ -5576,7 +5910,7 @@ mod tests {
         let out_path = dir.path().join("bundle.json");
 
         let event_id = events[0].id.to_string();
-        run_bundle(&path, &event_id, 5, Some(&out_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &event_id, 5, Some(&out_path), false).unwrap();
 
         // Should be plain JSON, not a zip
         let content = std::fs::read_to_string(&out_path).unwrap();
@@ -5965,7 +6299,7 @@ mod tests {
         let path = write_events(&dir, &[evt_a, evt_b.clone()]);
         let zip_path = dir.path().join("range.zip");
 
-        run_bundle(&path, &evt_b.id.to_string(), 10, Some(&zip_path), false).unwrap();
+        run_bundle(&EventLog::single(&path), &evt_b.id.to_string(), 10, Some(&zip_path), false).unwrap();
 
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
