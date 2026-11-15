@@ -263,6 +263,15 @@ fn warnings(st: &AgentStatus, now: DateTime<Utc>, recent: chrono::Duration) -> V
                 }
             }
         }
+        if let Some(etw) = d.get("etw") {
+            let counter = |name: &str| etw.get(name).and_then(|v| v.as_u64()).unwrap_or(0);
+            let (events, buffers) = (counter("events_lost"), counter("realtime_buffers_lost"));
+            if events > 0 || buffers > 0 {
+                out.push(format!(
+                    "ETW lost {events} events and {buffers} buffers before the sensor saw them (session buffers full)"
+                ));
+            }
+        }
         if let Some(sink) = d.get("sink") {
             if let Some(n) = sink
                 .get("events_dropped")
@@ -529,6 +538,22 @@ mod tests {
         // Old errors stop being reported.
         let later = reg.snapshot(t(1000));
         assert!(!later[0].warnings.iter().any(|w| w.contains("disk full")));
+    }
+
+    #[test]
+    fn reports_etw_losses() {
+        let reg = StatusRegistry::new([("a", None)], 300);
+        let health = |lost: u64| BatchSummary {
+            agent_id: Some("id-1".into()),
+            health: Some(json!({
+                "collectors": [{"name": "ETW", "state": "Running"}],
+                "etw": {"events_lost": lost, "realtime_buffers_lost": 2, "buffers": 128, "free_buffers": 0, "buffer_size_kb": 256}
+            })),
+            ..BatchSummary::default()
+        };
+        reg.record_batch("a", t(0), record(health(12345), 1));
+        let w = reg.snapshot(t(1))[0].warnings.join("|");
+        assert!(w.contains("ETW lost 12345 events and 2 buffers"), "{w}");
     }
 
     #[test]

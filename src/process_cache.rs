@@ -596,6 +596,7 @@ mod tests {
                 events_dropped: 0,
                 collectors: vec![],
                 sink: None,
+                etw: None,
             },
         );
         cache.enrich(&mut health);

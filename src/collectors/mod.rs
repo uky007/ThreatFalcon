@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::events::ThreatEvent;
+use crate::events::{EtwSessionStats, ThreatEvent};
 
 /// All telemetry collectors implement this trait.
 #[async_trait]
@@ -26,5 +26,9 @@ pub trait Collector: Send + Sync {
     /// Number of events dropped inside this collector (e.g. channel backpressure).
     fn dropped_events(&self) -> u64 {
         0
+    }
+    /// ETW session counters, for collectors that run an ETW session.
+    fn etw_session(&self) -> Option<EtwSessionStats> {
+        None
     }
 }

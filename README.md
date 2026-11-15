@@ -90,7 +90,7 @@ Config file lookup order (when `--config` is not specified):
 
 Relative paths in the config file are resolved against the config file's directory, not the process working directory. This ensures consistent behavior between foreground mode and Windows service mode (where cwd is typically `System32`). Explicit absolute paths in the config are never rewritten.
 
-The HTTP sink sends batches from a background task, so a slow or unreachable endpoint never holds up event collection. Batches waiting to be sent are kept in memory up to `queue_max_mb` (default: 64 MB). When the HTTP sink is configured with `spool_dir`, batches beyond that are written to disk instead of dropped, and spooled batches are re-sent, oldest first, whenever nothing newer is waiting. A batch whose delivery fails is retried with backoff (1 s, doubling up to 30 s) before newer ones; a batch the endpoint rejects as malformed or too large (HTTP 400 or 413) is dropped and counted instead of being retried. On shutdown the sink keeps delivering for up to 5 seconds and then spools what is left. With `gzip = true`, batches are compressed once, so queued and spooled batches also take less space. Spool size is capped by `spool_max_mb` (default: 256 MB); events that fit neither in memory nor in the spool are dropped and counted. Health events report the sink's `events_dropped`, `spool_files`, `spool_bytes` and `queue_bytes`. This prevents event loss during network outages, server maintenance and bursts of events (for example right after boot).
+The HTTP sink sends batches from a background task, so a slow or unreachable endpoint never holds up event collection. Batches waiting to be sent are kept in memory up to `queue_max_mb` (default: 64 MB). When the HTTP sink is configured with `spool_dir`, batches beyond that are written to disk instead of dropped, and spooled batches are re-sent, oldest first, whenever nothing newer is waiting. A batch whose delivery fails is retried with backoff (1 s, doubling up to 30 s) before newer ones; a batch the endpoint rejects as malformed or too large (HTTP 400 or 413) is dropped and counted instead of being retried. On shutdown the sink keeps delivering for up to 5 seconds and then spools what is left. With `gzip = true`, batches are compressed once, so queued and spooled batches also take less space. Spool size is capped by `spool_max_mb` (default: 256 MB); events that fit neither in memory nor in the spool are dropped and counted. Health events report the sink's `events_dropped`, `spool_files`, `spool_bytes` and `queue_bytes`, and, while the ETW collector runs, its session counters (`etw.events_lost` and `etw.realtime_buffers_lost`: events ETW dropped because the session buffers were full, which never reached the sensor; see `[collectors.etw]` for the buffer settings). This prevents event loss during network outages, server maintenance and bursts of events (for example right after boot).
 
 The default ETW provider set includes:
 
@@ -327,6 +327,12 @@ rotation_size_mb = 100
 
 [collectors.etw]
 enabled = true
+# ETW session buffers. When all of them are full (bursts at boot or while a
+# sample runs), ETW drops events before the sensor sees them; health events
+# report how many (etw.events_lost). Memory: at most max_buffers x buffer_size_kb.
+# buffer_size_kb = 256
+# min_buffers = 32
+# max_buffers = 128
 
 # Custom provider list (replaces defaults when specified)
 # providers = [

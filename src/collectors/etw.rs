@@ -538,6 +538,7 @@ mod platform {
     /// to `stop_session()` on shutdown.
     pub fn start_session(
         providers: &[crate::config::EtwProviderConfig],
+        buffers: (u32, u32, u32),
         agent: crate::events::AgentInfo,
         tx: mpsc::Sender<ThreatEvent>,
         dropped: Arc<AtomicU64>,
@@ -568,6 +569,14 @@ mod platform {
             props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
             props.Wnode.ClientContext = 1; // QPC
             props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+            // Room for bursts (boot, sample runs): when every buffer is
+            // full, ETW drops events before they reach the callback.
+            let (buffer_size_kb, min_buffers, max_buffers) = buffers;
+            props.BufferSize = buffer_size_kb;
+            props.MinimumBuffers = min_buffers;
+            props.MaximumBuffers = max_buffers;
+            // Deliver partly filled buffers at least every second.
+            props.FlushTimer = 1;
             props.LoggerNameOffset =
                 std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
             props
@@ -716,6 +725,43 @@ mod platform {
     pub fn stop_session(instance_lock: isize) {
         stop_trace();
         release_instance_lock(instance_lock);
+    }
+
+    /// Counters of the running session (`EVENT_TRACE_CONTROL_QUERY`).
+    pub fn query_session() -> Option<crate::events::EtwSessionStats> {
+        let session_name_wide: Vec<u16> = SESSION_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // Room after the struct for the logger and log file names ETW
+        // writes back.
+        let header = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+        let total = header + 1024;
+        let mut buf = vec![0u8; total];
+        let props =
+            unsafe { &mut *(buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES) };
+        props.Wnode.BufferSize = total as u32;
+        props.LoggerNameOffset = header as u32;
+        props.LogFileNameOffset = (header + 512) as u32;
+        let status = unsafe {
+            ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                windows::core::PCWSTR(session_name_wide.as_ptr()),
+                props,
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        if status != WIN32_ERROR(0) {
+            tracing::debug!(error = ?status, "ETW session query failed");
+            return None;
+        }
+        Some(crate::events::EtwSessionStats {
+            events_lost: u64::from(props.EventsLost),
+            realtime_buffers_lost: u64::from(props.RealTimeBuffersLost),
+            buffers: props.NumberOfBuffers,
+            free_buffers: props.FreeBuffers,
+            buffer_size_kb: props.BufferSize,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1658,6 +1704,7 @@ impl Collector for EtwCollector {
         {
             let (flag, lock) = platform::start_session(
                 &self.config.providers,
+                self.config.buffer_settings(),
                 self.agent.clone(),
                 _tx,
                 self.dropped.clone(),
@@ -1697,6 +1744,17 @@ impl Collector for EtwCollector {
     fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
             + self.scan_requests_dropped.load(Ordering::Relaxed)
+    }
+
+    fn etw_session(&self) -> Option<crate::events::EtwSessionStats> {
+        #[cfg(target_os = "windows")]
+        {
+            // Only while this collector's session runs
+            self.stop_flag.as_ref()?;
+            platform::query_session()
+        }
+        #[cfg(not(target_os = "windows"))]
+        None
     }
 }
 
