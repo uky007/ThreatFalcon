@@ -90,7 +90,7 @@ Config file lookup order (when `--config` is not specified):
 
 Relative paths in the config file are resolved against the config file's directory, not the process working directory. This ensures consistent behavior between foreground mode and Windows service mode (where cwd is typically `System32`). Explicit absolute paths in the config are never rewritten.
 
-When the HTTP sink is configured with `spool_dir`, failed batches are written to disk instead of dropped. Spooled batches are re-sent on the next successful POST or periodic health flush (every `health_interval_secs`), whichever comes first. This prevents event loss during network outages or server maintenance. Spool size is capped by `spool_max_mb` (default: 256 MB).
+The HTTP sink sends batches from a background task, so a slow or unreachable endpoint never holds up event collection. Batches waiting to be sent are kept in memory up to `queue_max_mb` (default: 64 MB). When the HTTP sink is configured with `spool_dir`, batches beyond that are written to disk instead of dropped, and spooled batches are re-sent, oldest first, whenever nothing newer is waiting. A batch whose delivery fails is retried with backoff (1 s, doubling up to 30 s) before newer ones; a batch the endpoint rejects as malformed or too large (HTTP 400 or 413) is dropped and counted instead of being retried. On shutdown the sink keeps delivering for up to 5 seconds and then spools what is left. With `gzip = true`, batches are compressed once, so queued and spooled batches also take less space. Spool size is capped by `spool_max_mb` (default: 256 MB); events that fit neither in memory nor in the spool are dropped and counted. Health events report the sink's `events_dropped`, `spool_files`, `spool_bytes` and `queue_bytes`. This prevents event loss during network outages, server maintenance and bursts of events (for example right after boot).
 
 The default ETW provider set includes:
 
@@ -311,6 +311,7 @@ rotation_size_mb = 100
 # gzip = false
 # spool_dir = "spool"
 # spool_max_mb = 256
+# queue_max_mb = 64
 # [output.headers]
 # X-Sensor-Id = "sensor-001"
 # X-Api-Key = "key-abc"

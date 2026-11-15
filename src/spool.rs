@@ -1,12 +1,14 @@
 //! Disk-backed spool for the HTTP sink.
 //!
-//! When the HTTP endpoint is unreachable, serialized event batches are
-//! written to spool files on disk. When the endpoint recovers, spooled
-//! files are drained oldest-first and re-sent.
+//! Batches the HTTP sink cannot deliver now (endpoint unreachable, or more
+//! waiting than its memory queue holds, or still undelivered at shutdown)
+//! are written to spool files on disk. The sink's delivery task drains them
+//! oldest-first whenever nothing newer is waiting.
 //!
 //! Spool files are written atomically via temp-file + rename, so readers
-//! never see partial content. Each file contains a JSON array identical
-//! to the HTTP POST body (before any gzip compression).
+//! never see partial content. Each file contains an HTTP POST body: a JSON
+//! array, gzip-compressed when the sink uses gzip (files written by older
+//! versions are always uncompressed).
 
 use std::fs;
 use std::io::Write;
@@ -115,7 +117,6 @@ impl DiskSpool {
     }
 
     /// Number of pending spool files.
-    #[allow(dead_code)] // used in tests and health diagnostics
     pub fn file_count(&self) -> u64 {
         self.file_count
     }

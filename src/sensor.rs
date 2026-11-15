@@ -153,6 +153,7 @@ impl Sensor {
                         events_dropped: writer.dropped_events(),
                         spool_files: writer.spool_files(),
                         spool_bytes: writer.spool_bytes(),
+                        queue_bytes: writer.queued_bytes(),
                     };
                     let health = self.build_health_event(
                         &collector_states,
@@ -203,18 +204,34 @@ impl Sensor {
             }
         }
 
-        // Flush buffered events before final health so drop counts are accurate
+        // Events the collectors queued before they stopped are still in the
+        // channel; write them too. The bound only guards against a collector
+        // that keeps sending after stop().
+        let mut drained = 0usize;
+        while drained < 2 * EVENT_CHANNEL_SIZE {
+            let Ok(mut evt) = rx.try_recv() else { break };
+            process_cache.enrich(&mut evt);
+            if let Err(e) = writer.send(&evt).await {
+                error!(error = %e, "Failed to write event");
+            }
+            event_count += 1;
+            drained += 1;
+        }
+
+        // Hand buffered events to the sink before the final health event so
+        // its drop counts cover them.
         if let Err(e) = writer.flush().await {
             error!(error = %e, "Failed to flush sink on shutdown");
         }
 
-        // Final health event (includes any drops from flush above)
+        // Final health event
         let total_dropped = writer.dropped_events() + self.collector_drops();
         let sink_status = SinkStatus {
             sink_type: writer.name().to_string(),
             events_dropped: writer.dropped_events(),
             spool_files: writer.spool_files(),
             spool_bytes: writer.spool_bytes(),
+            queue_bytes: writer.queued_bytes(),
         };
         let final_health = self.build_health_event(
             &collector_states,
@@ -227,9 +244,10 @@ impl Sensor {
             error!(error = %e, "Failed to write final health event");
         }
 
-        // Flush the final health event itself
-        if let Err(e) = writer.flush().await {
-            error!(error = %e, "Failed to flush final health event");
+        // Deliver (or, for the HTTP sink, spool) everything still buffered,
+        // including the final health event.
+        if let Err(e) = writer.shutdown().await {
+            error!(error = %e, "Failed to shut down sink");
         }
 
         info!(total_events = event_count, "Sensor stopped");
