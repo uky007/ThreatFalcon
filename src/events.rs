@@ -90,7 +90,7 @@ impl ThreatEvent {
             timestamp: Utc::now(),
             hostname: agent.hostname.clone(),
             agent_id: agent.agent_id,
-            sensor_version: env!("CARGO_PKG_VERSION").to_string(),
+            sensor_version: env!("THREATFALCON_VERSION").to_string(),
             source,
             category,
             severity,
@@ -115,7 +115,7 @@ impl ThreatEvent {
             timestamp: Utc::now(),
             hostname: agent.hostname.clone(),
             agent_id: agent.agent_id,
-            sensor_version: env!("CARGO_PKG_VERSION").to_string(),
+            sensor_version: env!("THREATFALCON_VERSION").to_string(),
             source,
             category,
             severity,
@@ -441,6 +441,18 @@ mod tests {
         assert!(json.contains("\"Disabled\""));
         assert!(json.contains("\"agent_id\""));
         assert!(json.contains("\"sensor_version\""));
+        // The build version, optionally with the commit as build metadata
+        let version = &event.sensor_version;
+        let base = env!("CARGO_PKG_VERSION");
+        match version.strip_prefix(base) {
+            Some("") => {}
+            Some(meta) => {
+                let commit = meta.strip_prefix('+').expect("build metadata");
+                assert_eq!(commit.len(), 7, "{version}");
+                assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{version}");
+            }
+            None => panic!("sensor_version {version} does not start with {base}"),
+        }
         // rule should not be present for health events
         assert!(!json.contains("\"rule\""));
     }
