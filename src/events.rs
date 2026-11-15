@@ -184,8 +184,8 @@ pub enum EventData {
         pid: u32,
         path: String,
         operation: FileOperation,
-        /// New name of a renamed file, when the sensor could tell it apart
-        /// from the old one (`path`).
+        /// New name of a renamed file (`operation: Rename`); `path` is the
+        /// old name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_path: Option<String>,
     },

@@ -239,11 +239,27 @@ fn warnings(st: &AgentStatus, now: DateTime<Utc>, recent: chrono::Duration) -> V
             out.push(format!("sensor dropped {n} events"));
         }
         if let Some(collectors) = d.get("collectors").and_then(|v| v.as_array()) {
-            for c in collectors {
-                let state = c.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-                if state != "Running" && state != "Disabled" {
-                    let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    out.push(clip(format!("collector {name} is {state}")));
+            let state = |c: &serde_json::Value| {
+                c.get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_owned()
+            };
+            // The sensor marks its collectors Stopped only in the final
+            // health event it sends when it shuts down.
+            let shut_down = collectors.iter().any(|c| state(c) == "Stopped")
+                && collectors
+                    .iter()
+                    .all(|c| matches!(state(c).as_str(), "Stopped" | "Disabled"));
+            if shut_down {
+                out.push("sensor was shut down (final health event)".to_owned());
+            } else {
+                for c in collectors {
+                    let state = state(c);
+                    if state != "Running" && state != "Disabled" {
+                        let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        out.push(clip(format!("collector {name} is {state}")));
+                    }
                 }
             }
         }
@@ -513,6 +529,38 @@ mod tests {
         // Old errors stop being reported.
         let later = reg.snapshot(t(1000));
         assert!(!later[0].warnings.iter().any(|w| w.contains("disk full")));
+    }
+
+    #[test]
+    fn final_health_event_reads_as_shutdown() {
+        let reg = StatusRegistry::new([("a", None)], 300);
+        let health = |states: [&str; 3]| BatchSummary {
+            agent_id: Some("id-1".into()),
+            health: Some(json!({
+                "collectors": [
+                    {"name": "ETW", "state": states[0]},
+                    {"name": "Sysmon", "state": states[1]},
+                    {"name": "EvasionDetector", "state": states[2]}
+                ]
+            })),
+            ..BatchSummary::default()
+        };
+        reg.record_batch(
+            "a",
+            t(0),
+            record(health(["Stopped", "Disabled", "Stopped"]), 1),
+        );
+        let w = reg.snapshot(t(1))[0].warnings.join("|");
+        assert_eq!(w, "sensor was shut down (final health event)");
+
+        // A collector that stopped while others still run is still reported
+        reg.record_batch(
+            "a",
+            t(2),
+            record(health(["Running", "Disabled", "Stopped"]), 1),
+        );
+        let w = reg.snapshot(t(3))[0].warnings.join("|");
+        assert_eq!(w, "collector EvasionDetector is Stopped");
     }
 
     #[test]

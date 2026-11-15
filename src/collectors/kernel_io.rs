@@ -15,7 +15,8 @@
 //! - file created (`CreateNewFile`), first modification through a handle
 //!   (`Write`, or a size change via `SetInformation`), first attribute or
 //!   timestamp change through a handle (`SetInformation` with
-//!   `FileBasicInformation`), deletion (`DeletePath`), rename (`RenamePath`)
+//!   `FileBasicInformation`), deletion (`DeletePath`), rename (`RenamePath`;
+//!   `path` is the old name, `new_path` the new one)
 //! - registry key created (`CreateKey` that created a new key), key deleted,
 //!   value set, value deleted; failed operations are not reported
 
@@ -172,20 +173,23 @@ impl KernelObjects {
             }
             FILE_RENAME_PATH => {
                 let (file_object, _) = read_info_header(&mut r, v0)?;
-                let event_path = r.read_utf16_nul();
-                // The name the file was opened under is the old one. The
-                // event's FilePath is reported as the new name only when it
-                // differs from that.
-                let (path, new_path) = match self.file_path(file_object) {
-                    Some(old)
-                        if !event_path.is_empty() && !event_path.eq_ignore_ascii_case(&old) =>
-                    {
-                        (old, Some(event_path))
+                // FilePath is the new name (checked on Windows 11 26200);
+                // the old one is the name the file was opened under.
+                let new_name = r.read_utf16_nul();
+                let old_name = self.file_path(file_object);
+                if !new_name.is_empty() {
+                    // Later writes through this handle are to the new name.
+                    if let Some(open) = self.files.get_mut(file_object) {
+                        open.path = new_name.clone();
                     }
-                    Some(old) => (old, None),
-                    None => (event_path, None),
-                };
-                (!path.is_empty()).then_some(file(pid, path, FileOperation::Rename, new_path))
+                }
+                let new_path = (!new_name.is_empty()
+                    && old_name.as_deref() != Some(new_name.as_str()))
+                .then_some(new_name);
+                // Opened before the sensor started: the old name is unknown.
+                let path = old_name.unwrap_or_default();
+                (!path.is_empty() || new_path.is_some())
+                    .then(|| file(pid, path, FileOperation::Rename, new_path))
             }
             FILE_CLOSE => {
                 // v1: Irp, FileObject, FileKey, IssuingThreadId(u32)
@@ -658,15 +662,21 @@ mod tests {
             )
         );
 
-        // Same name as opened (differing only in case): no separate new name
-        let same = DOC.to_uppercase();
-        let ev =
-            file_ev(&mut o, FILE_RENAME_PATH, &info_v1(0xA0, 10, Some(&same))).expect("rename");
-        assert_eq!(file_op(&ev), (DOC.to_string(), FileOperation::Rename, None));
+        // The handle now refers to the new name
+        let ev = file_ev(&mut o, FILE_WRITE, &write_v1(0xA0)).expect("modification");
+        assert_eq!(file_op(&ev).0, new);
 
-        // Unknown handle: the event's path is all there is
-        let ev = file_ev(&mut o, FILE_RENAME_PATH, &info_v1(0xB0, 10, Some(new))).expect("rename");
+        // Renamed again to the same name: no new name to report
+        let ev = file_ev(&mut o, FILE_RENAME_PATH, &info_v1(0xA0, 10, Some(new))).expect("rename");
         assert_eq!(file_op(&ev), (new.to_string(), FileOperation::Rename, None));
+
+        // Unknown handle: only the new name is known
+        let ev = file_ev(&mut o, FILE_RENAME_PATH, &info_v1(0xB0, 10, Some(new))).expect("rename");
+        assert_eq!(
+            file_op(&ev),
+            (String::new(), FileOperation::Rename, Some(new.to_string()))
+        );
+        assert!(file_ev(&mut o, FILE_RENAME_PATH, &info_v1(0xB0, 10, Some(""))).is_none());
     }
 
     #[test]

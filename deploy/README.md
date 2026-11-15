@@ -243,8 +243,9 @@ Agent states (`state` in the status API):
 
 `last_seen` is the last stored batch, `last_contact` the last authenticated
 request. Warnings are derived from the latest health event (collectors in
-`Error`, dropped events, batches spooled on the agent), quarantined events
-and recent failed requests. Counters cover the current server process; after
+`Error`, dropped events, batches spooled on the agent, or a sensor that was
+shut down: its last health event is the one it sends when it stops),
+quarantined events and recent failed requests. Counters cover the current server process; after
 a restart, `last_seen` comes from the events file until the agent reports
 again.
 
